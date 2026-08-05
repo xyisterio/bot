@@ -277,6 +277,17 @@ function stripDraftVariants(text) {
   return first || text;
 }
 
+// Страховка от утечки рассуждений: иногда вместо ответа модель (замечено
+// у Gemini) присылает что-то вроде самопроверки по инструкциям —
+// "только на русском (Yes) * без markdown (Yes)" — вместо реального текста.
+// Если увидели характерный паттерн "(Yes)"/"(No)"/"(да)"/"(нет)" несколько
+// раз подряд — считаем ответ невалидным, чтобы дальше в askLLM сработал
+// фолбэк на следующую модель, а не улетело это в чат.
+function looksLikeReasoningLeak(text) {
+  const yesNoCount = (text.match(/\((?:yes|no|да|нет)\)/gi) || []).length;
+  return yesNoCount >= 2;
+}
+
 async function callTarget(target, messages) {
   const body = {
     model: target.model,
@@ -289,7 +300,6 @@ async function callTarget(target, messages) {
   };
 
   // Groq поддерживает это поле для reasoning-моделей (qwen3, gpt-oss).
-  // Gemini его игнорирует через OpenAI-совместимый эндпоинт — не мешает.
   if (target.provider === "groq") {
     body.reasoning_format = "hidden";
 
@@ -303,6 +313,15 @@ async function callTarget(target, messages) {
     } else if (target.model.includes("qwen")) {
       body.reasoning_effort = "none";
     }
+  }
+
+  // Gemini (через OpenAI-совместимый эндпоинт) тоже "думает" перед ответом
+  // по умолчанию. Без ограничения иногда вместо ответа прилетает что-то
+  // похожее на внутреннюю самопроверку по системному промпту, а не сам
+  // текст — по сути, утечка размышлений вместо финального ответа. Снижаем
+  // эффорт: для простой болтовни в чате глубокие рассуждения не нужны.
+  if (target.provider === "gemini") {
+    body.reasoning_effort = "low";
   }
 
   const res = await fetch(target.baseUrl, {
@@ -343,6 +362,11 @@ async function callTarget(target, messages) {
 
   reply = stripDraftVariants(reply);
   if (!reply) throw new Error(`Пустой ответ от ${target.provider} после очистки вариантов`);
+
+  if (looksLikeReasoningLeak(reply)) {
+    console.warn(`[callTarget] ${target.provider}/${target.model}: похоже на утечку рассуждений вместо ответа: "${reply}"`);
+    throw new Error(`${target.provider} прислал утечку рассуждений вместо ответа`);
+  }
 
   return reply;
 }
