@@ -1,0 +1,17 @@
+{
+  "name": "tg-human-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Разговорный Telegram-бот на grammy + Groq API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "grammy": "^1.30.0",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
