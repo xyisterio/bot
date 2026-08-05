@@ -326,6 +326,21 @@ const app = express();
 app.get("/", (req, res) => res.send("bot is alive"));
 app.listen(PORT, () => console.log(`HTTP ping-сервер запущен на порту ${PORT}`));
 
+// ==== Регистрация команд в Telegram (чтобы появлялись в автоподсказке "/") ====
+async function registerCommands() {
+  await bot.api.setMyCommands([
+    { command: "start", description: "начать (сброс памяти)" },
+    { command: "reset", description: "очистить историю переписки" },
+    { command: "alias", description: "задать имя человеку вместо ника" },
+    { command: "unalias", description: "убрать заданное имя" },
+    { command: "aliases", description: "показать список алиасов" },
+  ]);
+  console.log("Команды зарегистрированы в Telegram");
+}
+
 // ==== Запуск long polling ====
+registerCommands().catch((err) =>
+  console.error("Не удалось зарегистрировать команды:", err)
+);
 bot.start();
 console.log("Бот запущен (long polling)");
