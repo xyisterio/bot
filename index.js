@@ -26,7 +26,7 @@ const GROQ_MODELS = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile,openai/g
   .map((m) => m.trim())
   .filter(Boolean);
 
-const GEMINI_MODELS = (process.env.GEMINI_MODEL || "gemini-2.5-flash")
+const GEMINI_MODELS = (process.env.GEMINI_MODEL || "gemini-flash-latest,gemini-3.5-flash")
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
