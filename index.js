@@ -4,7 +4,13 @@ import express from "express";
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+// GROQ_MODEL может содержать несколько моделей через запятую — бот пробует
+// их по порядку и переключается на следующую, если текущая недоступна
+// (модель сняли с Groq, упала с ошибкой, лимиты исчерпаны и т.п.)
+const GROQ_MODELS = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile,openai/gpt-oss-120b")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
 const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан в переменных окружения");
@@ -103,7 +109,49 @@ function pushHistory(chatId, role, content) {
   while (h.length > HISTORY_LIMIT) h.shift();
 }
 
-// ==== Запрос к Groq (OpenAI-совместимый эндпоинт) ====
+// ==== Фолбэк между моделями Groq ====
+// Индекс модели, на которой бот последний раз успешно ответил — начинаем
+// с неё же, чтобы не долбить мёртвую модель на каждый запрос.
+let activeModelIndex = 0;
+
+// Ошибки, при которых имеет смысл пробовать следующую модель:
+// модель сняли с платформы / нет доступа / временно недоступна / лимиты.
+// При остальных ошибках (например, 401 — неверный ключ) фолбэк не поможет,
+// но пробуем всё равно на случай проблем именно с конкретной моделью.
+function isFallbackWorthy(status) {
+  return [400, 401, 403, 404, 422, 429, 500, 502, 503].includes(status);
+}
+
+async function callGroqModel(model, messages) {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: 0.9,
+      max_tokens: 400,
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    const err = new Error(`Groq API вернул ${res.status}`);
+    err.status = res.status;
+    err.body = errText;
+    throw err;
+  }
+
+  const data = await res.json();
+  const reply = data.choices?.[0]?.message?.content?.trim();
+  if (!reply) throw new Error("Пустой ответ от Groq");
+  return reply;
+}
+
+// ==== Запрос к Groq (OpenAI-совместимый эндпоинт) с фолбэком по моделям ====
 async function askGroq(chatId, userText) {
   const history = getHistory(chatId);
 
@@ -113,34 +161,41 @@ async function askGroq(chatId, userText) {
     { role: "user", content: userText },
   ];
 
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      messages,
-      temperature: 0.9,
-      max_tokens: 400,
-    }),
-  });
+  let lastErr;
 
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error("Groq API error:", res.status, errText);
-    throw new Error(`Groq API вернул ${res.status}`);
+  // Пробуем модели по кругу начиная с текущей "активной", чтобы не
+  // всегда начинать со сдохшей первой модели в списке.
+  for (let i = 0; i < GROQ_MODELS.length; i++) {
+    const idx = (activeModelIndex + i) % GROQ_MODELS.length;
+    const model = GROQ_MODELS[idx];
+
+    try {
+      const reply = await callGroqModel(model, messages);
+
+      if (idx !== activeModelIndex) {
+        console.warn(`Переключился на модель "${model}" (индекс ${idx})`);
+        activeModelIndex = idx;
+      }
+
+      pushHistory(chatId, "user", userText);
+      pushHistory(chatId, "assistant", reply);
+
+      return reply;
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `Groq API error [модель "${model}"]:`,
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+
+      // Если ошибка не похожа на проблему с самой моделью — нет смысла
+      // перебирать остальные, они, скорее всего, упадут так же.
+      if (err.status && !isFallbackWorthy(err.status)) break;
+    }
   }
 
-  const data = await res.json();
-  const reply = data.choices?.[0]?.message?.content?.trim();
-  if (!reply) throw new Error("Пустой ответ от Groq");
-
-  pushHistory(chatId, "user", userText);
-  pushHistory(chatId, "assistant", reply);
-
-  return reply;
+  throw lastErr ?? new Error("Все модели Groq недоступны");
 }
 
 // ==== Имитация "живой" задержки перед ответом ====
