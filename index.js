@@ -466,5 +466,32 @@ async function registerCommands() {
 registerCommands().catch((err) =>
   console.error("Не удалось зарегистрировать команды:", err)
 );
-bot.start();
-console.log("Бот запущен (long polling)");
+
+// Перед стартом на всякий случай сбрасываем возможный "зависший" вебхук
+// и висящие апдейты — помогает от 409 Conflict при передеплое, когда
+// старый инстанс на Render ещё не до конца отключился от getUpdates.
+async function startBot() {
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: true });
+  } catch (err) {
+    console.error("Не удалось сбросить вебхук перед стартом:", err);
+  }
+
+  // onStart просто подтверждает успешный запуск; сама ошибка 409, если
+  // всё-таки возникнет во время работы, ловится ниже через .catch —
+  // без него необработанный reject валит процесс с голым стектрейсом.
+  bot.start({
+    onStart: () => console.log("Бот запущен (long polling)"),
+  }).catch((err) => {
+    console.error("Бот остановился с ошибкой:", err);
+    // Даём Render перезапустить процесс начисто, а не висеть в непонятном состоянии
+    process.exit(1);
+  });
+}
+
+startBot();
+
+// Корректно останавливаем поллинг при рестарте/остановке контейнера на Render,
+// чтобы старый инстанс не оставался "подвешенным" и не создавал 409 у нового
+process.once("SIGINT", () => bot.stop());
+process.once("SIGTERM", () => bot.stop());
