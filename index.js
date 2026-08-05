@@ -293,10 +293,11 @@ async function callTarget(target, messages) {
     model: target.model,
     messages,
     temperature: 0.9,
-    // Запас на случай reasoning-моделей: у них часть этого бюджета уходит
-    // на скрытые токены рассуждений (см. комментарий ниже), так что реальный
-    // видимый ответ должен помещаться даже после их вычета.
-    max_tokens: 700,
+    // Большой запас: у reasoning-моделей значительная (иногда почти вся)
+    // часть этого бюджета уходит на скрытые токены рассуждений ещё до
+    // того, как начнётся сам видимый ответ — даже на низком reasoning_effort.
+    // Видели обрезание при 700, поднимаем с большим запасом.
+    max_tokens: 1500,
   };
 
   // Groq поддерживает это поле для reasoning-моделей (qwen3, gpt-oss).
@@ -315,13 +316,15 @@ async function callTarget(target, messages) {
     }
   }
 
-  // Gemini (через OpenAI-совместимый эндпоинт) тоже "думает" перед ответом
-  // по умолчанию. Без ограничения иногда вместо ответа прилетает что-то
-  // похожее на внутреннюю самопроверку по системному промпту, а не сам
-  // текст — по сути, утечка размышлений вместо финального ответа. Снижаем
-  // эффорт: для простой болтовни в чате глубокие рассуждения не нужны.
+  // Gemini (через OpenAI-совместимый эндпоинт) тоже "думает" перед ответом.
+  // reasoning_effort снижает усилие, но не гарантированно убирает раздумья
+  // до нуля на всех моделях — поэтому дополнительно пробуем нативное поле
+  // Gemini thinking_budget=0 через extra_body (специфично для Google,
+  // OpenAI-эндпоинты его должны просто игнорировать, если что-то не так
+  // передалось — не критично).
   if (target.provider === "gemini") {
     body.reasoning_effort = "low";
+    body.extra_body = { google: { thinking_config: { thinking_budget: 0 } } };
   }
 
   const res = await fetch(target.baseUrl, {
@@ -346,12 +349,16 @@ async function callTarget(target, messages) {
   let reply = choice?.message?.content?.trim();
   if (!reply) throw new Error(`Пустой ответ от ${target.provider}`);
 
-  // Если ответ обрезан по лимиту токенов — видно в логах Render, поможет
-  // понять, что max_tokens/reasoning_effort снова надо подкрутить.
+  // Если ответ обрезан по лимиту токенов — не отдаём пользователю огрызок
+  // фразы, а считаем это ошибкой цели: сработает фолбэк на следующую
+  // модель в TARGETS (см. askLLM). Само событие видно в логах Render.
   if (choice?.finish_reason === "length") {
     console.warn(
-      `[callTarget] ${target.provider}/${target.model}: ответ обрезан по finish_reason=length (${reply.length} символов)`
+      `[callTarget] ${target.provider}/${target.model}: ответ обрезан по finish_reason=length, ухожу на фолбэк ("${reply}")`
     );
+    const err = new Error(`${target.provider} обрезал ответ по длине`);
+    err.status = 500; // считается фолбэк-достойной (см. isFallbackWorthy)
+    throw err;
   }
 
   // Страховка: если какая-то модель всё же прислала рассуждения внутри
