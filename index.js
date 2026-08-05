@@ -4,17 +4,71 @@ import express from "express";
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-// GROQ_MODEL может содержать несколько моделей через запятую — бот пробует
-// их по порядку и переключается на следующую, если текущая недоступна
-// (модель сняли с Groq, упала с ошибкой, лимиты исчерпаны и т.п.)
-const GROQ_MODELS = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile,openai/gpt-oss-120b")
-  .split(",")
-  .map((m) => m.trim())
-  .filter(Boolean);
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // опционально
 const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан в переменных окружения");
 if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY не задан в переменных окружения");
+
+// ==== Провайдеры и фолбэк между ними ====
+// PROVIDER_ORDER задаёт порядок провайдеров через запятую: "gemini,groq".
+// Внутри каждого провайдера через запятую можно перечислить несколько
+// моделей — бот пробует их по очереди, если текущая недоступна.
+// Провайдер без заданного ключа (напр. нет GEMINI_API_KEY) просто
+// пропускается.
+const PROVIDER_ORDER = (process.env.PROVIDER_ORDER || "gemini,groq")
+  .split(",")
+  .map((p) => p.trim().toLowerCase())
+  .filter(Boolean);
+
+const GROQ_MODELS = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile,openai/gpt-oss-120b")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+const GEMINI_MODELS = (process.env.GEMINI_MODEL || "gemini-2.5-flash")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+// Единый список целей для фолбэка: [{ provider, model, baseUrl, apiKey }, ...]
+// Порядок провайдеров — из PROVIDER_ORDER, порядок моделей внутри — как задано в env.
+const PROVIDER_CONFIGS = {
+  gemini: {
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    apiKey: GEMINI_API_KEY,
+    models: GEMINI_MODELS,
+  },
+  groq: {
+    baseUrl: "https://api.groq.com/openai/v1/chat/completions",
+    apiKey: GROQ_API_KEY,
+    models: GROQ_MODELS,
+  },
+};
+
+const TARGETS = PROVIDER_ORDER.flatMap((providerName) => {
+  const cfg = PROVIDER_CONFIGS[providerName];
+  if (!cfg) {
+    console.warn(`Неизвестный провайдер в PROVIDER_ORDER: "${providerName}", пропускаю`);
+    return [];
+  }
+  if (!cfg.apiKey) {
+    console.warn(`Нет API-ключа для провайдера "${providerName}", пропускаю`);
+    return [];
+  }
+  return cfg.models.map((model) => ({
+    provider: providerName,
+    model,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+  }));
+});
+
+if (TARGETS.length === 0) {
+  throw new Error(
+    "Не задано ни одной рабочей модели — проверь PROVIDER_ORDER, GROQ_API_KEY / GEMINI_API_KEY"
+  );
+}
 
 // ==== Персонаж — меняешь только этот текст, остального не трогаешь ====
 const SYSTEM_PROMPT = `
@@ -109,41 +163,43 @@ function pushHistory(chatId, role, content) {
   while (h.length > HISTORY_LIMIT) h.shift();
 }
 
-// ==== Фолбэк между моделями Groq ====
-// Индекс модели, на которой бот последний раз успешно ответил — начинаем
-// с неё же, чтобы не долбить мёртвую модель на каждый запрос.
-let activeModelIndex = 0;
+// ==== Фолбэк между провайдерами/моделями ====
+// Индекс цели (провайдер+модель), на которой бот последний раз успешно
+// ответил — начинаем с неё же, чтобы не долбить мёртвую цель на каждый запрос.
+let activeTargetIndex = 0;
 
-// Ошибки, при которых имеет смысл пробовать следующую модель:
-// модель сняли с платформы / нет доступа / временно недоступна / лимиты.
-// При остальных ошибках (например, 401 — неверный ключ) фолбэк не поможет,
-// но пробуем всё равно на случай проблем именно с конкретной моделью.
+// Ошибки, при которых имеет смысл пробовать следующую цель:
+// модель/провайдер недоступны, лимиты исчерпаны и т.п.
 function isFallbackWorthy(status) {
   return [400, 401, 403, 404, 422, 429, 500, 502, 503].includes(status);
 }
 
-async function callGroqModel(model, messages) {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+async function callTarget(target, messages) {
+  const body = {
+    model: target.model,
+    messages,
+    temperature: 0.9,
+    max_tokens: 400,
+  };
+
+  // Groq поддерживает это поле для reasoning-моделей (qwen3.6, gpt-oss).
+  // Gemini его игнорирует через OpenAI-совместимый эндпоинт — не мешает.
+  if (target.provider === "groq") {
+    body.reasoning_format = "hidden";
+  }
+
+  const res = await fetch(target.baseUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${GROQ_API_KEY}`,
+      Authorization: `Bearer ${target.apiKey}`,
     },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.9,
-      max_tokens: 400,
-      // На случай reasoning-моделей (qwen3.6, gpt-oss и т.п.) просим Groq
-      // не присылать блок "рассуждений" — нужен только финальный ответ.
-      // Для моделей без reasoning это поле просто игнорируется.
-      reasoning_format: "hidden",
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    const err = new Error(`Groq API вернул ${res.status}`);
+    const err = new Error(`${target.provider} API вернул ${res.status}`);
     err.status = res.status;
     err.body = errText;
     throw err;
@@ -151,19 +207,19 @@ async function callGroqModel(model, messages) {
 
   const data = await res.json();
   let reply = data.choices?.[0]?.message?.content?.trim();
-  if (!reply) throw new Error("Пустой ответ от Groq");
+  if (!reply) throw new Error(`Пустой ответ от ${target.provider}`);
 
   // Страховка: если какая-то модель всё же прислала рассуждения внутри
-  // <think>...</think> (были баги на стороне Groq с этим у gpt-oss), —
-  // вырезаем их, чтобы в чат не улетал внутренний монолог модели.
+  // <think>...</think> (были баги с этим у reasoning-моделей), — вырезаем,
+  // чтобы в чат не улетал внутренний монолог модели.
   reply = reply.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-  if (!reply) throw new Error("Пустой ответ от Groq после очистки <think>");
+  if (!reply) throw new Error(`Пустой ответ от ${target.provider} после очистки <think>`);
 
   return reply;
 }
 
-// ==== Запрос к Groq (OpenAI-совместимый эндпоинт) с фолбэком по моделям ====
-async function askGroq(chatId, userText) {
+// ==== Запрос к LLM с фолбэком по провайдерам и моделям ====
+async function askLLM(chatId, userText) {
   const history = getHistory(chatId);
 
   const messages = [
@@ -174,18 +230,18 @@ async function askGroq(chatId, userText) {
 
   let lastErr;
 
-  // Пробуем модели по кругу начиная с текущей "активной", чтобы не
-  // всегда начинать со сдохшей первой модели в списке.
-  for (let i = 0; i < GROQ_MODELS.length; i++) {
-    const idx = (activeModelIndex + i) % GROQ_MODELS.length;
-    const model = GROQ_MODELS[idx];
+  // Пробуем цели по кругу начиная с текущей "активной", чтобы не
+  // всегда начинать со сдохшей первой цели в списке.
+  for (let i = 0; i < TARGETS.length; i++) {
+    const idx = (activeTargetIndex + i) % TARGETS.length;
+    const target = TARGETS[idx];
 
     try {
-      const reply = await callGroqModel(model, messages);
+      const reply = await callTarget(target, messages);
 
-      if (idx !== activeModelIndex) {
-        console.warn(`Переключился на модель "${model}" (индекс ${idx})`);
-        activeModelIndex = idx;
+      if (idx !== activeTargetIndex) {
+        console.warn(`Переключился на "${target.provider}/${target.model}" (индекс ${idx})`);
+        activeTargetIndex = idx;
       }
 
       pushHistory(chatId, "user", userText);
@@ -195,18 +251,16 @@ async function askGroq(chatId, userText) {
     } catch (err) {
       lastErr = err;
       console.error(
-        `Groq API error [модель "${model}"]:`,
+        `Ошибка [${target.provider}/${target.model}]:`,
         err.status ?? "-",
         err.body ?? err.message
       );
 
-      // Если ошибка не похожа на проблему с самой моделью — нет смысла
-      // перебирать остальные, они, скорее всего, упадут так же.
       if (err.status && !isFallbackWorthy(err.status)) break;
     }
   }
 
-  throw lastErr ?? new Error("Все модели Groq недоступны");
+  throw lastErr ?? new Error("Все провайдеры и модели недоступны");
 }
 
 // ==== Имитация "живой" задержки перед ответом ====
@@ -369,7 +423,7 @@ bot.on("message:text", async (ctx) => {
     await ctx.replyWithChatAction("typing");
 
     // Groq отвечает быстро, так что подтягиваем ответ параллельно с "печатает..."
-    const replyPromise = askGroq(chatId, userText);
+    const replyPromise = askLLM(chatId, userText);
 
     const reply = await replyPromise;
 
