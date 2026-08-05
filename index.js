@@ -86,6 +86,7 @@ const SYSTEM_PROMPT = `
 
 - Иногда сообщение приходит из группового чата, где к тебе обращаются по имени (Женя/Жень) — само обращение уже вырезано из текста, отвечай сразу по сути, не переспрашивай "ты ко мне?".
 - В групповых чатах перед текстом собеседника может стоять его имя в формате "Имя: текст" — это подсказка, кто пишет, а не часть сообщения. Иногда, не в каждом ответе, можешь естественно обратиться к человеку по этому имени (как в обычной беседе), но не через раз и не механически.
+- Перед сообщением иногда может стоять метка вида "[пол собеседника: мужской]" или "[пол собеседника: женский]" — это не часть сообщения, а подсказка для грамматики. Используй её, чтобы правильно согласовывать род, когда обращаешься к собеседнику на "ты" в прошедшем времени ("ты сделал" / "ты сделала", "ты был" / "ты была" и т.п.). Саму метку никогда не комментируй и не упоминай вслух — просто согласуй род в ответе. Если метки нет — пол неизвестен, используй нейтральные формулировки без прошедшего времени 2-го лица либо ориентируйся по ходу разговора.
 
 Правила:
 - Пиши только на русском.
@@ -149,7 +150,85 @@ function getDisplayName(chatId, from) {
   return from.first_name || from.username || "юзер";
 }
 
-// ==== Хранилище истории диалогов (в памяти, по chatId) ====
+// ==== Пол собеседника (эвристика + ручная правка через /gender) ====
+// Нужен, чтобы бот правильно согласовывал род при обращении на "ты" в
+// прошедшем времени ("ты сделал" vs "ты сделала"). Источники по приоритету
+// (более слабый никогда не перезаписывает более сильный):
+//   manual (3) — задано командой /gender, финально, эвристика больше не трогает
+//   text   (2) — угадано по своим же глаголам ("я сделала")
+//   name   (1) — угадано по имени в Telegram, самый слабый сигнал
+const chatGenders = new Map(); // chatId -> Map<userId, { gender: "m"|"f", source: "manual"|"text"|"name" }>
+const SOURCE_PRIORITY = { manual: 3, text: 2, name: 1 };
+
+function getGenderMap(chatId) {
+  if (!chatGenders.has(chatId)) chatGenders.set(chatId, new Map());
+  return chatGenders.get(chatId);
+}
+
+function setGender(chatId, userId, gender, source) {
+  const map = getGenderMap(chatId);
+  const existing = map.get(userId);
+  if (existing && SOURCE_PRIORITY[existing.source] > SOURCE_PRIORITY[source]) return;
+  map.set(userId, { gender, source });
+}
+
+function getGender(chatId, userId) {
+  return getGenderMap(chatId).get(userId)?.gender ?? null;
+}
+
+// --- Эвристика по имени ---
+// Уменьшительные/имена, которые оканчиваются на -а/-я, но мужские —
+// без этого списка их угадало бы как женские.
+const MALE_NAME_EXCEPTIONS = new Set([
+  "никита", "илья", "данила", "фома", "кузьма", "лука", "савва", "гоша",
+  "лёша", "леша", "паша", "миша", "серёжа", "сережа", "костя", "витя",
+  "толя", "коля", "петя", "юра", "дима", "рома", "гена",
+]);
+// Унисекс-имена/уменьшительные — для них имя вообще не сигнал, лучше не гадать.
+const AMBIGUOUS_NAMES = new Set(["саша", "женя", "валя", "шура"]);
+
+function guessGenderFromName(firstName) {
+  const name = (firstName || "").trim().toLowerCase();
+  if (!name || AMBIGUOUS_NAMES.has(name)) return null;
+  if (MALE_NAME_EXCEPTIONS.has(name)) return "m";
+  if (/[ая]$/.test(name)) return "f";
+  return "m"; // грубое приближение: большинство мужских имён не оканчиваются на -а/-я
+}
+
+// --- Эвристика по тексту: "я сделал" -> м, "я сделала" -> ж ---
+// Ищем "я" и ближайший подходящий глагол в пределах нескольких слов после него.
+function guessGenderFromText(text) {
+  const words = text.split(/\s+/);
+  const yaIdx = words.findIndex((w) => /^я$/i.test(w.replace(/[^а-яёА-ЯЁ]/gi, "")));
+  if (yaIdx === -1) return null;
+
+  for (let i = yaIdx + 1; i < Math.min(yaIdx + 5, words.length); i++) {
+    const clean = words[i].replace(/[^а-яёА-ЯЁ]/gi, "").toLowerCase();
+    if (clean.length < 3) continue;
+    if (/(лась|ла)$/.test(clean)) return "f";
+    if (/(лся|л)$/.test(clean)) return "m";
+  }
+  return null;
+}
+
+// Вызывается на каждое сообщение — обновляет догадку, если сигнал есть.
+function updateGenderGuess(chatId, from, text) {
+  const existing = getGenderMap(chatId).get(from.id);
+  if (existing?.source === "manual") return; // ручное значение не трогаем
+
+  const fromText = guessGenderFromText(text);
+  if (fromText) {
+    setGender(chatId, from.id, fromText, "text");
+    return;
+  }
+
+  if (!existing) {
+    const fromName = guessGenderFromName(from.first_name);
+    if (fromName) setGender(chatId, from.id, fromName, "name");
+  }
+}
+
+
 const HISTORY_LIMIT = 12; // сколько последних сообщений держим в контексте
 const histories = new Map();
 
@@ -203,13 +282,27 @@ async function callTarget(target, messages) {
     model: target.model,
     messages,
     temperature: 0.9,
-    max_tokens: 400,
+    // Запас на случай reasoning-моделей: у них часть этого бюджета уходит
+    // на скрытые токены рассуждений (см. комментарий ниже), так что реальный
+    // видимый ответ должен помещаться даже после их вычета.
+    max_tokens: 700,
   };
 
-  // Groq поддерживает это поле для reasoning-моделей (qwen3.6, gpt-oss).
+  // Groq поддерживает это поле для reasoning-моделей (qwen3, gpt-oss).
   // Gemini его игнорирует через OpenAI-совместимый эндпоинт — не мешает.
   if (target.provider === "groq") {
     body.reasoning_format = "hidden";
+
+    // ВАЖНО: у gpt-oss на Groq "скрытые" токены рассуждений всё равно
+    // тратят общий max_tokens (по умолчанию reasoning_effort="medium" может
+    // съесть большую часть лимита на раздумья, и на сам ответ ничего не
+    // остаётся — реплика обрывается на полуслове). Снижаем усилие на
+    // рассуждения, они тут не нужны для болтовни в чате.
+    if (target.model.includes("gpt-oss")) {
+      body.reasoning_effort = "low";
+    } else if (target.model.includes("qwen")) {
+      body.reasoning_effort = "none";
+    }
   }
 
   const res = await fetch(target.baseUrl, {
@@ -230,8 +323,17 @@ async function callTarget(target, messages) {
   }
 
   const data = await res.json();
-  let reply = data.choices?.[0]?.message?.content?.trim();
+  const choice = data.choices?.[0];
+  let reply = choice?.message?.content?.trim();
   if (!reply) throw new Error(`Пустой ответ от ${target.provider}`);
+
+  // Если ответ обрезан по лимиту токенов — видно в логах Render, поможет
+  // понять, что max_tokens/reasoning_effort снова надо подкрутить.
+  if (choice?.finish_reason === "length") {
+    console.warn(
+      `[callTarget] ${target.provider}/${target.model}: ответ обрезан по finish_reason=length (${reply.length} символов)`
+    );
+  }
 
   // Страховка: если какая-то модель всё же прислала рассуждения внутри
   // <think>...</think> (были баги с этим у reasoning-моделей), — вырезаем,
@@ -408,6 +510,46 @@ bot.command("aliases", async (ctx) => {
   await ctx.reply(`текущие алиасы:\n${lines.join("\n")}`);
 });
 
+// /gender — посмотреть или задать пол вручную (перекрывает эвристику навсегда).
+// Использование: /gender м | /gender ж — про себя
+//                реплаем на чьё-то сообщение — про этого человека
+//                без аргументов — показать текущее значение
+bot.command("model", async (ctx) => {
+  const target = TARGETS[activeTargetIndex];
+  await ctx.reply(`сейчас отвечаю через: ${target.provider}/${target.model}`);
+});
+
+bot.command("gender", async (ctx) => {
+  const chatId = ctx.chat.id;
+  const raw = (ctx.match || "").trim().toLowerCase();
+  const target = ctx.message.reply_to_message?.from || ctx.from;
+  const targetLabel = target.first_name || target.username || "этот юзер";
+
+  if (!raw) {
+    const current = getGender(chatId, target.id);
+    await ctx.reply(
+      current
+        ? `сейчас для ${targetLabel} стоит: ${current === "m" ? "мужской" : "женский"}`
+        : `пол для ${targetLabel} не задан — напиши /gender м или /gender ж (можно реплаем на чьё-то сообщение)`
+    );
+    return;
+  }
+
+  const MALE_WORDS = new Set(["м", "муж", "мужской", "male", "m"]);
+  const FEMALE_WORDS = new Set(["ж", "жен", "женский", "female", "f"]);
+
+  let gender;
+  if (MALE_WORDS.has(raw)) gender = "m";
+  else if (FEMALE_WORDS.has(raw)) gender = "f";
+  else {
+    await ctx.reply("не понял — напиши /gender м или /gender ж");
+    return;
+  }
+
+  setGender(chatId, target.id, gender, "manual");
+  await ctx.reply(`ок, записал: ${targetLabel} — ${gender === "m" ? "мужской" : "женский"}`);
+});
+
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
@@ -444,6 +586,15 @@ bot.on("message:text", async (ctx) => {
     // Подсказываем модели, кто говорит — "Имя: текст"
     const displayName = getDisplayName(chatId, ctx.from);
     userText = `${displayName}: ${userText}`;
+  }
+
+  // Обновляем догадку о поле по исходному тексту (не по обрезанному/с
+  // префиксами) и, если пол известен, добавляем метку для модели —
+  // см. пояснение этой метки в SYSTEM_PROMPT.
+  updateGenderGuess(chatId, ctx.from, ctx.message.text);
+  const gender = getGender(chatId, ctx.from.id);
+  if (gender) {
+    userText = `[пол собеседника: ${gender === "m" ? "мужской" : "женский"}] ${userText}`;
   }
 
   try {
@@ -485,6 +636,8 @@ async function registerCommands() {
     { command: "alias", description: "задать имя человеку вместо ника" },
     { command: "unalias", description: "убрать заданное имя" },
     { command: "aliases", description: "показать список алиасов" },
+    { command: "gender", description: "посмотреть/задать пол (свой или реплаем)" },
+    { command: "model", description: "какая модель сейчас отвечает" },
   ]);
   console.log("Команды зарегистрированы в Telegram");
 }
