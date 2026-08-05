@@ -134,6 +134,10 @@ async function callGroqModel(model, messages) {
       messages,
       temperature: 0.9,
       max_tokens: 400,
+      // На случай reasoning-моделей (qwen3.6, gpt-oss и т.п.) просим Groq
+      // не присылать блок "рассуждений" — нужен только финальный ответ.
+      // Для моделей без reasoning это поле просто игнорируется.
+      reasoning_format: "hidden",
     }),
   });
 
@@ -146,8 +150,15 @@ async function callGroqModel(model, messages) {
   }
 
   const data = await res.json();
-  const reply = data.choices?.[0]?.message?.content?.trim();
+  let reply = data.choices?.[0]?.message?.content?.trim();
   if (!reply) throw new Error("Пустой ответ от Groq");
+
+  // Страховка: если какая-то модель всё же прислала рассуждения внутри
+  // <think>...</think> (были баги на стороне Groq с этим у gpt-oss), —
+  // вырезаем их, чтобы в чат не улетал внутренний монолог модели.
+  reply = reply.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  if (!reply) throw new Error("Пустой ответ от Groq после очистки <think>");
+
   return reply;
 }
 
