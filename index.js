@@ -293,22 +293,22 @@ async function callTarget(target, messages) {
     model: target.model,
     messages,
     temperature: 0.9,
-    // Большой запас: у reasoning-моделей значительная (иногда почти вся)
-    // часть этого бюджета уходит на скрытые токены рассуждений ещё до
-    // того, как начнётся сам видимый ответ — даже на низком reasoning_effort.
-    // Видели обрезание при 700, поднимаем с большим запасом.
-    max_tokens: 1500,
+    // gemini-2.5-flash (единственная линейка, где Google даёт thinking_budget=0
+    // по-настоящему) снята с доступа — остался gemini-flash-latest/3.5-flash,
+    // а там размышления нельзя выключить до нуля вообще никакими флагами.
+    // Единственный рычаг, который реально работает — щедрый общий бюджет,
+    // чтобы после того, что модель потратит на размышления, оставалось
+    // достаточно на сам видимый ответ.
+    max_tokens: 3000,
   };
 
   // Groq поддерживает это поле для reasoning-моделей (qwen3, gpt-oss).
   if (target.provider === "groq") {
     body.reasoning_format = "hidden";
 
-    // ВАЖНО: у gpt-oss на Groq "скрытые" токены рассуждений всё равно
-    // тратят общий max_tokens (по умолчанию reasoning_effort="medium" может
-    // съесть большую часть лимита на раздумья, и на сам ответ ничего не
-    // остаётся — реплика обрывается на полуслове). Снижаем усилие на
-    // рассуждения, они тут не нужны для болтовни в чате.
+    // У gpt-oss на Groq reasoning_effort реально снижает объём размышлений
+    // (в отличие от Gemini 3, где это не гарантировано) — оставляем как
+    // основной способ сэкономить бюджет для этого провайдера.
     if (target.model.includes("gpt-oss")) {
       body.reasoning_effort = "low";
     } else if (target.model.includes("qwen")) {
@@ -316,15 +316,12 @@ async function callTarget(target, messages) {
     }
   }
 
-  // Gemini (через OpenAI-совместимый эндпоинт) тоже "думает" перед ответом.
-  // reasoning_effort снижает усилие, но не гарантированно убирает раздумья
-  // до нуля на всех моделях — поэтому дополнительно пробуем нативное поле
-  // Gemini thinking_budget=0 через extra_body (специфично для Google,
-  // OpenAI-эндпоинты его должны просто игнорировать, если что-то не так
-  // передалось — не критично).
+  // Для Gemini reasoning_effort/thinking_budget оставляем как best-effort —
+  // не вредит, если модель их проигнорирует, но полагаться на них как на
+  // решение проблемы больше нельзя (см. комментарий про max_tokens выше).
   if (target.provider === "gemini") {
     body.reasoning_effort = "low";
-    body.extra_body = { google: { thinking_config: { thinking_budget: 0 } } };
+    body.google = { thinking_config: { thinking_budget: 0 } };
   }
 
   const res = await fetch(target.baseUrl, {
@@ -629,7 +626,12 @@ bot.on("message:text", async (ctx) => {
   }
 
   try {
-    await ctx.replyWithChatAction("typing");
+    // Явно прокидываем message_thread_id (для групп с темами/топиками) —
+    // без этого "печатает" иногда не показывается в конкретной теме,
+    // даже если сам запрос уходит в общий чат.
+    await ctx.replyWithChatAction("typing", {
+      message_thread_id: ctx.message.message_thread_id,
+    });
 
     // Groq отвечает быстро, так что подтягиваем ответ параллельно с "печатает..."
     const replyPromise = askLLM(chatId, userText);
@@ -640,7 +642,10 @@ bot.on("message:text", async (ctx) => {
     await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
 
     if (isGroup) {
-      await ctx.reply(reply, { reply_parameters: { message_id: ctx.message.message_id } });
+      await ctx.reply(reply, {
+        reply_parameters: { message_id: ctx.message.message_id },
+        message_thread_id: ctx.message.message_thread_id,
+      });
     } else {
       await ctx.reply(reply);
     }
