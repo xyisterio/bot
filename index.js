@@ -316,12 +316,12 @@ async function callTarget(target, messages) {
     }
   }
 
-  // Для Gemini reasoning_effort/thinking_budget оставляем как best-effort —
-  // не вредит, если модель их проигнорирует, но полагаться на них как на
-  // решение проблемы больше нельзя (см. комментарий про max_tokens выше).
+  // Для Gemini reasoning_effort — единственное задокументированное и реально
+  // принимаемое API поле для управления размышлениями (проверено curl-примером
+  // Google). Поле "google.thinking_config" через голый JSON API не принимает
+  // (упало с 400 Unknown name "google") — убрано. Полагаемся на max_tokens.
   if (target.provider === "gemini") {
     body.reasoning_effort = "low";
-    body.google = { thinking_config: { thinking_budget: 0 } };
   }
 
   const res = await fetch(target.baseUrl, {
