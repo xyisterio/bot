@@ -107,6 +107,38 @@ if (TARGETS.length === 0) {
 // "остывающей" после ошибки и не пробуется первой (см. askLLM).
 const cooldownUntil = new Array(TARGETS.length).fill(0);
 
+// ==== Стикеры ====
+// Ключ — категория ситуации, значение — массив file_id стикеров этой
+// категории (можно несколько на категорию — при отправке берётся случайный,
+// чтобы одна и та же реакция не приедалась). Как достать file_id — переслать
+// стикер боту-логгеру (или @RawDataBot) и скопировать поле file_id из ответа.
+const STICKERS = {
+  greeting: [
+    "CAACAgIAAxkBAAFRJrxqdFGtFrhAvsZSKTbhwOxdDXgw1gAC7qUAAssZoEsgQQ_OmbChUz0E",
+    "CAACAgIAAxkBAAFRJr5qdFGzlWziBDSzo9OKr6xy2KlmggACi6UAAs4noEvcBPY8x_v0Lj0E",
+    "CAACAgIAAxkBAAFRJsBqdFG4fxgGhbMIOn9kAlOvqeC_qgAC_aQAAghaoUtXidSucVEdLz0E",
+  ],
+};
+
+function pickSticker(key) {
+  const pool = STICKERS[key];
+  if (!pool || pool.length === 0) return null;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// Вычленяет тег "[sticker: ключ]" из конца ответа модели (если он там есть)
+// и возвращает { text, stickerKey } — чистый текст без тега и ключ категории.
+// Тег может стоять только последней строкой, чтобы случайно не срезать текст
+// вопроса пользователя из середины ответа.
+function extractSticker(text) {
+  const match = text.match(/\n?\[sticker:\s*([a-zA-Zа-яёА-ЯЁ_]+)\]\s*$/i);
+  if (!match) return { text, stickerKey: null };
+  const key = match[1].toLowerCase();
+  const clean = text.slice(0, match.index).trim();
+  // Если ключ не из известного списка — просто выкидываем тег, но не считаем ошибкой
+  return { text: clean || text, stickerKey: STICKERS[key] ? key : null };
+}
+
 // ==== Персонаж — меняешь только этот текст, остального не трогаешь ====
 const SYSTEM_PROMPT = `
 Ты не играешь роль Жени — ты воспроизводишь его стиль общения и мышления. Главная цель: твои ответы должны создавать ощущение, что человек разговаривает именно с Женей. Не копируй фразы дословно — воспроизводи характер, привычки, ход мыслей и манеру общения.
@@ -163,6 +195,7 @@ const SYSTEM_PROMPT = `
 - Пиши только на русском.
 - Не используй markdown-разметку (звёздочки, решётки) — обычный текст, как в переписке.
 - Отвечай ОДНИМ финальным вариантом реплики. Никогда не присылай несколько вариантов ответа через "or"/"или", не бери фразы в кавычки, не оформляй это как черновик или выбор — только готовый чистовой текст, который сразу можно отправить в чат.
+- Если ситуация подходящая, можешь ПОСЛЕДНЕЙ строкой ответа (и только последней) добавить тег вида [sticker: greeting] — это отправит стикер вместе с текстом. Доступные ключи сейчас: greeting (приветствие, когда с тобой здороваются). Используй нечасто и только когда реально в тему, не в каждом ответе. Если ситуация не подходит ни под один из доступных ключей — тег не ставь.
 `.trim();
 
 // ==== Имя бота — на какие обращения реагировать в группах ====
@@ -590,7 +623,8 @@ async function askLLM(chatId, userText) {
     const target = TARGETS[idx];
 
     try {
-      const reply = await callTarget(target, messages);
+      const rawReply = await callTarget(target, messages);
+      const { text: reply, stickerKey } = extractSticker(rawReply);
 
       cooldownUntil[idx] = 0; // на успехе снимаем cooldown, если он был
       if (idx !== activeTargetIndex) {
@@ -599,10 +633,12 @@ async function askLLM(chatId, userText) {
         saveActiveTargetIndex();
       }
 
+      // В историю кладём чистый текст без тега — модели не нужно видеть
+      // свой же служебный тег в контексте будущих сообщений.
       pushHistory(chatId, "user", userText);
       pushHistory(chatId, "assistant", reply);
 
-      return reply;
+      return { text: reply, stickerKey };
     } catch (err) {
       lastErr = err;
       console.error(
@@ -709,6 +745,8 @@ bot.command("start", async (ctx) => {
   const chatId = ctx.chat.id;
   await clearHistory(chatId); // сброс истории при /start
   await ctx.reply("йо");
+  const stickerId = pickSticker("greeting");
+  if (stickerId) await ctx.replyWithSticker(stickerId);
 });
 
 // Доступна только владельцу — сброс контекста диалога влияет на всех
@@ -936,7 +974,7 @@ bot.on("message:text", async (ctx) => {
     // Groq отвечает быстро, так что подтягиваем ответ параллельно с "печатает..."
     const replyPromise = askLLM(chatId, userText);
 
-    const reply = await replyPromise;
+    const { text: reply, stickerKey } = await replyPromise;
 
     // держим typing включенным нужное время, чтобы не было мгновенного ответа
     await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
@@ -948,6 +986,13 @@ bot.on("message:text", async (ctx) => {
       });
     } else {
       await ctx.reply(reply);
+    }
+
+    const stickerId = stickerKey && pickSticker(stickerKey);
+    if (stickerId) {
+      await ctx.replyWithSticker(stickerId, {
+        message_thread_id: ctx.message.message_thread_id,
+      });
     }
   } catch (err) {
     console.error("Ошибка обработки сообщения:", err);
