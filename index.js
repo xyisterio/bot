@@ -126,8 +126,13 @@ const STICKERS = {
     "CAACAgIAAxkBAAFRJxFqdFbxZqxhkvpKDVbIaBtHhag4cwACzooAAiJ8cUpq6AjHNaugLT0E",
     "CAACAgIAAxkBAAFRJxVqdFb6M603CYV-WETNYD_q8Mev3AACXIoAAorleUptjSEtmSh1Uj0E",
   ],
-  banter: [
-    // сюда file_id для реакции на фразы-мемы (см. BANTER_TRIGGERS ниже)
+  banter_male: [
+    // сюда file_id для реакции на фразы-мемы от мужчин (см. MALE_BANTER_TRIGGERS ниже)
+  ],
+  banter_female: [
+    "CAACAgIAAxkBAAFRKLVqdGzJu-uYlwrt_0GXpbGe7x2WwAACHKwAApE6oEuhMw0Fyh-PBT0E",
+    "CAACAgIAAxkBAAFRKLNqdGzCi-bDe-Q6JCFvmx3sWPNhiAACTqYAAsq9qEtnK8tKkmUcbz0E",
+    "CAACAgIAAxkBAAFRKLFqdGy9VRyrLj8qGJI0Y_sT5OZgiQACHqsAAkp1oEttG7nqMrHMzz0E",
   ],
 };
 
@@ -137,19 +142,25 @@ function pickSticker(key) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
-// ==== Триггерные фразы для стикер-стёба ====
-// Работает одинаково для ЛЮБОГО отправителя — без проверки, кто пишет,
-// пол/ориентация здесь вообще не смотрятся. Просто конкретная фраза в
-// сообщении -> стикер из категории "banter". Добавляй свои фразы в массив,
-// регистр не важен.
-const BANTER_TRIGGERS = [
+// ==== Триггерные фразы для стикер-стёба (по полу отправителя) ====
+// Срабатывает, только если пол собеседника уже определён (см. getGender
+// ниже) — для мужчин смотрим MALE_BANTER_TRIGGERS -> стикер из категории
+// "banter_male", для женщин FEMALE_BANTER_TRIGGERS -> "banter_female".
+// Если пол неизвестен — не срабатывает ни один из блоков. Добавляй свои
+// фразы в соответствующий массив, регистр не важен.
+const MALE_BANTER_TRIGGERS = [
   "готовь жопу",
   "давай трахаться",
 ];
 
-function matchesBanterTrigger(text) {
+// Женский блок — любовные/сексуальные темы. Добавь сюда фразы-триггеры,
+// стикеры для STICKERS.banter_female подставишь отдельно.
+const FEMALE_BANTER_TRIGGERS = [
+];
+
+function matchesTrigger(text, triggers) {
   const lower = text.toLowerCase();
-  return BANTER_TRIGGERS.some((phrase) => lower.includes(phrase));
+  return triggers.some((phrase) => lower.includes(phrase));
 }
 
 // Вычленяет тег "[sticker: ключ]" из конца ответа модели (если он там есть)
@@ -223,7 +234,10 @@ const SYSTEM_PROMPT = `
 - Пиши только на русском.
 - Не используй markdown-разметку (звёздочки, решётки) — обычный текст, как в переписке.
 - Отвечай ОДНИМ финальным вариантом реплики. Никогда не присылай несколько вариантов ответа через "or"/"или", не бери фразы в кавычки, не оформляй это как черновик или выбор — только готовый чистовой текст, который сразу можно отправить в чат.
-- Если ситуация подходящая, можешь ПОСЛЕДНЕЙ строкой ответа (и только последней) добавить тег вида [sticker: greeting] — это отправит стикер вместе с текстом. Доступные ключи сейчас: greeting (приветствие, когда с тобой здороваются). Используй нечасто и только когда реально в тему, не в каждом ответе. Если ситуация не подходит ни под один из доступных ключей — тег не ставь.
+- Если ситуация подходящая, можешь ПОСЛЕДНЕЙ строкой ответа (и только последней) добавить тег вида [sticker: ключ] — это отправит стикер вместе с текстом. Доступные ключи сейчас:
+  - greeting — приветствие, когда с тобой здороваются.
+  - banter_male / banter_female — собеседник заигрывает с тобой, намекает на секс, пытается разыграть романтическую/любовную сцену или шутит на эту тему именно В ТВОЮ СТОРОНУ (не когда просто обсуждают отношения/любовь в целом как тему разговора, а когда это направлено на тебя). Выбирай ключ по метке "[пол собеседника: ...]" в начале сообщения — мужской пол -> banter_male, женский -> banter_female. Если метки пола нет — тег не ставь, ключ угадывать не нужно.
+  Используй теги нечасто и только когда реально в тему, не в каждом подходящем по смыслу ответе — это не должно ощущаться как автоматическая реакция на каждый флирт. Если ситуация не подходит ни под один из доступных ключей — тег не ставь.
 `.trim();
 
 // ==== Имя бота — на какие обращения реагировать в группах ====
@@ -1036,20 +1050,41 @@ bot.on("message:text", async (ctx) => {
   const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
   let userText = ctx.message.text;
 
-  // Стёб по триггерным фразам (BANTER_TRIGGERS) — срабатывает независимо
-  // от того, обращались ли к боту напрямую, и не зависит от того, кто
-  // автор сообщения (без проверки пола/ориентации/чего-либо ещё). Просто
-  // конкретная фраза в тексте -> стикер реплаем. Дальше сообщение всё
-  // равно обрабатывается как обычно (вдруг оно ещё и адресовано боту).
-  if (matchesBanterTrigger(userText)) {
-    const stickerId = pickSticker("banter");
+  // Определяем пол пораньше (до проверки триггеров), чтобы выбрать нужный
+  // блок — мужской или женский. Смотрим по исходному тексту сообщения.
+  updateGenderGuess(chatId, ctx.from, ctx.message.text);
+  const gender = getGender(chatId, ctx.from.id);
+
+  // Стёб по триггерным фразам — срабатывает независимо от того,
+  // обращались ли к боту напрямую. Блок выбирается по полу отправителя:
+  // мужчины -> MALE_BANTER_TRIGGERS/"banter_male", женщины ->
+  // FEMALE_BANTER_TRIGGERS/"banter_female". Если пол неизвестен — не
+  // срабатывает. Дальше сообщение всё равно обрабатывается как обычно
+  // (вдруг оно ещё и адресовано боту).
+  // regexStickerFired — чтобы модель не прислала ещё один стикер тем же
+  // тегом на то же сообщение (см. использование ниже, у отправки ответа).
+  let regexStickerFired = false;
+  if (gender === "m" && matchesTrigger(userText, MALE_BANTER_TRIGGERS)) {
+    regexStickerFired = true;
+    const stickerId = pickSticker("banter_male");
     if (stickerId) {
       await ctx
         .replyWithSticker(stickerId, {
           reply_parameters: { message_id: ctx.message.message_id },
           message_thread_id: ctx.message.message_thread_id,
         })
-        .catch((err) => console.error("Не удалось отправить banter-стикер:", err));
+        .catch((err) => console.error("Не удалось отправить banter_male-стикер:", err));
+    }
+  } else if (gender === "f" && matchesTrigger(userText, FEMALE_BANTER_TRIGGERS)) {
+    regexStickerFired = true;
+    const stickerId = pickSticker("banter_female");
+    if (stickerId) {
+      await ctx
+        .replyWithSticker(stickerId, {
+          reply_parameters: { message_id: ctx.message.message_id },
+          message_thread_id: ctx.message.message_thread_id,
+        })
+        .catch((err) => console.error("Не удалось отправить banter_female-стикер:", err));
     }
   }
 
@@ -1094,11 +1129,9 @@ bot.on("message:text", async (ctx) => {
     }
   }
 
-  // Обновляем догадку о поле по исходному тексту (не по обрезанному/с
-  // префиксами) и, если пол известен, добавляем метку для модели —
-  // см. пояснение этой метки в SYSTEM_PROMPT.
-  updateGenderGuess(chatId, ctx.from, ctx.message.text);
-  const gender = getGender(chatId, ctx.from.id);
+  // Пол уже определён выше (до блока с banter-триггерами) — тут просто
+  // добавляем метку для модели, если он известен. См. пояснение метки
+  // в SYSTEM_PROMPT.
   if (gender) {
     userText = `[пол собеседника: ${gender === "m" ? "мужской" : "женский"}] ${userText}`;
   }
@@ -1128,7 +1161,9 @@ bot.on("message:text", async (ctx) => {
       await ctx.reply(reply);
     }
 
-    const stickerId = stickerKey && pickSticker(stickerKey);
+    // Если явная фраза уже вызвала стикер по regex выше — не дублируем
+    // ещё одним стикером от тега модели на то же сообщение.
+    const stickerId = !regexStickerFired && stickerKey && pickSticker(stickerKey);
     if (stickerId) {
       await ctx.replyWithSticker(stickerId, {
         message_thread_id: ctx.message.message_thread_id,
