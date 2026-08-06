@@ -711,7 +711,10 @@ bot.command("start", async (ctx) => {
   await ctx.reply("йо");
 });
 
+// Доступна только владельцу — сброс контекста диалога влияет на всех
+// в чате, не должен быть в руках любого участника группы.
 bot.command("reset", async (ctx) => {
+  if (!isOwner(ctx)) return;
   await clearHistory(ctx.chat.id);
   await ctx.reply("память почистил");
 });
