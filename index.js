@@ -1286,6 +1286,30 @@ bot.on("message:text", async (ctx) => {
       if (!userText) userText = "привет"; // если написали просто "Женя"
     }
 
+    // Если бота явно упомянули через @username — вырезаем сам тег из текста,
+    // который пойдёт модели. Иначе модель увидит сырой "@EVGEN1Y_VBOT" и
+    // может спутать его с тегом настоящего Жени (@EVGEN1Y_V — это ровно
+    // префикс юзернейма бота), хотя isMentioned/isOwnerMentioned на уровне
+    // кода уже корректно их различают (\b в ownerMentionRegex + проверка
+    // !isMentioned ниже) — проблема именно в том, что сырая строка всё
+    // равно долетает до LLM и вводит её в заблуждение.
+    if (isMentioned) {
+      const botMentionEntity = ctx.message.entities.find(
+        (e) =>
+          e.type === "mention" &&
+          userText
+            .substring(e.offset, e.offset + e.length)
+            .toLowerCase() === `@${ctx.me.username?.toLowerCase()}`
+      );
+      if (botMentionEntity) {
+        userText =
+          userText.slice(0, botMentionEntity.offset) +
+          userText.slice(botMentionEntity.offset + botMentionEntity.length);
+        userText = userText.trim();
+        if (!userText) userText = "привет"; // если написали только "@EVGEN1Y_VBOT"
+      }
+    }
+
     // Подсказываем модели, кто говорит — "Имя: текст"
     const displayName = getDisplayName(chatId, ctx.from);
     userText = `${displayName}: ${userText}`;
