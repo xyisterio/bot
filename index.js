@@ -718,6 +718,13 @@ async function callTarget(target, messages) {
   let reply = choice?.message?.content?.trim();
   if (!reply) throw new Error(`Пустой ответ от ${target.provider}`);
 
+  // data.model — это то, что РЕАЛЬНО ответило (важно для роутеров вроде
+  // HF/OpenRouter, которые под капотом динамически выбирают бэкенд —
+  // может отличаться от target.model, который мы запросили).
+  // system_fingerprint иногда содержит доп. инфо о бэкенде/версии.
+  const actualModel = data.model || null;
+  const systemFingerprint = data.system_fingerprint || null;
+
   // Если ответ обрезан по лимиту токенов — не отдаём пользователю огрызок
   // фразы, а считаем это ошибкой цели: сработает фолбэк на следующую
   // модель в TARGETS (см. askLLM). Само событие видно в логах Render.
@@ -744,7 +751,7 @@ async function callTarget(target, messages) {
     throw new Error(`${target.provider} прислал утечку рассуждений вместо ответа`);
   }
 
-  return reply;
+  return { reply, actualModel, systemFingerprint };
 }
 
 // ==== Запрос к LLM с фолбэком по провайдерам и моделям ====
@@ -785,11 +792,20 @@ async function askLLM(chatId, userText) {
     const target = TARGETS[idx];
 
     try {
-      const rawReply = await callTarget(target, messages);
+      const { reply: rawReply, actualModel, systemFingerprint } = await callTarget(target, messages);
       // ВРЕМЕННЫЙ DEBUG-ЛОГ — убрать после проверки тегов [sticker: ...].
       // Показывает сырой ответ модели ДО вырезания тега, чтобы понять,
       // ставит ли модель тег вообще, и если ставит — с правильным ли ключом.
-      console.log(`[DEBUG rawReply от ${target.provider}/${target.model}]:`, JSON.stringify(rawReply));
+      // actualModel/systemFingerprint — то, что реально ответило по данным
+      // самого API (важно для роутеров HF/OpenRouter: реальный бэкенд может
+      // отличаться от target.model, который мы запросили).
+      console.log(
+        `[DEBUG rawReply от ${target.provider}/${target.model}` +
+          (actualModel && actualModel !== target.model ? ` → фактически ответил: ${actualModel}` : "") +
+          (systemFingerprint ? ` | fingerprint: ${systemFingerprint}` : "") +
+          `]:`,
+        JSON.stringify(rawReply)
+      );
 
       const { text: reply, stickerKey } = extractSticker(rawReply);
 
