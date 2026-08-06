@@ -782,6 +782,11 @@ async function askLLM(chatId, userText) {
 
     try {
       const rawReply = await callTarget(target, messages);
+      // ВРЕМЕННЫЙ DEBUG-ЛОГ — убрать после проверки тегов [sticker: ...].
+      // Показывает сырой ответ модели ДО вырезания тега, чтобы понять,
+      // ставит ли модель тег вообще, и если ставит — с правильным ли ключом.
+      console.log(`[DEBUG rawReply от ${target.provider}/${target.model}]:`, JSON.stringify(rawReply));
+
       const { text: reply, stickerKey } = extractSticker(rawReply);
 
       cooldownUntil[idx] = 0; // на успехе снимаем cooldown, если он был
