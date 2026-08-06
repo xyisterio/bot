@@ -51,6 +51,19 @@ const GEMINI_MODELS = (process.env.GEMINI_MODEL || "gemini-flash-latest,gemini-3
   .map((m) => m.trim())
   .filter(Boolean);
 
+// ==== Таймаут на один запрос к модели и "остывание" недоступных целей ====
+// REQUEST_TIMEOUT_MS — сколько максимум ждём ответа от одной модели, прежде
+// чем считать её недоступной и уйти на фолбэк (вместо того чтобы зависать
+// на несколько минут, если провайдер просто не отвечает).
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 20000;
+// MODEL_COOLDOWN_MS — на сколько "замораживаем" модель после ошибки, прежде
+// чем снова пробовать её первой. Пока цель в cooldown — бот сразу пробует
+// следующую по списку, не дожидаясь таймаута на мёртвой модели каждый раз.
+// Как только cooldown истёк, бот на следующем запросе снова начнёт с неё
+// (обычно это основной провайдер, напр. gemini) — то есть возврат к
+// основной модели происходит автоматически, без ручных команд.
+const MODEL_COOLDOWN_MS = Number(process.env.MODEL_COOLDOWN_MS) || 5 * 60 * 1000;
+
 // Единый список целей для фолбэка: [{ provider, model, baseUrl, apiKey }, ...]
 // Порядок провайдеров — из PROVIDER_ORDER, порядок моделей внутри — как задано в env.
 const PROVIDER_CONFIGS = {
@@ -89,6 +102,10 @@ if (TARGETS.length === 0) {
     "Не задано ни одной рабочей модели — проверь PROVIDER_ORDER, GROQ_API_KEY / GEMINI_API_KEY"
   );
 }
+
+// cooldownUntil[idx] — таймстамп (мс), до которого цель TARGETS[idx] считается
+// "остывающей" после ошибки и не пробуется первой (см. askLLM).
+const cooldownUntil = new Array(TARGETS.length).fill(0);
 
 // ==== Персонаж — меняешь только этот текст, остального не трогаешь ====
 const SYSTEM_PROMPT = `
@@ -177,6 +194,14 @@ const ownerMentionRegex = new RegExp(
   `@${OWNER_USERNAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
   "i"
 );
+
+// Проверка "это владелец бота пишет?" — для команд, которые не должны быть
+// доступны всем в группе (например /model). Сверяем telegram-юзернейм
+// отправителя с OWNER_USERNAME (тем же, что задан в env для owner-меты).
+function isOwner(ctx) {
+  const username = ctx.from?.username;
+  return !!username && username.toLowerCase() === OWNER_USERNAME.toLowerCase();
+}
 
 // ==== Алиасы участников (по chatId -> userId -> заданное имя) ====
 // Живут в памяти как кэш, но зеркалятся в Redis (ключ aliases:{chatId}) —
@@ -388,7 +413,7 @@ async function saveActiveTargetIndex() {
 // Ошибки, при которых имеет смысл пробовать следующую цель:
 // модель/провайдер недоступны, лимиты исчерпаны и т.п.
 function isFallbackWorthy(status) {
-  return [400, 401, 403, 404, 422, 429, 500, 502, 503].includes(status);
+  return [400, 401, 403, 404, 422, 429, 500, 502, 503, 504].includes(status);
 }
 
 // Страховка от бага некоторых reasoning-моделей (замечено у gpt-oss на Groq):
@@ -461,14 +486,36 @@ async function callTarget(target, messages) {
     body.reasoning_effort = "low";
   }
 
-  const res = await fetch(target.baseUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${target.apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
+  // Таймаут на сам запрос: если провайдер завис и не отвечает вообще
+  // (не дал ни 200, ни ошибку) — раньше это вешало ответ пользователю
+  // на минуты вперёд. Теперь через REQUEST_TIMEOUT_MS обрываем запрос и
+  // уходим на фолбэк, как при обычной ошибке.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let res;
+  try {
+    res = await fetch(target.baseUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${target.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      const timeoutErr = new Error(
+        `${target.provider}/${target.model} не ответил за ${REQUEST_TIMEOUT_MS}мс — таймаут`
+      );
+      timeoutErr.status = 504;
+      throw timeoutErr;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!res.ok) {
     const errText = await res.text();
@@ -524,15 +571,28 @@ async function askLLM(chatId, userText) {
 
   let lastErr;
 
-  // Пробуем цели по кругу начиная с текущей "активной", чтобы не
-  // всегда начинать со сдохшей первой цели в списке.
-  for (let i = 0; i < TARGETS.length; i++) {
-    const idx = (activeTargetIndex + i) % TARGETS.length;
+  // Порядок попыток на этот запрос: сначала цели НЕ в cooldown (в исходном
+  // порядке TARGETS — т.е. первой пробуется основной провайдер, напр.
+  // gemini), затем те, что ещё "остывают" после недавней ошибки — их
+  // пробуем последними, но не выкидываем совсем, чтобы бот всё равно
+  // ответил, если вдруг остыть успели вообще все.
+  // Благодаря этому бот не "залипает" на фолбэк-модели навсегда: как
+  // только у основной цели истёк cooldown, следующий же запрос снова
+  // начнёт с неё — переключение туда-обратно происходит само.
+  const now = Date.now();
+  const order = [...TARGETS.keys()].sort((a, b) => {
+    const aCold = cooldownUntil[a] > now ? 1 : 0;
+    const bCold = cooldownUntil[b] > now ? 1 : 0;
+    return aCold - bCold || a - b;
+  });
+
+  for (const idx of order) {
     const target = TARGETS[idx];
 
     try {
       const reply = await callTarget(target, messages);
 
+      cooldownUntil[idx] = 0; // на успехе снимаем cooldown, если он был
       if (idx !== activeTargetIndex) {
         console.warn(`Переключился на "${target.provider}/${target.model}" (индекс ${idx})`);
         activeTargetIndex = idx;
@@ -551,7 +611,12 @@ async function askLLM(chatId, userText) {
         err.body ?? err.message
       );
 
+      // Без статуса — сетевая ошибка/таймаут (см. AbortError в callTarget,
+      // тому уже проставлен status=504, так что сюда попадают только совсем
+      // неожиданные исключения) — тоже считаем фолбэк-достойной.
       if (err.status && !isFallbackWorthy(err.status)) break;
+
+      cooldownUntil[idx] = Date.now() + MODEL_COOLDOWN_MS;
     }
   }
 
@@ -751,9 +816,24 @@ bot.command("aliases", async (ctx) => {
 // Использование: /gender м | /gender ж — про себя
 //                реплаем на чьё-то сообщение — про этого человека
 //                без аргументов — показать текущее значение
+// Доступно только владельцу (см. OWNER_USERNAME / isOwner) — остальным
+// не сообщаем, через какого провайдера сейчас отвечает бот. Тем же
+// способом (if (!isOwner(ctx)) return;) можно закрыть и любую другую
+// команду ниже, если понадобится.
 bot.command("model", async (ctx) => {
+  if (!isOwner(ctx)) return;
   const target = TARGETS[activeTargetIndex];
-  await ctx.reply(`сейчас отвечаю через: ${target.provider}/${target.model}`);
+  const cooling = TARGETS
+    .map((t, i) => ({ t, until: cooldownUntil[i] }))
+    .filter((x) => x.until > Date.now());
+  let text = `сейчас отвечаю через: ${target.provider}/${target.model}`;
+  if (cooling.length) {
+    const list = cooling
+      .map((x) => `${x.t.provider}/${x.t.model} (ещё ~${Math.ceil((x.until - Date.now()) / 1000)}с)`)
+      .join(", ");
+    text += `\nв cooldown: ${list}`;
+  }
+  await ctx.reply(text);
 });
 
 bot.command("gender", async (ctx) => {
