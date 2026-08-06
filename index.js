@@ -118,12 +118,38 @@ const STICKERS = {
     "CAACAgIAAxkBAAFRJr5qdFGzlWziBDSzo9OKr6xy2KlmggACi6UAAs4noEvcBPY8x_v0Lj0E",
     "CAACAgIAAxkBAAFRJsBqdFG4fxgGhbMIOn9kAlOvqeC_qgAC_aQAAghaoUtXidSucVEdLz0E",
   ],
+  music: [
+    "CAACAgIAAxkBAAFRJwNqdFbAsR3Xo-vR4efleGEaIXKtkQAC0I0AAhQ2cEq0B2sbW9LAED0E",
+    "CAACAgIAAxkBAAFRJwdqdFbIASfzdRCthNzyQ997NM9WkQAClJEAArVlcUqurKxe4fBQyD0E",
+    "CAACAgIAAxkBAAFRJwlqdFbQc6qJqU2-5uzdcUhcx-SR1AAC8owAAu9_eEpX3FI4KWU-ZT0E",
+    "CAACAgIAAxkBAAFRJwtqdFbVaL4iSQ6oRwa9LdC7BudJggAC5ZYAAor9eEqnEEgY_YOVjz0E",
+    "CAACAgIAAxkBAAFRJxFqdFbxZqxhkvpKDVbIaBtHhag4cwACzooAAiJ8cUpq6AjHNaugLT0E",
+    "CAACAgIAAxkBAAFRJxVqdFb6M603CYV-WETNYD_q8Mev3AACXIoAAorleUptjSEtmSh1Uj0E",
+  ],
+  banter: [
+    // сюда file_id для реакции на фразы-мемы (см. BANTER_TRIGGERS ниже)
+  ],
 };
 
 function pickSticker(key) {
   const pool = STICKERS[key];
   if (!pool || pool.length === 0) return null;
   return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ==== Триггерные фразы для стикер-стёба ====
+// Работает одинаково для ЛЮБОГО отправителя — без проверки, кто пишет,
+// пол/ориентация здесь вообще не смотрятся. Просто конкретная фраза в
+// сообщении -> стикер из категории "banter". Добавляй свои фразы в массив,
+// регистр не важен.
+const BANTER_TRIGGERS = [
+  "готовь жопу",
+  "давай трахаться",
+];
+
+function matchesBanterTrigger(text) {
+  const lower = text.toLowerCase();
+  return BANTER_TRIGGERS.some((phrase) => lower.includes(phrase));
 }
 
 // Вычленяет тег "[sticker: ключ]" из конца ответа модели (если он там есть)
@@ -948,10 +974,48 @@ bot.command("gender", async (ctx) => {
   await ctx.reply(`ок, записал: ${targetLabel} — ${gender === "m" ? "мужской" : "женский"}`);
 });
 
+// ==== Реакция стикером на присланную песню/аудио ====
+// Отдельно от текстовых ответов через LLM — тут модель вообще не участвует,
+// это чисто механическая реакция: пришло аудио/голосовое → шлём стикер из
+// категории "music". В группе реагируем, только если это реплай на
+// сообщение бота (иначе бот реагировал бы на любую музыку в чате подряд).
+bot.on(["message:audio", "message:voice"], async (ctx) => {
+  const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+  if (isGroup) {
+    const isReplyToBot = ctx.message.reply_to_message?.from?.id === ctx.me.id;
+    if (!isReplyToBot) return;
+  }
+
+  const stickerId = pickSticker("music");
+  if (!stickerId) return; // категория ещё не заполнена — молчим
+
+  await ctx.replyWithSticker(stickerId, {
+    reply_parameters: { message_id: ctx.message.message_id },
+    message_thread_id: ctx.message.message_thread_id,
+  });
+});
+
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
   let userText = ctx.message.text;
+
+  // Стёб по триггерным фразам (BANTER_TRIGGERS) — срабатывает независимо
+  // от того, обращались ли к боту напрямую, и не зависит от того, кто
+  // автор сообщения (без проверки пола/ориентации/чего-либо ещё). Просто
+  // конкретная фраза в тексте -> стикер реплаем. Дальше сообщение всё
+  // равно обрабатывается как обычно (вдруг оно ещё и адресовано боту).
+  if (matchesBanterTrigger(userText)) {
+    const stickerId = pickSticker("banter");
+    if (stickerId) {
+      await ctx
+        .replyWithSticker(stickerId, {
+          reply_parameters: { message_id: ctx.message.message_id },
+          message_thread_id: ctx.message.message_thread_id,
+        })
+        .catch((err) => console.error("Не удалось отправить banter-стикер:", err));
+    }
+  }
 
   if (isGroup) {
     rememberUsername(chatId, ctx.from);
