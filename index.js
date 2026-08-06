@@ -1104,8 +1104,7 @@ function buildModelsKeyboard() {
   return { inline_keyboard: rows };
 }
 
-// /model и /models — синонимы, оба открывают меню с кнопками.
-bot.command(["model", "models"], async (ctx) => {
+bot.command("model", async (ctx) => {
   if (!isOwner(ctx)) return;
   await ctx.reply(buildModelsStatusText(), { reply_markup: buildModelsKeyboard() });
 });
@@ -1363,7 +1362,6 @@ async function registerCommands() {
     { command: "aliases", description: "показать список алиасов" },
     { command: "gender", description: "посмотреть/задать пол (свой или реплаем)" },
     { command: "model", description: "выбрать модель / посмотреть текущую" },
-    { command: "models", description: "то же самое, что /model" },
   ]);
   console.log("Команды зарегистрированы в Telegram");
 }
