@@ -807,6 +807,40 @@ async function loadPersistedState() {
 // ==== Инициализация бота ====
 const bot = new Bot(BOT_TOKEN);
 
+// ==== Разрешённые группы ====
+// ALLOWED_GROUP_IDS — id групп/супергрупп через запятую, где боту разрешено
+// отвечать. Личные чаты этим списком НЕ ограничиваются — там бот всегда
+// доступен. Если список пуст — ограничения нет, бот работает в любой группе.
+const ALLOWED_GROUP_IDS = (process.env.ALLOWED_GROUP_IDS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map(Number);
+
+function isAllowedChat(ctx) {
+  const isGroup = ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
+  if (!isGroup) return true;
+  if (ALLOWED_GROUP_IDS.length === 0) return true;
+  return ALLOWED_GROUP_IDS.includes(ctx.chat.id);
+}
+
+// Глобальный фильтр — стоит раньше всех bot.command/bot.on, поэтому
+// отсекает неразрешённые группы до того, как сообщение попадёт в любой
+// хендлер (команды, текст, реакции на аудио — вообще всё). В логах
+// печатает id и название группы, откуда прилетело сообщение — удобно,
+// чтобы потом просто скопировать id в ALLOWED_GROUP_IDS.
+bot.use(async (ctx, next) => {
+  if (!ctx.chat) return next();
+  if (!isAllowedChat(ctx)) {
+    console.warn(
+      `Сообщение из неразрешённой группы (id: ${ctx.chat.id}, название: "${ctx.chat.title}") — игнорирую. ` +
+        `Чтобы разрешить, добавь ${ctx.chat.id} в ALLOWED_GROUP_IDS.`
+    );
+    return;
+  }
+  await next();
+});
+
 bot.command("start", async (ctx) => {
   const chatId = ctx.chat.id;
   await clearHistory(chatId); // сброс истории при /start
