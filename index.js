@@ -353,12 +353,52 @@ const MALE_NAME_EXCEPTIONS = new Set([
 // Унисекс-имена/уменьшительные — для них имя вообще не сигнал, лучше не гадать.
 const AMBIGUOUS_NAMES = new Set(["саша", "женя", "валя", "шура"]);
 
+// Небольшой словарь распространённых латинских/английских имён — для НИКОВ
+// вроде "Erkiss" или "lays pwnz" никакого лингвистического сигнала нет
+// в принципе (это не имена, а произвольные ники), поэтому для них лучше
+// вернуть null (пол неизвестен), чем гадать наугад. Словарь ловит только
+// реальные имена, написанные латиницей.
+const LATIN_FEMALE_NAMES = new Set([
+  "kat", "katya", "katia", "kate", "katherine", "kathryn", "polina",
+  "anna", "ann", "anya", "maria", "mary", "masha", "olya", "olga",
+  "sasha", "julia", "yulia", "lena", "elena", "helen", "nastya",
+  "anastasia", "dasha", "daria", "sofia", "sophia", "emma", "olivia",
+  "emily", "amy", "lucy", "vika", "victoria", "veronika", "veronica",
+  "ira", "irina", "tanya", "tatiana", "svetlana", "sveta", "nina",
+]);
+const LATIN_MALE_NAMES = new Set([
+  "alex", "sasha", "artem", "artyom", "dima", "dmitry", "dmitri",
+  "sergey", "sergei", "ivan", "john", "mike", "michael", "andrey",
+  "andrew", "anton", "denis", "dennis", "roman", "max", "maxim",
+  "nikita", "oleg", "pavel", "paul", "vlad", "vladislav", "vladimir",
+  "kirill", "cyril", "egor", "yegor", "stas", "stanislav",
+]);
+
 function guessGenderFromName(firstName) {
   const name = (firstName || "").trim().toLowerCase();
   if (!name || AMBIGUOUS_NAMES.has(name)) return null;
   if (MALE_NAME_EXCEPTIONS.has(name)) return "m";
   if (/[ая]$/.test(name)) return "f";
-  return "m"; // грубое приближение: большинство мужских имён не оканчиваются на -а/-я
+  // Кириллица не совпала (не на "а"/"я") — считаем мужским: подавляющее
+  // большинство обычных кириллических имён/форм так и оканчивается.
+  if (/[а-яёА-ЯЁ]/.test(name)) return "m";
+
+  // Латиница — тут уже нет надёжного правила по окончанию (Kat, Erkiss,
+  // Alex, polina — никакой общей закономерности), поэтому смотрим только
+  // в словарь известных имён. Если ника там нет (гейм-тег, набор букв
+  // вроде "lays pwnz") — честно возвращаем null, а не гадаем наугад.
+  if (LATIN_FEMALE_NAMES.has(name)) return "f";
+  if (LATIN_MALE_NAMES.has(name)) return "m";
+
+  // Если ник — это несколько слов ("lays pwnz"), пробуем первое слово
+  // отдельно на случай, если это реальное имя + приставка/тег.
+  const firstWord = name.split(/\s+/)[0];
+  if (firstWord && firstWord !== name) {
+    if (LATIN_FEMALE_NAMES.has(firstWord)) return "f";
+    if (LATIN_MALE_NAMES.has(firstWord)) return "m";
+  }
+
+  return null;
 }
 
 // --- Эвристика по тексту: "я сделал" -> м, "я сделала" -> ж ---
