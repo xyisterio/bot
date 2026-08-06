@@ -1,5 +1,6 @@
 import { Bot } from "grammy";
 import express from "express";
+import { Redis } from "@upstash/redis";
 
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -9,6 +10,25 @@ const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан в переменных окружения");
 if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY не задан в переменных окружения");
+
+// ==== Персистентность (Upstash Redis) ====
+// Без этого вся память (история переписки, алиасы, пол, индекс юзернеймов,
+// активная модель) хранится только в оперативной памяти процесса и
+// пропадает при каждом рестарте/передеплое на Render.
+// Redis.fromEnv() сам берёт UPSTASH_REDIS_REST_URL и UPSTASH_REDIS_REST_TOKEN
+// из переменных окружения — их нужно завести на Render (см. README).
+// Если переменные не заданы — бот просто работает как раньше, без сохранения.
+const redis =
+  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+    ? Redis.fromEnv()
+    : null;
+
+if (!redis) {
+  console.warn(
+    "Upstash Redis не настроен (UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN) — " +
+      "работаю без сохранения памяти, при рестарте всё сбросится"
+  );
+}
 
 // ==== Провайдеры и фолбэк между ними ====
 // PROVIDER_ORDER задаёт порядок провайдеров через запятую: "gemini,groq".
@@ -115,7 +135,8 @@ function stripNameTrigger(text) {
 }
 
 // ==== Алиасы участников (по chatId -> userId -> заданное имя) ====
-// Задаются командой /alias, живут в памяти (сбросятся при рестарте деплоя)
+// Живут в памяти как кэш, но зеркалятся в Redis (ключ aliases:{chatId}) —
+// см. loadPersistedState() при старте.
 const chatAliases = new Map(); // chatId -> Map<userId, aliasName>
 // Индекс username -> userId, чтобы /alias @ник Имя работал без реплая
 const chatUsernameIndex = new Map(); // chatId -> Map<usernameLower, userId>
@@ -125,9 +146,26 @@ function getAliasMap(chatId) {
   return chatAliases.get(chatId);
 }
 
+// Фоново сохраняет текущий набор алиасов чата в Redis (fire-and-forget —
+// не блокируем ответ пользователю ради записи в БД).
+async function saveAliases(chatId) {
+  if (!redis) return;
+  try {
+    await redis.set(`aliases:${chatId}`, Object.fromEntries(getAliasMap(chatId)));
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить алиасы чата ${chatId}:`, err);
+  }
+}
+
 // value: { name: заданное имя, label: как человек выглядел в Telegram на момент задания }
 function setAlias(chatId, userId, name, label) {
   getAliasMap(chatId).set(userId, { name, label });
+  saveAliases(chatId);
+}
+
+function removeAlias(chatId, userId) {
+  getAliasMap(chatId).delete(userId);
+  saveAliases(chatId);
 }
 
 function getUsernameIndex(chatId) {
@@ -135,11 +173,26 @@ function getUsernameIndex(chatId) {
   return chatUsernameIndex.get(chatId);
 }
 
+async function saveUsernames(chatId) {
+  if (!redis) return;
+  try {
+    await redis.set(`usernames:${chatId}`, Object.fromEntries(getUsernameIndex(chatId)));
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить индекс юзернеймов чата ${chatId}:`, err);
+  }
+}
+
 // Запоминаем @username -> userId по каждому сообщению в группе,
-// чтобы потом можно было сослаться на человека командой /alias по нику
+// чтобы потом можно было сослаться на человека командой /alias по нику.
+// Пишем в Redis только когда реально что-то новое — иначе будет запись
+// на КАЖДОЕ сообщение в группе.
 function rememberUsername(chatId, from) {
   if (!from?.username) return;
-  getUsernameIndex(chatId).set(from.username.toLowerCase(), from.id);
+  const index = getUsernameIndex(chatId);
+  const key = from.username.toLowerCase();
+  if (index.get(key) === from.id) return; // уже знаем — незачем писать в Redis
+  index.set(key, from.id);
+  saveUsernames(chatId);
 }
 
 // Имя, которое бот увидит и может использовать для этого отправителя:
@@ -165,11 +218,22 @@ function getGenderMap(chatId) {
   return chatGenders.get(chatId);
 }
 
+async function saveGenders(chatId) {
+  if (!redis) return;
+  try {
+    await redis.set(`genders:${chatId}`, Object.fromEntries(getGenderMap(chatId)));
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить пол участников чата ${chatId}:`, err);
+  }
+}
+
 function setGender(chatId, userId, gender, source) {
   const map = getGenderMap(chatId);
   const existing = map.get(userId);
   if (existing && SOURCE_PRIORITY[existing.source] > SOURCE_PRIORITY[source]) return;
+  if (existing && existing.gender === gender && existing.source === source) return; // ничего не изменилось — не пишем в Redis
   map.set(userId, { gender, source });
+  saveGenders(chatId);
 }
 
 function getGender(chatId, userId) {
@@ -237,16 +301,45 @@ function getHistory(chatId) {
   return histories.get(chatId);
 }
 
+async function saveHistory(chatId) {
+  if (!redis) return;
+  try {
+    await redis.set(`history:${chatId}`, getHistory(chatId));
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить историю чата ${chatId}:`, err);
+  }
+}
+
+async function clearHistory(chatId) {
+  histories.delete(chatId);
+  if (!redis) return;
+  try {
+    await redis.del(`history:${chatId}`);
+  } catch (err) {
+    console.error(`Redis: не удалось удалить историю чата ${chatId}:`, err);
+  }
+}
+
 function pushHistory(chatId, role, content) {
   const h = getHistory(chatId);
   h.push({ role, content });
   while (h.length > HISTORY_LIMIT) h.shift();
+  saveHistory(chatId);
 }
 
 // ==== Фолбэк между провайдерами/моделями ====
 // Индекс цели (провайдер+модель), на которой бот последний раз успешно
 // ответил — начинаем с неё же, чтобы не долбить мёртвую цель на каждый запрос.
 let activeTargetIndex = 0;
+
+async function saveActiveTargetIndex() {
+  if (!redis) return;
+  try {
+    await redis.set("activeTargetIndex", activeTargetIndex);
+  } catch (err) {
+    console.error("Redis: не удалось сохранить activeTargetIndex:", err);
+  }
+}
 
 // Ошибки, при которых имеет смысл пробовать следующую цель:
 // модель/провайдер недоступны, лимиты исчерпаны и т.п.
@@ -399,6 +492,7 @@ async function askLLM(chatId, userText) {
       if (idx !== activeTargetIndex) {
         console.warn(`Переключился на "${target.provider}/${target.model}" (индекс ${idx})`);
         activeTargetIndex = idx;
+        saveActiveTargetIndex();
       }
 
       pushHistory(chatId, "user", userText);
@@ -428,17 +522,88 @@ function typingDelayMs(replyLength) {
   return base + jitter;
 }
 
+// ==== Восстановление состояния из Redis при старте ====
+// Читает всё, что успели сохранить save*-хелперы выше, обратно в
+// оперативные Map'ы, чтобы после рестарта бот "помнил" контекст диалогов,
+// алиасы, пол и на какой модели остановился в прошлый раз.
+async function loadPersistedState() {
+  if (!redis) return;
+
+  try {
+    const [historyKeys, aliasKeys, usernameKeys, genderKeys, savedIdx] = await Promise.all([
+      redis.keys("history:*"),
+      redis.keys("aliases:*"),
+      redis.keys("usernames:*"),
+      redis.keys("genders:*"),
+      redis.get("activeTargetIndex"),
+    ]);
+
+    await Promise.all(
+      historyKeys.map(async (key) => {
+        const chatId = Number(key.slice("history:".length));
+        const data = await redis.get(key);
+        if (Array.isArray(data)) histories.set(chatId, data);
+      })
+    );
+
+    await Promise.all(
+      aliasKeys.map(async (key) => {
+        const chatId = Number(key.slice("aliases:".length));
+        const data = await redis.get(key);
+        if (data && typeof data === "object") {
+          const map = getAliasMap(chatId);
+          for (const [userId, value] of Object.entries(data)) map.set(Number(userId), value);
+        }
+      })
+    );
+
+    await Promise.all(
+      usernameKeys.map(async (key) => {
+        const chatId = Number(key.slice("usernames:".length));
+        const data = await redis.get(key);
+        if (data && typeof data === "object") {
+          const map = getUsernameIndex(chatId);
+          for (const [username, userId] of Object.entries(data)) map.set(username, Number(userId));
+        }
+      })
+    );
+
+    await Promise.all(
+      genderKeys.map(async (key) => {
+        const chatId = Number(key.slice("genders:".length));
+        const data = await redis.get(key);
+        if (data && typeof data === "object") {
+          const map = getGenderMap(chatId);
+          for (const [userId, value] of Object.entries(data)) map.set(Number(userId), value);
+        }
+      })
+    );
+
+    if (typeof savedIdx === "number" && Number.isInteger(savedIdx) && savedIdx >= 0 && savedIdx < TARGETS.length) {
+      activeTargetIndex = savedIdx;
+    }
+
+    console.log(
+      `Восстановлено из Redis: истории — ${historyKeys.length}, алиасы — ${aliasKeys.length}, ` +
+        `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}` +
+        (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "")
+    );
+  } catch (err) {
+    console.error("Не удалось восстановить состояние из Redis, стартую с чистой памятью:", err);
+  }
+}
+
 // ==== Инициализация бота ====
 const bot = new Bot(BOT_TOKEN);
 
 bot.command("start", async (ctx) => {
   const chatId = ctx.chat.id;
-  histories.delete(chatId); // сброс истории при /start
+  await clearHistory(chatId); // сброс истории при /start
   await ctx.reply("йо");
 });
 
 bot.command("reset", async (ctx) => {
-  histories.delete(ctx.chat.id);
+  await clearHistory(ctx.chat.id);
   await ctx.reply("память почистил");
 });
 
@@ -502,7 +667,7 @@ bot.command("alias", async (ctx) => {
     return;
   }
 
-  getAliasMap(chatId).set(userId, { name: alias, label: `@${username}` });
+  setAlias(chatId, userId, alias, `@${username}`);
   await ctx.reply(`ок, теперь @${username} = "${alias}"`);
 });
 
@@ -524,7 +689,7 @@ bot.command("unalias", async (ctx) => {
     return;
   }
 
-  getAliasMap(chatId).delete(userId);
+  removeAlias(chatId, userId);
   await ctx.reply("алиас убрал");
 });
 
@@ -687,6 +852,8 @@ registerCommands().catch((err) =>
 // и висящие апдейты — помогает от 409 Conflict при передеплое, когда
 // старый инстанс на Render ещё не до конца отключился от getUpdates.
 async function startBot() {
+  await loadPersistedState();
+
   try {
     await bot.api.deleteWebhook({ drop_pending_updates: true });
   } catch (err) {
