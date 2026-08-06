@@ -19,11 +19,15 @@ npm start
    - **Start command:** `npm start`
 4. **Environment → Add Environment Variable:**
    - `BOT_TOKEN` — токен от @BotFather
-   - `PROVIDER_ORDER` — например `gemini,groq`
+   - `PROVIDER_ORDER` — например `gemini,groq,huggingface,openrouter`
    - `GEMINI_API_KEY` — ключ с aistudio.google.com/apikey
    - `GEMINI_MODEL` — например `gemini-2.5-flash`
    - `GROQ_API_KEY` — ключ с console.groq.com (нужен как минимум для фолбэка)
    - `GROQ_MODEL` — например `openai/gpt-oss-120b,llama-3.3-70b-versatile`
+   - `HUGGINGFACE_API_KEY` — токен с huggingface.co/settings/tokens (права "Make calls to Inference Providers")
+   - `HUGGINGFACE_MODEL` — например `meta-llama/Llama-3.3-70B-Instruct,Qwen/Qwen2.5-72B-Instruct`
+   - `OPENROUTER_API_KEY` — ключ с openrouter.ai/keys
+   - `OPENROUTER_MODEL` — например `meta-llama/llama-3.3-70b-instruct:free,qwen/qwen3-coder:free`
    - `UPSTASH_REDIS_REST_URL` и `UPSTASH_REDIS_REST_TOKEN` — чтобы память бота (история, алиасы, пол, активная модель) не сбрасывалась при рестартах. Без этих двух переменных бот всё равно работает, просто без сохранения памяти. Подробности — в разделе "Память между рестартами" ниже.
 
    Подробности и актуальный список переменных — в разделе "Модели и провайдеры" ниже.
@@ -75,11 +79,15 @@ npm start
 **Переменные окружения:**
 
 ```
-PROVIDER_ORDER=gemini,groq          # порядок провайдеров слева направо
+PROVIDER_ORDER=gemini,groq,huggingface,openrouter    # порядок провайдеров слева направо
 GEMINI_API_KEY=...                  # ключ с aistudio.google.com/apikey
 GEMINI_MODEL=gemini-flash-latest,gemini-3.5-flash       # можно списком через запятую
 GROQ_API_KEY=...                    # ключ с console.groq.com/keys
 GROQ_MODEL=openai/gpt-oss-120b,llama-3.3-70b-versatile
+HUGGINGFACE_API_KEY=...             # токен с huggingface.co/settings/tokens
+HUGGINGFACE_MODEL=meta-llama/Llama-3.3-70B-Instruct,Qwen/Qwen2.5-72B-Instruct
+OPENROUTER_API_KEY=...              # ключ с openrouter.ai/keys
+OPENROUTER_MODEL=meta-llama/llama-3.3-70b-instruct:free,qwen/qwen3-coder:free
 ```
 
 Провайдер без заданного ключа просто пропускается — например, если
@@ -90,7 +98,20 @@ GROQ_MODEL=openai/gpt-oss-120b,llama-3.3-70b-versatile
 - `gemini-flash-latest` — это алиас, который Google сам переключает на актуальную GA Flash-модель, так что он меньше ломается со временем, чем захардкоженное имя вроде `gemini-2.5-flash` (эту модель Google уже отрезал для новых ключей раньше официальной даты депрекации)
 - Заметно живее и умнее ламы/квена — это полноценная фронтир-модель, а не открытая уменьшенная
 - На бесплатном тире Google может использовать переписку для обучения моделей — учитывай это, если в чате будут чувствительные данные
+- ⚠️ На практике реальный лимит для новых бесплатных ключей может оказаться сильно жёстче заявленного — например, у `gemini-3.5-flash` free tier видели квоту всего **20 запросов в сутки** (не в минуту — именно в сутки, `GenerateRequestsPerDayPerProjectPerModel-FreeTier`). Это дневная, не минутная квота — при 5-минутном `MODEL_COOLDOWN_MS` бот будет весь день безуспешно дёргать gemini каждые 5 минут и падать в лог теми же 429, пока квота не сбросится около полуночи по времени Google (обычно Pacific Time). На фолбэк на остальных провайдеров это не влияет, просто шум в логах — если раздражает, можно поднять `MODEL_COOLDOWN_MS` или убрать gemini из `PROVIDER_ORDER`.
 
 **Про Groq (используется как фолбэк):**
 ⚠️ Groq регулярно снимает модели с платформы. Актуальный список — console.groq.com/docs/models,
 депрекации — console.groq.com/docs/deprecations. При 404 model_not_found — модель уже не существует, замени в `GROQ_MODEL`.
+
+**Про Hugging Face Inference Providers:**
+- Единый OpenAI-совместимый роутер (`router.huggingface.co`), который под капотом маршрутизирует запрос к одному из нескольких сторонних бэкендов (Together AI, Fireworks, Cerebras и др.) — какой именно бэкенд обслужит конкретный запрос, решается на их стороне динамически
+- Бесплатный тир: ориентировочно ~1000 запросов/день на общей инфраструктуре, латентность может плавать (первый запрос к "холодной" модели — 30–60 секунд)
+- Модели по умолчанию (`Llama-3.3-70B-Instruct`, `Qwen2.5-72B-Instruct`) — того же уровня, что и модели у Groq, не тупее
+- ⚠️ **Приватность:** так как роутер выбирает бэкенд динамически, политика хранения/использования переписки для обучения зависит от того, какой именно провайдер обслужил запрос — единой гарантии от самого Hugging Face по умолчанию нет. Перед использованием зайди в **huggingface.co/settings/inference-providers** и там вручную отключи (или явно разреши только нужных) провайдеров — эта настройка привязана к аккаунту, из `.env`/кода она не управляется и делается один раз
+
+**Про OpenRouter:**
+- Агрегатор с моделями с суффиксом `:free` — доступ полностью бесплатный, но состав ротируется: провайдеры добавляют/убирают бесплатные модели без предупреждения, так что раз в пару месяцев стоит сверяться со списком на openrouter.ai/models с фильтром `free`
+- Бесплатный тир: 20 запросов/мин + 50 запросов/день без пополнения баланса, либо 1000/день после разовой покупки от $10 кредитов (лимит остаётся навсегда, даже если сами кредиты потрачены на что-то другое)
+- Модели по умолчанию (`llama-3.3-70b-instruct:free`, `qwen3-coder:free`) — открытые модели, качество сопоставимо с тем, что уже используется у Groq/HF
+

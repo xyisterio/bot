@@ -6,6 +6,8 @@ import { Redis } from "@upstash/redis";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // опционально
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY; // опционально
+const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY; // опционально
 const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан в переменных окружения");
@@ -36,7 +38,7 @@ if (!redis) {
 // моделей — бот пробует их по очереди, если текущая недоступна.
 // Провайдер без заданного ключа (напр. нет GEMINI_API_KEY) просто
 // пропускается.
-const PROVIDER_ORDER = (process.env.PROVIDER_ORDER || "gemini,groq")
+const PROVIDER_ORDER = (process.env.PROVIDER_ORDER || "gemini,groq,huggingface,openrouter")
   .split(",")
   .map((p) => p.trim().toLowerCase())
   .filter(Boolean);
@@ -47,6 +49,32 @@ const GROQ_MODELS = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile,openai/g
   .filter(Boolean);
 
 const GEMINI_MODELS = (process.env.GEMINI_MODEL || "gemini-flash-latest,gemini-3.5-flash")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+// Hugging Face Inference Providers — единый OpenAI-совместимый роутер,
+// маршрутизирует к разным бэкендам (Together, Fireworks, Cerebras и др.)
+// в зависимости от того, кто в моменте обслуживает конкретную модель.
+// ВАЖНО про приватность: то, кто именно обслужит запрос, а значит и
+// политика хранения/использования данных — зависит от настроек аккаунта
+// на huggingface.co/settings/inference-providers. Там можно вручную
+// отключить провайдеров, которые используют данные для обучения моделей —
+// сделать это нужно один раз в личном кабинете, из кода это не настраивается.
+const HUGGINGFACE_MODELS = (
+  process.env.HUGGINGFACE_MODEL || "meta-llama/Llama-3.3-70B-Instruct,Qwen/Qwen2.5-72B-Instruct"
+)
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+// OpenRouter — агрегатор с бесплатными (:free) моделями, состав ротируется.
+// Бесплатный тир: 20 запросов/мин, 50/день без пополнения баланса (или
+// 1000/день после разовой покупки от $10 кредитов — лимит остаётся навсегда).
+const OPENROUTER_MODELS = (
+  process.env.OPENROUTER_MODEL ||
+  "meta-llama/llama-3.3-70b-instruct:free,qwen/qwen3-coder:free"
+)
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
@@ -62,6 +90,11 @@ const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 20000;
 // Как только cooldown истёк, бот на следующем запросе снова начнёт с неё
 // (обычно это основной провайдер, напр. gemini) — то есть возврат к
 // основной модели происходит автоматически, без ручных команд.
+// ВАЖНО: у Gemini free tier лимит дневной (не по минутам) — 5 минут
+// cooldown тут маловато и модель будет постоянно "мигать" ошибками в
+// логах до сброса квоты в полночь по PT, но это осознанно оставлено как
+// есть (см. README) — фолбэк на остальных провайдеров работает исправно,
+// просто в логах будут повторяющиеся 429 от gemini весь день.
 const MODEL_COOLDOWN_MS = Number(process.env.MODEL_COOLDOWN_MS) || 5 * 60 * 1000;
 
 // Единый список целей для фолбэка: [{ provider, model, baseUrl, apiKey }, ...]
@@ -76,6 +109,16 @@ const PROVIDER_CONFIGS = {
     baseUrl: "https://api.groq.com/openai/v1/chat/completions",
     apiKey: GROQ_API_KEY,
     models: GROQ_MODELS,
+  },
+  huggingface: {
+    baseUrl: "https://router.huggingface.co/v1/chat/completions",
+    apiKey: HUGGINGFACE_API_KEY,
+    models: HUGGINGFACE_MODELS,
+  },
+  openrouter: {
+    baseUrl: "https://openrouter.ai/api/v1/chat/completions",
+    apiKey: OPENROUTER_API_KEY,
+    models: OPENROUTER_MODELS,
   },
 };
 
