@@ -571,6 +571,22 @@ async function saveActiveTargetIndex() {
   }
 }
 
+// pinnedTargetIndex — модель, вручную закреплённая владельцем через кнопки
+// в /model (см. bot.command("model") и callback_query ниже). Если задана —
+// askLLM пробует её первой (при условии что она не в cooldown), иначе
+// ведёт себя как раньше (обычный фолбэк). null — авто-режим.
+let pinnedTargetIndex = null;
+
+async function savePinnedTargetIndex() {
+  if (!redis) return;
+  try {
+    // Upstash не любит хранить null как значение — используем -1 как "нет".
+    await redis.set("pinnedTargetIndex", pinnedTargetIndex === null ? -1 : pinnedTargetIndex);
+  } catch (err) {
+    console.error("Redis: не удалось сохранить pinnedTargetIndex:", err);
+  }
+}
+
 // Ошибки, при которых имеет смысл пробовать следующую цель:
 // модель/провайдер недоступны, лимиты исчерпаны и т.п.
 function isFallbackWorthy(status) {
@@ -741,11 +757,18 @@ async function askLLM(chatId, userText) {
   // только у основной цели истёк cooldown, следующий же запрос снова
   // начнёт с неё — переключение туда-обратно происходит само.
   const now = Date.now();
-  const order = [...TARGETS.keys()].sort((a, b) => {
+  let order = [...TARGETS.keys()].sort((a, b) => {
     const aCold = cooldownUntil[a] > now ? 1 : 0;
     const bCold = cooldownUntil[b] > now ? 1 : 0;
     return aCold - bCold || a - b;
   });
+
+  // Если владелец вручную закрепил модель кнопкой в /model — пробуем её
+  // первой (но только если она не остывает; если в cooldown, откатываемся
+  // к обычному порядку, чтобы не блокировать ответ бота на всём чате).
+  if (pinnedTargetIndex !== null && cooldownUntil[pinnedTargetIndex] <= now) {
+    order = [pinnedTargetIndex, ...order.filter((idx) => idx !== pinnedTargetIndex)];
+  }
 
   for (const idx of order) {
     const target = TARGETS[idx];
@@ -803,12 +826,13 @@ async function loadPersistedState() {
   if (!redis) return;
 
   try {
-    const [historyKeys, aliasKeys, usernameKeys, genderKeys, savedIdx] = await Promise.all([
+    const [historyKeys, aliasKeys, usernameKeys, genderKeys, savedIdx, savedPinnedIdx] = await Promise.all([
       redis.keys("history:*"),
       redis.keys("aliases:*"),
       redis.keys("usernames:*"),
       redis.keys("genders:*"),
       redis.get("activeTargetIndex"),
+      redis.get("pinnedTargetIndex"),
     ]);
 
     await Promise.all(
@@ -856,10 +880,20 @@ async function loadPersistedState() {
       activeTargetIndex = savedIdx;
     }
 
+    if (
+      typeof savedPinnedIdx === "number" &&
+      Number.isInteger(savedPinnedIdx) &&
+      savedPinnedIdx >= 0 &&
+      savedPinnedIdx < TARGETS.length
+    ) {
+      pinnedTargetIndex = savedPinnedIdx;
+    }
+
     console.log(
       `Восстановлено из Redis: истории — ${historyKeys.length}, алиасы — ${aliasKeys.length}, ` +
         `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}` +
-        (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "")
+        (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "") +
+        (pinnedTargetIndex !== null ? `, закреплена вручную — индекс ${pinnedTargetIndex}` : "")
     );
   } catch (err) {
     console.error("Не удалось восстановить состояние из Redis, стартую с чистой памятью:", err);
@@ -1020,23 +1054,112 @@ bot.command("aliases", async (ctx) => {
 //                реплаем на чьё-то сообщение — про этого человека
 //                без аргументов — показать текущее значение
 // Доступно только владельцу (см. OWNER_USERNAME / isOwner) — остальным
-// не сообщаем, через какого провайдера сейчас отвечает бот. Тем же
-// способом (if (!isOwner(ctx)) return;) можно закрыть и любую другую
-// команду ниже, если понадобится.
-bot.command("model", async (ctx) => {
-  if (!isOwner(ctx)) return;
-  const target = TARGETS[activeTargetIndex];
+// не сообщаем, через какого провайдера сейчас отвечает бот, и не даём
+// переключать модели. Тем же способом (if (!isOwner(ctx)) return;) можно
+// закрыть и любую другую команду ниже, если понадобится.
+
+// Текст статуса для сообщения с кнопками /model — вынесен отдельно, чтобы
+// переиспользовать и при первой отправке, и при обновлении того же
+// сообщения после нажатия кнопки (см. callback_query ниже).
+function buildModelsStatusText() {
+  const now = Date.now();
+  const active = TARGETS[activeTargetIndex];
+  let text = `сейчас отвечаю через: ${active.provider}/${active.model}`;
+
+  if (pinnedTargetIndex !== null) {
+    const pinned = TARGETS[pinnedTargetIndex];
+    text +=
+      cooldownUntil[pinnedTargetIndex] > now
+        ? `\n📌 закреплено: ${pinned.provider}/${pinned.model} (сейчас в cooldown, пока отвечаю в авто-режиме)`
+        : `\n📌 закреплено вручную: ${pinned.provider}/${pinned.model}`;
+  }
+
   const cooling = TARGETS
     .map((t, i) => ({ t, until: cooldownUntil[i] }))
-    .filter((x) => x.until > Date.now());
-  let text = `сейчас отвечаю через: ${target.provider}/${target.model}`;
+    .filter((x) => x.until > now);
   if (cooling.length) {
     const list = cooling
-      .map((x) => `${x.t.provider}/${x.t.model} (ещё ~${Math.ceil((x.until - Date.now()) / 1000)}с)`)
+      .map((x) => `${x.t.provider}/${x.t.model} (ещё ~${Math.ceil((x.until - now) / 1000)}с)`)
       .join(", ");
     text += `\nв cooldown: ${list}`;
   }
-  await ctx.reply(text);
+
+  text += `\n\nвыбери модель кнопкой (✅ доступна сейчас, ⏳ в cooldown — нажать нельзя):`;
+  return text;
+}
+
+// Клавиатура: одна кнопка на цель (provider/model), плюс кнопка "авто" —
+// снять ручное закрепление и вернуться к обычному фолбэку.
+function buildModelsKeyboard() {
+  const now = Date.now();
+  const rows = TARGETS.map((t, i) => {
+    const cold = cooldownUntil[i] > now;
+    let mark = cold ? "⏳" : "✅";
+    if (i === activeTargetIndex) mark += "👉";
+    if (i === pinnedTargetIndex) mark += "📌";
+    const label = `${mark} ${t.provider}/${t.model}`.slice(0, 64); // лимит Telegram на текст кнопки
+    return [{ text: label, callback_data: `setmodel:${i}` }];
+  });
+  rows.push([{ text: "🔄 авто (снять закрепление)", callback_data: "setmodel:auto" }]);
+  return { inline_keyboard: rows };
+}
+
+// /model и /models — синонимы, оба открывают меню с кнопками.
+bot.command(["model", "models"], async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await ctx.reply(buildModelsStatusText(), { reply_markup: buildModelsKeyboard() });
+});
+
+// Обработка нажатий на кнопки из /model. Закрыто владельцем так же, как
+// и сама команда — на всякий случай, если кто-то доберётся до кнопок в
+// групповом чате (например, переслав сообщение с меню).
+bot.on("callback_query:data", async (ctx) => {
+  const data = ctx.callbackQuery.data;
+  if (!data.startsWith("setmodel:")) return;
+
+  if (!isOwner(ctx)) {
+    await ctx.answerCallbackQuery({ text: "эта кнопка только для владельца", show_alert: true });
+    return;
+  }
+
+  const value = data.slice("setmodel:".length);
+
+  if (value === "auto") {
+    pinnedTargetIndex = null;
+    savePinnedTargetIndex();
+    await ctx.answerCallbackQuery({ text: "снял закрепление, вернулся в авто-режим" });
+  } else {
+    const idx = Number(value);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= TARGETS.length) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    const now = Date.now();
+    if (cooldownUntil[idx] > now) {
+      const secLeft = Math.ceil((cooldownUntil[idx] - now) / 1000);
+      await ctx.answerCallbackQuery({
+        text: `${TARGETS[idx].provider}/${TARGETS[idx].model} ещё в cooldown ~${secLeft}с — недоступна`,
+        show_alert: true,
+      });
+      return;
+    }
+
+    pinnedTargetIndex = idx;
+    savePinnedTargetIndex();
+    await ctx.answerCallbackQuery({
+      text: `закрепил: ${TARGETS[idx].provider}/${TARGETS[idx].model}`,
+    });
+  }
+
+  // Обновляем то же сообщение, чтобы отметки (👉/📌/⏳) на кнопках и текст
+  // статуса сразу отражали новый выбор.
+  try {
+    await ctx.editMessageText(buildModelsStatusText(), { reply_markup: buildModelsKeyboard() });
+  } catch (err) {
+    // Например "message is not modified", если состояние не изменилось — не страшно.
+    console.error("Не удалось обновить сообщение /model после нажатия кнопки:", err.message);
+  }
 });
 
 bot.command("gender", async (ctx) => {
@@ -1239,7 +1362,8 @@ async function registerCommands() {
     { command: "unalias", description: "убрать заданное имя" },
     { command: "aliases", description: "показать список алиасов" },
     { command: "gender", description: "посмотреть/задать пол (свой или реплаем)" },
-    { command: "model", description: "какая модель сейчас отвечает" },
+    { command: "model", description: "выбрать модель / посмотреть текущую" },
+    { command: "models", description: "то же самое, что /model" },
   ]);
   console.log("Команды зарегистрированы в Telegram");
 }
