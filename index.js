@@ -657,20 +657,36 @@ function normalizeMoveText(text) {
 
 // Пытается распознать ход из текста сообщения — либо в UCI-формате
 // (e2e4, e7e8q), либо обычной шахматной нотацией (SAN: e4, Nf3, O-O, exd5).
-// Применяет ход к переданному объекту chess.js и возвращает Move, либо
-// null, если это на ход вообще не похоже (тогда сообщение уйдёт в обычный чат).
+// Сообщение может содержать не только сам ход (например "e2e4, покажи
+// доску" одним сообщением) — разбиваем на токены по пробелам/запятым и
+// пробуем каждый по очереди, применяя первый, который окажется легальным
+// ходом. Применяет ход к переданному объекту chess.js и возвращает Move,
+// либо null, если ни один токен на ход не похож (тогда сообщение уйдёт в
+// обычный чат).
 function tryApplyUserMove(chess, rawText) {
   const text = normalizeMoveText(rawText);
-  const uciMatch = text.match(/^([a-h][1-8])[\s-]?([a-h][1-8])\s*=?\s*([qrbn])?$/i);
-  try {
-    if (uciMatch) {
-      const [, from, to, promo] = uciMatch;
-      return chess.move({ from, to, promotion: (promo || "q").toLowerCase() }) || null;
+  const tokens = text.split(/[\s,;]+/).filter(Boolean);
+
+  for (const token of tokens) {
+    const uciMatch = token.match(/^([a-h][1-8])-?([a-h][1-8])=?([qrbn])?$/i);
+    try {
+      if (uciMatch) {
+        const [, from, to, promo] = uciMatch;
+        const move = chess.move({
+          from: from.toLowerCase(),
+          to: to.toLowerCase(),
+          promotion: (promo || "q").toLowerCase(),
+        });
+        if (move) return move;
+      } else {
+        const move = chess.move(token);
+        if (move) return move;
+      }
+    } catch {
+      // не подошло — пробуем следующий токен сообщения
     }
-    return chess.move(text) || null;
-  } catch {
-    return null;
   }
+  return null;
 }
 
 // ==== Простой шахматный движок для хода бота (material + PST + minimax) ====
@@ -1603,27 +1619,10 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
-    if (CHESS_BOARD_REGEX.test(rawText)) {
-      const chess = new Chess(chessGame.fen);
-      await ctx.reply(formatBoard(chess), { parse_mode: "Markdown" });
-      return;
-    }
-
-    if (CHESS_NEW_GAME_REGEX.test(rawText)) {
-      const userColor = chessGame.userColor;
-      const chess = startChessGame(chatId, userColor);
-      const colorNote = userColor === "w" ? ", ты снова белыми — ходи" : ", ты снова чёрными — жду мой ход первым";
-      await ctx.reply(`окей, погнали заново${colorNote}`);
-      if (userColor === "b") {
-        const botMove = findBestMove(chess);
-        chess.move(botMove);
-        chessGames.set(chatId, { fen: chess.fen(), userColor });
-        saveChessGame(chatId);
-        await ctx.reply(`Мой ход: ${botMove.san}\n${formatBoard(chess)}`, { parse_mode: "Markdown" });
-      }
-      return;
-    }
-
+    // Ход проверяем ДО команд "покажи доску"/"новая партия" — сообщение
+    // вида "e2e4, покажи доску" должно сначала применить ход (новая доска
+    // и так придёт в ответе), а не просто напечатать старую позицию,
+    // проигнорировав сам ход.
     const chess = new Chess(chessGame.fen);
     if (chess.turn() === chessGame.userColor) {
       const move = tryApplyUserMove(chess, rawText);
@@ -1672,7 +1671,28 @@ bot.on("message:text", async (ctx) => {
         await ctx.reply(`Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess)}`, { parse_mode: "Markdown" });
         return;
       }
-      // Не похоже на ход — падаем ниже в обычный чат, ничего не делаем
+      // Ход не распознан — проверяем, не команда ли это ("покажи доску",
+      // "новая партия"). Если нет — падаем ниже в обычный чат.
+    }
+
+    if (CHESS_BOARD_REGEX.test(rawText)) {
+      await ctx.reply(formatBoard(chess), { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (CHESS_NEW_GAME_REGEX.test(rawText)) {
+      const userColor = chessGame.userColor;
+      const newChess = startChessGame(chatId, userColor);
+      const colorNote = userColor === "w" ? ", ты снова белыми — ходи" : ", ты снова чёрными — жду мой ход первым";
+      await ctx.reply(`окей, погнали заново${colorNote}`);
+      if (userColor === "b") {
+        const botMove = findBestMove(newChess);
+        newChess.move(botMove);
+        chessGames.set(chatId, { fen: newChess.fen(), userColor });
+        saveChessGame(chatId);
+        await ctx.reply(`Мой ход: ${botMove.san}\n${formatBoard(newChess)}`, { parse_mode: "Markdown" });
+      }
+      return;
     }
   } else if (CHESS_INTENT_REGEX.test(rawText)) {
     // Партии нет, но упомянули шахматы — считаем приглашением и стартуем.
