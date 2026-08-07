@@ -679,8 +679,31 @@ function startChessGame(chatId, userId, userColor, view, playerName) {
 
 // Юникод-символы фигур для вида "картинками". Полые ♔♘♙... — белые,
 // залитые ♚♞♟... — чёрные (стандартное начертание).
-const UNICODE_WHITE = { p: "♙", n: "♘", b: "♗", r: "♖", q: "♕", k: "♔" };
-const UNICODE_BLACK = { p: "♟", n: "♞", b: "♝", r: "♜", q: "♛", k: "♚" };
+//
+// VS15 (U+FE0E, "variation selector-15") приклеен к каждому символу —
+// без него часть клиентов (в первую очередь мобильный Telegram) рисует
+// эти символы эмодзи-шрифтом, который шире моноширинного текста, и
+// правая граница доски в ```-блоке "уезжает" вправо на строках с
+// фигурами (буквенный вид не страдает, там обычный ASCII). VS15
+// принудительно просит текстовое/узкое начертание вместо эмодзи-стиля.
+const VS15 = "\uFE0E";
+const withVS = (s) => s + VS15;
+const UNICODE_WHITE = {
+  p: withVS("♙"),
+  n: withVS("♘"),
+  b: withVS("♗"),
+  r: withVS("♖"),
+  q: withVS("♕"),
+  k: withVS("♔"),
+};
+const UNICODE_BLACK = {
+  p: withVS("♟"),
+  n: withVS("♞"),
+  b: withVS("♝"),
+  r: withVS("♜"),
+  q: withVS("♛"),
+  k: withVS("♚"),
+};
 
 function formatBoardAscii(chess) {
   // chess.ascii() сам рисует доску буквами (заглавные — белые, строчные —
@@ -717,10 +740,15 @@ function formatBoard(chess, userColor, view, playerName) {
 
   let caption;
   if (view === "unicode") {
+    // Символы легенды тоже с VS15 (см. комментарий у UNICODE_WHITE/BLACK) —
+    // легенда в том же ```-блоке, что и доска, поэтому должна рендериться
+    // так же узко, иначе сама строка легенды может "поплыть".
+    const wLegend = "kqrbnp".split("").map((t) => UNICODE_WHITE[t]).join("");
+    const bLegend = "kqrbnp".split("").map((t) => UNICODE_BLACK[t]).join("");
     caption =
       userColor === "w"
-        ? "(♔♕♖♗♘♙ — твои белые, ♚♛♜♝♞♟ — мои чёрные)"
-        : "(♚♛♜♝♞♟ — твои чёрные, ♔♕♖♗♘♙ — мои белые)";
+        ? `(${wLegend} — твои белые, ${bLegend} — мои чёрные)`
+        : `(${bLegend} — твои чёрные, ${wLegend} — мои белые)`;
   } else {
     caption =
       userColor === "w"
@@ -912,6 +940,468 @@ const CHESS_CHECKMATE_WIN_PHRASES = ["мат, я выиграл. Ну ты де�
 const CHESS_CHECKMATE_LOSE_PHRASES = ["ну и мат мне... красиво сыграл", "мат мне, засчитано — забирай победу"];
 const CHESS_DRAW_PHRASES = ["ничья, разошлись как в море корабли", "пат или ничья короче — никто не выиграл"];
 const CHESS_RESIGN_PHRASES = ["принято, партия окончена", "ладно, сдался — так сдался"];
+
+// ==== Шашки (русские шашки, 8x8, обязательное взятие) ====
+// Реализовано с нуля (готовой библиотеки уровня chess.js для шашек в
+// зависимостях нет) — доска, генератор ходов, движок для хода бота.
+// Общая архитектура намеренно скопирована с шахматного блока выше:
+// своя Map(chatId:userId -> состояние), зеркалирование в Redis
+// (ключ checkers:{chatId}:{userId}), тот же parseRequestedUserColor и те
+// же регэкспы "покажи доску"/"новая партия"/переключение вида — эти фразы
+// не специфичны для шахмат, так что переиспользуются как есть.
+//
+// Упрощения относительно официальных турнирных правил (осознанно, чтобы
+// не раздувать движок): при взятии ходить обязательно (в т.ч. добивать
+// цепочку, пока есть куда), но правило "бить максимально длинную цепочку,
+// если есть выбор" не форсируется — бот и игрок могут выбрать любую
+// доступную цепочку взятий. Дамка, проходящая через последнюю
+// горизонталь ВНУТРИ цепочки взятий, превращается в дамку только по
+// завершении всего хода, а не сразу посреди прыжков.
+//
+// Координаты — как в шахматах, a1..h8. Доска хранится как массив из 8
+// строк (row 0 = 8-я горизонталь сверху, row 7 = 1-я горизонталь снизу),
+// в каждой строке 8 клеток (col 0 = вертикаль a). Клетка — null (пусто)
+// либо { color: "w"|"b", king: boolean }.
+
+const CHECKERS_INTENT_REGEX = /шашк/i;
+const CHECKERS_MOVE_REGEX = /^[a-h][1-8](?:[-:x][a-h][1-8])+$/i;
+const CHECKERS_SEARCH_DEPTH = 5; // полуходов вперёд — у шашек ветвление меньше, чем в шахматах, можно глубже
+
+// chatId:userId -> { board, turn: "w"|"b", userColor: "w"|"b", view, playerName }
+const checkersGames = new Map();
+
+function checkersMapKey(chatId, userId) {
+  return `${chatId}:${userId}`;
+}
+
+function getCheckersGame(chatId, userId) {
+  return checkersGames.get(checkersMapKey(chatId, userId)) || null;
+}
+
+async function saveCheckersGame(chatId, userId) {
+  if (!redis) return;
+  try {
+    await redis.set(`checkers:${chatId}:${userId}`, checkersGames.get(checkersMapKey(chatId, userId)));
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить партию в шашки ${chatId}:${userId}:`, err);
+  }
+}
+
+async function clearCheckersGame(chatId, userId) {
+  checkersGames.delete(checkersMapKey(chatId, userId));
+  if (!redis) return;
+  try {
+    await redis.del(`checkers:${chatId}:${userId}`);
+  } catch (err) {
+    console.error(`Redis: не удалось удалить партию в шашки ${chatId}:${userId}:`, err);
+  }
+}
+
+// Тёмная (игровая) клетка — ровно та же чётность, что и у тёмных клеток
+// в шахматах (a1 тёмная, h8 тёмная), чтобы координаты совпадали с
+// привычной шахматной разметкой доски.
+function isDarkSquare(row, col) {
+  const file = col + 1;
+  const rank = 8 - row;
+  return (file + rank) % 2 === 0;
+}
+
+function squareToRC(square) {
+  const col = square.charCodeAt(0) - "a".charCodeAt(0);
+  const rank = parseInt(square[1], 10);
+  const row = 8 - rank;
+  return { row, col };
+}
+
+function rcToSquare(row, col) {
+  const file = String.fromCharCode("a".charCodeAt(0) + col);
+  const rank = 8 - row;
+  return `${file}${rank}`;
+}
+
+function createInitialCheckersBoard() {
+  const board = Array.from({ length: 8 }, () => Array(8).fill(null));
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      if (!isDarkSquare(row, col)) continue;
+      const rank = 8 - row;
+      if (rank <= 3) board[row][col] = { color: "w", king: false };
+      else if (rank >= 6) board[row][col] = { color: "b", king: false };
+    }
+  }
+  return board;
+}
+
+function cloneCheckersBoard(board) {
+  return board.map((row) => row.map((cell) => (cell ? { ...cell } : null)));
+}
+
+function inBounds(row, col) {
+  return row >= 0 && row < 8 && col >= 0 && col < 8;
+}
+
+const DIAG_DIRS = [
+  [-1, -1],
+  [-1, 1],
+  [1, -1],
+  [1, 1],
+];
+
+// Все одиночные прыжки-взятия из клетки (row,col) для стоящей там фигуры.
+// Для простой шашки — только соседняя клетка по диагонали в любом из 4
+// направлений (в русских шашках бить можно и назад). Для дамки — любая
+// дистанция: летит до первой фигуры на диагонали, и если это чужая, а
+// сразу за ней есть свободные клетки — каждая из них отдельный вариант
+// приземления.
+function findJumpsFromSquare(board, row, col, piece) {
+  const jumps = [];
+  if (!piece.king) {
+    for (const [dr, dc] of DIAG_DIRS) {
+      const midR = row + dr;
+      const midC = col + dc;
+      const toR = row + 2 * dr;
+      const toC = col + 2 * dc;
+      if (!inBounds(toR, toC)) continue;
+      const midCell = board[midR][midC];
+      const toCell = board[toR][toC];
+      if (midCell && midCell.color !== piece.color && !toCell) {
+        jumps.push({ toR, toC, capR: midR, capC: midC });
+      }
+    }
+    return jumps;
+  }
+
+  for (const [dr, dc] of DIAG_DIRS) {
+    let step = 1;
+    let capR = null;
+    let capC = null;
+    while (true) {
+      const midR = row + dr * step;
+      const midC = col + dc * step;
+      if (!inBounds(midR, midC)) break;
+      const midCell = board[midR][midC];
+      if (!midCell) {
+        step++;
+        continue; // пусто — летим дальше в поисках фигуры
+      }
+      if (midCell.color === piece.color) break; // своя фигура блокирует направление
+      capR = midR;
+      capC = midC;
+      let land = step + 1;
+      while (true) {
+        const landR = row + dr * land;
+        const landC = col + dc * land;
+        if (!inBounds(landR, landC)) break;
+        if (board[landR][landC]) break; // за битой фигурой клетка занята — приземлиться нельзя
+        jumps.push({ toR: landR, toC: landC, capR, capC });
+        land++;
+      }
+      break; // вторую фигуру в этом же направлении бить нельзя без приземления между ними
+    }
+  }
+  return jumps;
+}
+
+// Рекурсивно строит все полные цепочки взятий из клетки (row,col).
+// Возвращает массив последовательностей, каждая — массив прыжков
+// {toR,toC,capR,capC}; продолжает цепочку, пока с новой позиции есть
+// ещё взятия (обязательное правило "бей, пока можешь").
+function findCaptureSequences(board, row, col, piece) {
+  const jumps = findJumpsFromSquare(board, row, col, piece);
+  if (jumps.length === 0) return [[]];
+
+  const sequences = [];
+  for (const jump of jumps) {
+    const nextBoard = cloneCheckersBoard(board);
+    nextBoard[row][col] = null;
+    nextBoard[jump.capR][jump.capC] = null;
+    nextBoard[jump.toR][jump.toC] = { ...piece };
+    const subSequences = findCaptureSequences(nextBoard, jump.toR, jump.toC, piece);
+    for (const sub of subSequences) sequences.push([jump, ...sub]);
+  }
+  return sequences;
+}
+
+// Список ходов для стороны color на доске board. Если у ЛЮБОЙ её фигуры
+// есть взятие — бить обязательно, и возвращаются только ходы-взятия
+// (каждый — целая вынужденная цепочка прыжков) со всех фигур, у которых
+// они есть. Иначе — обычные тихие ходы.
+function generateCheckersMoves(board, color) {
+  const captureMoves = [];
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const piece = board[row][col];
+      if (!piece || piece.color !== color) continue;
+      const sequences = findCaptureSequences(board, row, col, piece).filter((seq) => seq.length > 0);
+      for (const seq of sequences) {
+        captureMoves.push({
+          fromR: row,
+          fromC: col,
+          isCapture: true,
+          jumps: seq,
+          toR: seq[seq.length - 1].toR,
+          toC: seq[seq.length - 1].toC,
+        });
+      }
+    }
+  }
+  if (captureMoves.length > 0) return captureMoves;
+
+  const simpleMoves = [];
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const piece = board[row][col];
+      if (!piece || piece.color !== color) continue;
+      if (piece.king) {
+        for (const [dr, dc] of DIAG_DIRS) {
+          let step = 1;
+          while (true) {
+            const toR = row + dr * step;
+            const toC = col + dc * step;
+            if (!inBounds(toR, toC) || board[toR][toC]) break;
+            simpleMoves.push({ fromR: row, fromC: col, toR, toC, isCapture: false });
+            step++;
+          }
+        }
+      } else {
+        const forward = piece.color === "w" ? -1 : 1; // белые идут к 8-й горизонтали (row 0), чёрные — к 1-й (row 7)
+        for (const dc of [-1, 1]) {
+          const toR = row + forward;
+          const toC = col + dc;
+          if (inBounds(toR, toC) && !board[toR][toC]) {
+            simpleMoves.push({ fromR: row, fromC: col, toR, toC, isCapture: false });
+          }
+        }
+      }
+    }
+  }
+  return simpleMoves;
+}
+
+function applyCheckersMove(board, move) {
+  const newBoard = cloneCheckersBoard(board);
+  const piece = newBoard[move.fromR][move.fromC];
+  newBoard[move.fromR][move.fromC] = null;
+
+  let curR = move.toR;
+  let curC = move.toC;
+  if (move.isCapture) {
+    for (const jump of move.jumps) {
+      newBoard[jump.capR][jump.capC] = null;
+      curR = jump.toR;
+      curC = jump.toC;
+    }
+  }
+
+  if (!piece.king && ((piece.color === "w" && curR === 0) || (piece.color === "b" && curR === 7))) {
+    piece.king = true;
+  }
+  newBoard[curR][curC] = piece;
+  return newBoard;
+}
+
+function checkersHasAnyPiece(board, color) {
+  return board.some((row) => row.some((cell) => cell && cell.color === color));
+}
+
+// null, если игра продолжается; иначе "w" или "b" — кто выиграл (у кого
+// сейчас ход — colorToMove — тот проиграл, если у него нет ни фигур, ни
+// ходов).
+function checkCheckersWinner(board, colorToMove) {
+  const other = colorToMove === "w" ? "b" : "w";
+  if (!checkersHasAnyPiece(board, colorToMove)) return other;
+  if (generateCheckersMoves(board, colorToMove).length === 0) return other;
+  return null;
+}
+
+// ==== Простой движок для хода бота в шашках (материал + продвижение) ====
+const CHECKERS_MAN_VALUE = 100;
+const CHECKERS_KING_VALUE = 350;
+const CHECKERS_MATE_SCORE = 100000;
+
+function evaluateCheckersBoard(board) {
+  let score = 0;
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const cell = board[row][col];
+      if (!cell) continue;
+      const sign = cell.color === "w" ? 1 : -1;
+      if (cell.king) {
+        score += sign * CHECKERS_KING_VALUE;
+        continue;
+      }
+      // Бонус за продвижение к дамке — чем ближе к последней горизонтали,
+      // тем ценнее простая шашка (у белых цель row 0, у чёрных row 7).
+      const advancement = cell.color === "w" ? 7 - row : row;
+      score += sign * (CHECKERS_MAN_VALUE + advancement * 6);
+      // Небольшой бонус за центральные вертикали — меньше шансов попасть
+      // под размен с края доски.
+      const centerBonus = 4 - Math.abs(col - 3.5);
+      score += sign * centerBonus;
+    }
+  }
+  return score;
+}
+
+function minimaxCheckers(board, color, depth, alpha, beta) {
+  const moves = generateCheckersMoves(board, color);
+  if (moves.length === 0) {
+    // Стороне color нечем/некуда ходить — она проиграла.
+    return color === "w" ? -CHECKERS_MATE_SCORE - depth : CHECKERS_MATE_SCORE + depth;
+  }
+  if (depth === 0) return evaluateCheckersBoard(board);
+
+  const maximizing = color === "w";
+  let best = maximizing ? -Infinity : Infinity;
+  const nextColor = color === "w" ? "b" : "w";
+  for (const move of moves) {
+    const nextBoard = applyCheckersMove(board, move);
+    const score = minimaxCheckers(nextBoard, nextColor, depth - 1, alpha, beta);
+    if (maximizing) {
+      best = Math.max(best, score);
+      alpha = Math.max(alpha, best);
+    } else {
+      best = Math.min(best, score);
+      beta = Math.min(beta, best);
+    }
+    if (beta <= alpha) break;
+  }
+  return best;
+}
+
+function findBestCheckersMove(board, color) {
+  const moves = generateCheckersMoves(board, color);
+  if (moves.length === 0) return null;
+  // Взятия длиннее двигаем в приоритете при равенстве оценки — эстетика,
+  // не влияет на легальность (бить и так обязательно, если есть чем).
+  moves.sort((a, b) => (b.jumps?.length || 0) - (a.jumps?.length || 0));
+
+  let bestMove = moves[0];
+  let bestScore = color === "w" ? -Infinity : Infinity;
+  const nextColor = color === "w" ? "b" : "w";
+  for (const move of moves) {
+    const nextBoard = applyCheckersMove(board, move);
+    const score = minimaxCheckers(nextBoard, nextColor, CHECKERS_SEARCH_DEPTH - 1, -Infinity, Infinity);
+    if (color === "w" ? score > bestScore : score < bestScore) {
+      bestScore = score;
+      bestMove = move;
+    }
+  }
+  return bestMove;
+}
+
+function startCheckersGame(chatId, userId, userColor, view, playerName) {
+  const key = checkersMapKey(chatId, userId);
+  const resolvedView = view || checkersGames.get(key)?.view || "ascii";
+  const state = { board: createInitialCheckersBoard(), turn: "w", userColor, view: resolvedView, playerName };
+  checkersGames.set(key, state);
+  saveCheckersGame(chatId, userId);
+  return state;
+}
+
+// Символы вида "картинками": простые — белый/чёрный кружок, дамки —
+// латинские буквы в кружке. Геометрические фигуры и Enclosed Alphanumerics
+// рендерятся как обычный узкий текст почти везде, но VS15 добавлен и сюда
+// на всякий случай (см. подробный комментарий у UNICODE_WHITE в шахматах).
+const CHECKERS_UNICODE = {
+  wMan: withVS("○"),
+  bMan: withVS("●"),
+  wKing: withVS("Ⓦ"),
+  bKing: withVS("Ⓑ"),
+};
+
+function checkersCellGlyph(cell, row, col, view) {
+  if (!cell) return isDarkSquare(row, col) ? "." : " ";
+  if (view === "unicode") {
+    if (cell.king) return cell.color === "w" ? CHECKERS_UNICODE.wKing : CHECKERS_UNICODE.bKing;
+    return cell.color === "w" ? CHECKERS_UNICODE.wMan : CHECKERS_UNICODE.bMan;
+  }
+  const letter = cell.color === "w" ? "w" : "b";
+  return cell.king ? letter.toUpperCase() : letter;
+}
+
+function formatCheckersBoard(board, userColor, view, playerName) {
+  const lines = ["  +------------------------+"];
+  for (let row = 0; row < 8; row++) {
+    const rank = 8 - row;
+    const cells = board[row].map((cell, col) => checkersCellGlyph(cell, row, col, view));
+    lines.push(`${rank} | ${cells.join("  ")} |`);
+  }
+  lines.push("  +------------------------+");
+  lines.push("    a  b  c  d  e  f  g  h");
+  const board_ = lines.join("\n");
+
+  let caption;
+  if (view === "unicode") {
+    const you = userColor === "w" ? CHECKERS_UNICODE.wMan + CHECKERS_UNICODE.wKing : CHECKERS_UNICODE.bMan + CHECKERS_UNICODE.bKing;
+    const me = userColor === "w" ? CHECKERS_UNICODE.bMan + CHECKERS_UNICODE.bKing : CHECKERS_UNICODE.wMan + CHECKERS_UNICODE.wKing;
+    caption = `(${you} — твои, ${me} — мои; заглавная в кружке — дамка)`;
+  } else {
+    caption =
+      userColor === "w"
+        ? "(w/W — твои белые, b/B — мои чёрные; заглавная — дамка)"
+        : "(b/B — твои чёрные, w/W — мои белые; заглавная — дамка)";
+  }
+
+  const header = playerName ? `Партия в шашки с ${playerName}:\n` : "";
+  return header + "```\n" + board_ + "\n" + caption + "\n```";
+}
+
+// Разбирает попытку хода вида "b6-c5" (тихий ход) или "b6:d4" /
+// "b6xd4" / многоходовая цепочка взятий "b6:d4:f2". Ищет среди легальных
+// ходов текущей стороны такой, что совпадают стартовая и финальная
+// клетки (а если промежуточные клетки в тексте указаны — ещё и путь).
+// Возвращает найденный ход (в исходном формате из generateCheckersMoves)
+// либо null.
+function tryApplyCheckersMove(board, color, rawText) {
+  const text = normalizeMoveText(rawText);
+  const tokens = text.split(/[\s,;]+/).filter(Boolean);
+  const legalMoves = generateCheckersMoves(board, color);
+
+  for (const token of tokens) {
+    if (!CHECKERS_MOVE_REGEX.test(token)) continue;
+    const squares = token.match(/[a-h][1-8]/gi);
+    if (!squares || squares.length < 2) continue;
+
+    const from = squareToRC(squares[0]);
+    const to = squareToRC(squares[squares.length - 1]);
+    const candidates = legalMoves.filter((m) => m.fromR === from.row && m.fromC === from.col && m.toR === to.row && m.toC === to.col);
+    if (candidates.length === 0) continue;
+    if (candidates.length === 1 || squares.length === 2) return candidates[0];
+
+    // Несколько ходов дают ту же стартовую/финальную клетку (разные пути
+    // взятия к одной и той же финальной клетке) — уточняем по указанным
+    // в тексте промежуточным клеткам.
+    const wanted = squares.slice(1, -1).map((sq) => squareToRC(sq));
+    const exact = candidates.find((m) => {
+      if (!m.jumps || m.jumps.length - 1 !== wanted.length) return false;
+      return wanted.every((sq, i) => m.jumps[i].toR === sq.row && m.jumps[i].toC === sq.col);
+    });
+    if (exact) return exact;
+    return candidates[0];
+  }
+  return null;
+}
+
+const CHECKERS_MOVE_SHAPE = /^[a-h][1-8][-:x][a-h][1-8]([-:x][a-h][1-8])*$/i;
+
+function looksLikeCheckersMoveAttempt(rawText) {
+  const tokens = normalizeMoveText(rawText).split(/[\s,;]+/).filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 3) return false;
+  return tokens.every((t) => CHECKERS_MOVE_SHAPE.test(t));
+}
+
+const CHECKERS_START_PHRASES_WHITE = [
+  "го, сыграем в шашки. Ты за белых, ходи первым — формат b6-c5, взятие b6:d4.",
+  "давай в шашки. Бери белых, начинай: тихий ход через тире (b6-c5), взятие через двоеточие (b6:d4).",
+];
+const CHECKERS_START_PHRASES_BLACK = [
+  "го, сыграем в шашки. Ты за чёрных, значит я белыми и хожу первым.",
+  "давай в шашки. Бери чёрных — я тогда белыми, начинаю.",
+];
+const CHECKERS_WIN_PHRASES = ["всё, тебе больше нечем ходить — я выиграл", "готово, обыграл. Реванш будешь брать?"];
+const CHECKERS_LOSE_PHRASES = ["хм, мне ходить нечем — забирай победу", "сдаюсь по правилам, ты выиграл эту партию"];
+const CHECKERS_RESIGN_PHRASES = ["принято, партия в шашки окончена", "ладно, сдался — так сдался"];
 
 // ==== Фолбэк между провайдерами/моделями ====
 // Индекс цели (провайдер+модель), на которой бот последний раз успешно
@@ -1203,12 +1693,13 @@ async function loadPersistedState() {
   if (!redis) return;
 
   try {
-    const [historyKeys, aliasKeys, usernameKeys, genderKeys, chessKeys, savedIdx, savedPinnedIdx] = await Promise.all([
+    const [historyKeys, aliasKeys, usernameKeys, genderKeys, chessKeys, checkersKeys, savedIdx, savedPinnedIdx] = await Promise.all([
       redis.keys("history:*"),
       redis.keys("aliases:*"),
       redis.keys("usernames:*"),
       redis.keys("genders:*"),
       redis.keys("chess:*"),
+      redis.keys("checkers:*"),
       redis.get("activeTargetIndex"),
       redis.get("pinnedTargetIndex"),
     ]);
@@ -1266,6 +1757,18 @@ async function loadPersistedState() {
       })
     );
 
+    await Promise.all(
+      checkersKeys.map(async (key) => {
+        // Ключ вида checkers:{chatId}:{userId} — под тем же составным
+        // ключом, что и checkersMapKey() в рантайме.
+        const mapKey = key.slice("checkers:".length);
+        const data = await redis.get(key);
+        if (data && typeof data === "object" && Array.isArray(data.board)) {
+          checkersGames.set(mapKey, data);
+        }
+      })
+    );
+
     if (typeof savedIdx === "number" && Number.isInteger(savedIdx) && savedIdx >= 0 && savedIdx < TARGETS.length) {
       activeTargetIndex = savedIdx;
     }
@@ -1281,7 +1784,8 @@ async function loadPersistedState() {
 
     console.log(
       `Восстановлено из Redis: истории — ${historyKeys.length}, алиасы — ${aliasKeys.length}, ` +
-        `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}, шахматные партии — ${chessKeys.length}` +
+        `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}, шахматные партии — ${chessKeys.length}, ` +
+        `шашечные партии — ${checkersKeys.length}` +
         (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "") +
         (pinnedTargetIndex !== null ? `, закреплена вручную — индекс ${pinnedTargetIndex}` : "")
     );
@@ -1728,6 +2232,12 @@ bot.on("message:text", async (ctx) => {
   // болтать параллельно с игрой).
   const userId = ctx.from.id;
   const chessGame = getChessGame(chatId, userId);
+  // То же самое для шашек — своя независимая партия под тем же составным
+  // ключом chatId+userId, см. checkersMapKey. Один и тот же пользователь
+  // не может одновременно вести и шахматную, и шашечную партию: шахматный
+  // блок ниже проверяется первым, шашечный — только если шахматной партии
+  // нет (см. цепочку if/else if дальше).
+  const checkersGame = getCheckersGame(chatId, userId);
 
   if (chessGame) {
     if (CHESS_RESIGN_REGEX.test(rawText)) {
@@ -1885,6 +2395,132 @@ bot.on("message:text", async (ctx) => {
       });
     } else {
       await ctx.reply(pickRandom(CHESS_START_PHRASES_WHITE));
+    }
+    return;
+  } else if (checkersGame) {
+    if (CHESS_RESIGN_REGEX.test(rawText)) {
+      await clearCheckersGame(chatId, userId);
+      await ctx.reply(pickRandom(CHECKERS_RESIGN_PHRASES));
+      return;
+    }
+
+    // Ход проверяем ДО команд "покажи доску"/"новая партия" — та же логика,
+    // что и в шахматном блоке выше (см. подробный комментарий там).
+    if (checkersGame.turn === checkersGame.userColor) {
+      const move = tryApplyCheckersMove(checkersGame.board, checkersGame.userColor, rawText);
+      if (move) {
+        let board = applyCheckersMove(checkersGame.board, move);
+        const opponentColor = checkersGame.userColor === "w" ? "b" : "w";
+        const moveNote = move.jumps ? move.jumps.map((j) => rcToSquare(j.toR, j.toC)).join(":") : rcToSquare(move.toR, move.toC);
+
+        const userWinner = checkCheckersWinner(board, opponentColor);
+        checkersGames.set(checkersMapKey(chatId, userId), { ...checkersGame, board, turn: opponentColor });
+        saveCheckersGame(chatId, userId);
+
+        if (userWinner) {
+          await ctx.reply(
+            `${moveNote}\n${formatCheckersBoard(board, checkersGame.userColor, checkersGame.view, checkersGame.playerName)}\n\n${pickRandom(CHECKERS_LOSE_PHRASES)}`,
+            { parse_mode: "Markdown" }
+          );
+          await clearCheckersGame(chatId, userId);
+          return;
+        }
+
+        // Ходит бот
+        const botMove = findBestCheckersMove(board, opponentColor);
+        board = applyCheckersMove(board, botMove);
+        const botMoveNote = botMove.jumps
+          ? botMove.jumps.map((j) => rcToSquare(j.toR, j.toC)).join(":")
+          : rcToSquare(botMove.toR, botMove.toC);
+
+        const botWinner = checkCheckersWinner(board, checkersGame.userColor);
+        checkersGames.set(checkersMapKey(chatId, userId), { ...checkersGame, board, turn: checkersGame.userColor });
+        saveCheckersGame(chatId, userId);
+
+        if (botWinner) {
+          await ctx.reply(
+            `Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, checkersGame.userColor, checkersGame.view, checkersGame.playerName)}\n\n${pickRandom(CHECKERS_WIN_PHRASES)}`,
+            { parse_mode: "Markdown" }
+          );
+          await clearCheckersGame(chatId, userId);
+          return;
+        }
+
+        await ctx.reply(
+          `Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, checkersGame.userColor, checkersGame.view, checkersGame.playerName)}`,
+          { parse_mode: "Markdown" }
+        );
+        return;
+      }
+      if (looksLikeCheckersMoveAttempt(rawText)) {
+        await ctx.reply(
+          "такой ход сделать нельзя (нелегален, или есть обязательное взятие, или опечатка). Глянь позицию — \"покажи доску\" — и попробуй другой, формат b6-c5 или взятие b6:d4"
+        );
+        return;
+      }
+    }
+
+    const requestedColor = parseRequestedUserColor(rawText);
+
+    if (CHESS_VIEW_UNICODE_REGEX.test(rawText) || CHESS_VIEW_ASCII_REGEX.test(rawText)) {
+      const newView = CHESS_VIEW_UNICODE_REGEX.test(rawText) ? "unicode" : "ascii";
+      if (newView !== checkersGame.view) {
+        checkersGames.set(checkersMapKey(chatId, userId), { ...checkersGame, view: newView });
+        saveCheckersGame(chatId, userId);
+      }
+      await ctx.reply(formatCheckersBoard(checkersGame.board, checkersGame.userColor, newView, checkersGame.playerName), {
+        parse_mode: "Markdown",
+      });
+      return;
+    }
+
+    if (CHESS_BOARD_REGEX.test(rawText)) {
+      await ctx.reply(
+        formatCheckersBoard(checkersGame.board, checkersGame.userColor, checkersGame.view, checkersGame.playerName),
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (CHESS_NEW_GAME_REGEX.test(rawText) || (requestedColor && requestedColor !== checkersGame.userColor)) {
+      const userColor = requestedColor || checkersGame.userColor;
+      const newState = startCheckersGame(chatId, userId, userColor, checkersGame.view, checkersGame.playerName);
+      const colorNote = userColor === "w" ? ", ты снова белыми — ходи" : ", ты чёрными — я белыми и хожу первым";
+      await ctx.reply(`окей, погнали заново${colorNote}`);
+      if (userColor === "b") {
+        const botMove = findBestCheckersMove(newState.board, "w");
+        const board = applyCheckersMove(newState.board, botMove);
+        const botMoveNote = botMove.jumps
+          ? botMove.jumps.map((j) => rcToSquare(j.toR, j.toC)).join(":")
+          : rcToSquare(botMove.toR, botMove.toC);
+        checkersGames.set(checkersMapKey(chatId, userId), { ...newState, board, turn: "b" });
+        saveCheckersGame(chatId, userId);
+        await ctx.reply(`Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, userColor, checkersGame.view, checkersGame.playerName)}`, {
+          parse_mode: "Markdown",
+        });
+      }
+      return;
+    }
+  } else if (CHECKERS_INTENT_REGEX.test(rawText)) {
+    // Партии нет, но упомянули шашки — считаем приглашением, та же логика,
+    // что и у шахматного CHESS_INTENT_REGEX выше.
+    const userColor = parseRequestedUserColor(rawText) || "w";
+    const playerName = getDisplayName(chatId, ctx.from);
+    const state = startCheckersGame(chatId, userId, userColor, undefined, playerName);
+    if (userColor === "b") {
+      await ctx.reply(pickRandom(CHECKERS_START_PHRASES_BLACK));
+      const botMove = findBestCheckersMove(state.board, "w");
+      const board = applyCheckersMove(state.board, botMove);
+      const botMoveNote = botMove.jumps
+        ? botMove.jumps.map((j) => rcToSquare(j.toR, j.toC)).join(":")
+        : rcToSquare(botMove.toR, botMove.toC);
+      checkersGames.set(checkersMapKey(chatId, userId), { ...state, board, turn: "b" });
+      saveCheckersGame(chatId, userId);
+      await ctx.reply(`Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, userColor, state.view, playerName)}`, {
+        parse_mode: "Markdown",
+      });
+    } else {
+      await ctx.reply(pickRandom(CHECKERS_START_PHRASES_WHITE));
     }
     return;
   }
