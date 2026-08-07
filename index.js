@@ -170,7 +170,9 @@ const STICKERS = {
     "CAACAgIAAxkBAAFRJxVqdFb6M603CYV-WETNYD_q8Mev3AACXIoAAorleUptjSEtmSh1Uj0E",
   ],
   banter_male: [
-    // сюда file_id для реакции на фразы-мемы от мужчин (см. MALE_BANTER_TRIGGERS ниже)
+    "CAACAgIAAxkBAAFRJudqdFSuOIpQQb7w7UgOA4P02ZsOqwACkqYAAkLpqUvGlew-xCdAGj0E",
+    "CAACAgIAAxkBAAFRJuVqdFSoq8wYdmYDg3iHSi5HiimMJQACVKYAAu35oEtnSn4fpHehVD0E",
+    "CAACAgIAAxkBAAFRJt1qdFSOtUzDzrHFbZ4CPPtFRvkhdQAC_6EAAgn9oEtlo15W_K95qz0E",
   ],
   banter_female: [
     "CAACAgIAAxkBAAFRKLVqdGzJu-uYlwrt_0GXpbGe7x2WwAACHKwAApE6oEuhMw0Fyh-PBT0E",
@@ -1376,22 +1378,27 @@ bot.on("message:text", async (ctx) => {
     // держим typing включенным нужное время, чтобы не было мгновенного ответа
     await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
 
-    if (isGroup) {
+    // Если явная фраза уже вызвала стикер по regex выше — не дублируем
+    // ещё одним стикером от тега модели на то же сообщение.
+    const stickerId = !regexStickerFired && stickerKey && pickSticker(stickerKey);
+
+    if (stickerId) {
+      // Стикер реально есть чем отправить — шлём ТОЛЬКО его, без текста.
+      // Текст модели в этом случае был просто реакцией ("спасибо" и т.п.),
+      // дублировать её текстом не нужно. В историю (см. askLLM) уже
+      // положен полный текст с вырезанным тегом — бот всё равно будет
+      // помнить, что "ответил", даже если пользователю ушёл только стикер.
+      await ctx.replyWithSticker(stickerId, {
+        reply_parameters: isGroup ? { message_id: ctx.message.message_id } : undefined,
+        message_thread_id: ctx.message.message_thread_id,
+      });
+    } else if (isGroup) {
       await ctx.reply(reply, {
         reply_parameters: { message_id: ctx.message.message_id },
         message_thread_id: ctx.message.message_thread_id,
       });
     } else {
       await ctx.reply(reply);
-    }
-
-    // Если явная фраза уже вызвала стикер по regex выше — не дублируем
-    // ещё одним стикером от тега модели на то же сообщение.
-    const stickerId = !regexStickerFired && stickerKey && pickSticker(stickerKey);
-    if (stickerId) {
-      await ctx.replyWithSticker(stickerId, {
-        message_thread_id: ctx.message.message_thread_id,
-      });
     }
   } catch (err) {
     console.error("Ошибка обработки сообщения:", err);
