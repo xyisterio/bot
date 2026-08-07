@@ -1671,8 +1671,27 @@ const krokodilGames = new Map();
 // сбрасывается при завершении конкретного раунда/игры.
 const krokodilScores = new Map();
 
+// Раунд считается "зависшим", если статус не idle (т.е. кто-то либо
+// выбирает сложность, либо уже ведёт раунд), а с момента последнего
+// перехода в этот статус (см. startedAt, выставляется в bot.on("callback_
+// query:data") при "host"/"diff:") прошло больше этого времени — типичный
+// случай: ведущий взял слово и вышел из чата/заблокировал бота. Проверяется
+// централизованно в getKrokodilGame ниже, так что чинить нужно в одном
+// месте: любое обращение к раунду (команда /krokodil, кнопки, проверка
+// отгадки, естественный триггер "крокодил") сначала само его расчищает,
+// если он завис — раунд просто тихо возвращается в "idle", а следующий
+// желающий видит обычное приглашение "жми кнопку, чтобы стать ведущим".
+// Для ручного сброса раньше таймаута — см. bot.command("krokodil_reset").
+const KROKODIL_TIMEOUT_MS = 10 * 60 * 1000; // 10 минут без действий
+
 function getKrokodilGame(chatId) {
-  return krokodilGames.get(chatId) || null;
+  const game = krokodilGames.get(chatId) || null;
+  if (game && game.status !== "idle" && game.startedAt && Date.now() - game.startedAt > KROKODIL_TIMEOUT_MS) {
+    krokodilGames.set(chatId, { status: "idle", usedWords: game.usedWords || [] });
+    saveKrokodilGame(chatId);
+    return krokodilGames.get(chatId);
+  }
+  return game;
 }
 
 function getKrokodilScoreMap(chatId) {
@@ -2670,6 +2689,37 @@ bot.command("krokodil", async (ctx) => {
   );
 });
 
+// /krokodil_reset — ручной "рестарт": принудительно закрывает текущий
+// раунд (в статусе "choosing" ИЛИ "active") и возвращает игру в "idle" —
+// не дожидаясь автосброса по таймауту (см. KROKODIL_TIMEOUT_MS выше).
+// Специально доступна ЛЮБОМУ в чате, а не только ведущему/владельцу:
+// единственный сценарий, ради которого она вообще нужна — ведущий взял
+// слово и пропал, так что дожидаться его же команды на сброс бессмысленно.
+// Читаем raw из Map, а не через getKrokodilGame — не хотим, чтобы
+// автосброс по таймауту внутри getKrokodilGame тихо подменил game на уже
+// idle ДО того, как мы соберём wasActive/revealedWord для сообщения.
+// Счёт игроков (krokodilScores) не трогаем — сбрасывается только сам
+// раунд, таблица лидеров чата остаётся как есть.
+bot.command("krokodil_reset", async (ctx) => {
+  const chatId = ctx.chat.id;
+  const game = krokodilGames.get(chatId);
+
+  if (!game || game.status === "idle") {
+    await ctx.reply("раунд и так не идёт — жми кнопку, чтобы начать");
+    return;
+  }
+
+  const wasActive = game.status === "active";
+  const revealedWord = wasActive ? game.word : null;
+  krokodilGames.set(chatId, { status: "idle", usedWords: game.usedWords || [] });
+  saveKrokodilGame(chatId);
+
+  const wordNote = revealedWord ? ` Слово было: «${revealedWord}».` : "";
+  await ctx.reply(`🔄 раунд сброшен вручную.${wordNote}\n\n${formatKrokodilLeaderboard(chatId)}`, {
+    reply_markup: krokodilIdleKeyboard(),
+  });
+});
+
 // Естественный триггер вроде "Женя, крокодил" — проверяется в основном
 // обработчике текстовых сообщений, ДО шахматно-шашечной логики (см.
 // KROKODIL_INTENT_REGEX и блок "Крокодил" там) — специально раньше, чтобы
@@ -2701,6 +2751,7 @@ bot.on("callback_query:data", async (ctx) => {
       candidateId: clicker.id,
       candidateName: krokodilPlayerLabel(clicker),
       usedWords: game?.usedWords || [],
+      startedAt: Date.now(),
     });
     saveKrokodilGame(chatId);
 
@@ -2732,6 +2783,7 @@ bot.on("callback_query:data", async (ctx) => {
       word,
       difficulty,
       usedWords,
+      startedAt: Date.now(),
     });
     saveKrokodilGame(chatId);
 
@@ -3719,6 +3771,7 @@ async function registerCommands() {
     { command: "gender", description: "посмотреть/задать пол (свой или реплаем)" },
     { command: "model", description: "выбрать модель / посмотреть текущую" },
     { command: "krokodil", description: "сыграть в крокодил (объясни слово)" },
+    { command: "krokodil_reset", description: "сбросить зависший раунд крокодила" },
   ]);
   console.log("Команды зарегистрированы в Telegram");
 }
