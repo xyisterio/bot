@@ -1074,6 +1074,10 @@ function isDarkSquare(row, col) {
 }
 
 function squareToRC(square) {
+  // toLowerCase() — чтобы E7-e6 / e7-E6 / E7-E6 распознавались так же, как
+  // e7-e6: сюда попадают клетки, вытащенные regexp'ом с флагом /gi, а он
+  // сохраняет исходный регистр букв из сообщения пользователя.
+  square = square.toLowerCase();
   const col = square.charCodeAt(0) - "a".charCodeAt(0);
   const rank = parseInt(square[1], 10);
   const row = 8 - rank;
@@ -2287,6 +2291,36 @@ function parseWeatherIntent(text) {
 // слова, так что обрубание хвоста по одному символу обычно и даёт нужный
 // префикс ("Киеве" → "Киев" — точное совпадение, "Одессе" → "Одесс" —
 // префикс "Одессы"). Пробуем от полной строки и короче, до 3 символов.
+// Для ранжирования результатов геокодера: "ё" в написании пользователя
+// нередко на деле означает "е" (Королёв/Королев и т.п.), а count=1 в
+// Open-Meteo не гарантирует, что вернётся самый крупный/точный по имени
+// населённый пункт — маленький посёлок с похожим названием (тоже
+// подходящий по префиксу) может обогнать миллионник. Нормализуем и для
+// сравнения точности, и приводим population к числу для сравнения размера.
+function normalizeCityName(s) {
+  return (s || "").toLowerCase().replace(/ё/g, "е");
+}
+
+// Оценивает, насколько хорошо кандидат geocoder'а соответствует запросу:
+// точное совпадение имени весит намного больше, чем просто совпадение по
+// префиксу (на которое опирается geocodeCity из-за падежей) — иначе
+// небольшой населённый пункт, начинающийся на то же слово, может
+// перевесить нужный крупный город только за счёт населения.
+function scoreGeocodeHit(hit, query) {
+  const name = normalizeCityName(hit.name);
+  const q = normalizeCityName(query);
+  const exact = name === q ? 1_000_000_000 : 0;
+  const population = Number(hit.population) || 0;
+  return exact + population;
+}
+
+// Геокодинг с фолбэком на грамматические падежи: Open-Meteo матчит только
+// по ПРЕФИКСУ индексированного имени (см. docs geocoding-api.open-meteo.com),
+// а "Киеве"/"Одессе" — это предложный падеж, не префикс "Киев"/"Одесса".
+// Большинство русских окончаний падежей — это 1-2 лишних символа В КОНЦЕ
+// слова, так что обрубание хвоста по одному символу обычно и даёт нужный
+// префикс ("Киеве" → "Киев" — точное совпадение, "Одессе" → "Одесс" —
+// префикс "Одессы"). Пробуем от полной строки и короче, до 3 символов.
 async function geocodeCity(rawCity) {
   const base = rawCity.trim();
   const candidates = [base];
@@ -2297,23 +2331,29 @@ async function geocodeCity(rawCity) {
   for (const candidate of candidates) {
     if (candidate.length < 2) continue;
     try {
+      // count=10, а не 1 — чтобы было из чего выбрать: при обрезанном по
+      // падежу префиксе под него может подходить сразу несколько мест
+      // (крупный город и созвучный посёлок), а нам нужен самый релевантный,
+      // а не первый по версии API (см. scoreGeocodeHit).
       const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
         candidate
-      )}&count=1&language=ru&format=json`;
+      )}&count=10&language=ru&format=json`;
       const res = await fetch(url);
       if (!res.ok) continue;
       const data = await res.json();
-      const hit = data?.results?.[0];
-      if (hit) {
-        return {
-          name: hit.name,
-          country: hit.country || "",
-          admin1: hit.admin1 || "",
-          latitude: hit.latitude,
-          longitude: hit.longitude,
-          timezone: hit.timezone || "auto",
-        };
-      }
+      const hits = data?.results;
+      if (!hits || hits.length === 0) continue;
+
+      const best = hits.reduce((a, b) => (scoreGeocodeHit(b, base) > scoreGeocodeHit(a, base) ? b : a));
+
+      return {
+        name: best.name,
+        country: best.country || "",
+        admin1: best.admin1 || "",
+        latitude: best.latitude,
+        longitude: best.longitude,
+        timezone: best.timezone || "auto",
+      };
     } catch (err) {
       console.error(`Геокодинг "${candidate}" не удался:`, err.message);
     }
