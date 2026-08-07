@@ -2552,9 +2552,16 @@ bot.command("model", async (ctx) => {
 // Обработка нажатий на кнопки из /model. Закрыто владельцем так же, как
 // и сама команда — на всякий случай, если кто-то доберётся до кнопок в
 // групповом чате (например, переслав сообщение с меню).
-bot.on("callback_query:data", async (ctx) => {
+bot.on("callback_query:data", async (ctx, next) => {
   const data = ctx.callbackQuery.data;
-  if (!data.startsWith("setmodel:")) return;
+  // ВАЖНО: это не единственный обработчик "callback_query:data" — ниже
+  // есть отдельный для крокодила (см. bot.on("callback_query:data", ...)
+  // дальше по файлу). grammY выполняет такие обработчики цепочкой через
+  // next(), и если тут просто сделать return без next() — апдейт до
+  // крокодила и других обработчиков дальше по цепочке вообще не дойдёт
+  // (сама кнопка будет выглядеть так, будто "ничего не происходит" при
+  // нажатии). Поэтому на чужой префикс явно передаём управление дальше.
+  if (!data.startsWith("setmodel:")) return next();
 
   if (!isOwner(ctx)) {
     await ctx.answerCallbackQuery({ text: "эта кнопка только для владельца", show_alert: true });
