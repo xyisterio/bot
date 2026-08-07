@@ -1,6 +1,7 @@
 import { Bot } from "grammy";
 import express from "express";
 import { Redis } from "@upstash/redis";
+import { Chess } from "chess.js";
 
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -570,6 +571,223 @@ function pushHistory(chatId, role, content) {
   saveHistory(chatId);
 }
 
+// ==== Шахматы ====
+// Отдельная механика поверх обычного чата, без команды: если для чата ещё
+// нет активной партии и в сообщении упоминаются шахматы — считаем это
+// приглашением и стартуем игру. Дальше, пока партия идёт, каждое входящее
+// сообщение сначала пробуем распознать как ход (или "сдаюсь"/"покажи
+// доску"/"новая партия") — если получилось, играем; если сообщение на ход
+// не похоже, оно просто уходит в обычный LLM-чат как раньше, так что можно
+// одновременно и играть, и болтать.
+//
+// Легальность ходов и правила (рокировка, взятие на проходе, мат/пат/ничья)
+// считает chess.js. Ход бота считает простой minimax с альфа-бета
+// отсечением на несколько полуходов вперёд (материал + позиционные бонусы
+// за центр) — бот реально перебирает варианты, а не ходит наугад.
+// Партия (FEN + цвет пользователя) хранится в памяти и зеркалится в Redis
+// (ключ chess:{chatId}), как и остальная память бота — см. loadPersistedState.
+
+const CHESS_INTENT_REGEX = /шахмат/i;
+const CHESS_RESIGN_REGEX = /сда(ю|л)/i;
+const CHESS_BOARD_REGEX = /покажи доск|^доска\??$|как там доска/i;
+const CHESS_NEW_GAME_REGEX = /нов(ую|ая) парти|давай заново|начн[её]м заново|переиграем/i;
+
+const chessGames = new Map(); // chatId -> { fen, userColor: "w" | "b" }
+
+function getChessGame(chatId) {
+  return chessGames.get(chatId) || null;
+}
+
+async function saveChessGame(chatId) {
+  if (!redis) return;
+  try {
+    await redis.set(`chess:${chatId}`, chessGames.get(chatId));
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить шахматную партию чата ${chatId}:`, err);
+  }
+}
+
+async function clearChessGame(chatId) {
+  chessGames.delete(chatId);
+  if (!redis) return;
+  try {
+    await redis.del(`chess:${chatId}`);
+  } catch (err) {
+    console.error(`Redis: не удалось удалить шахматную партию чата ${chatId}:`, err);
+  }
+}
+
+function startChessGame(chatId, userColor) {
+  const chess = new Chess();
+  chessGames.set(chatId, { fen: chess.fen(), userColor });
+  saveChessGame(chatId);
+  return chess;
+}
+
+// Юникод-фигуры для текстовой доски: заглавные ключи — белые (полые
+// символы), строчные — чёрные (заливные), как принято по умолчанию.
+const PIECE_UNICODE = {
+  P: "♙", N: "♘", B: "♗", R: "♖", Q: "♕", K: "♔",
+  p: "♟", n: "♞", b: "♝", r: "♜", q: "♛", k: "♚",
+};
+
+function formatBoard(chess) {
+  const board = chess.board(); // board[0] — 8-я горизонталь, board[7] — 1-я
+  const lines = board.map((row, i) => {
+    const cells = row
+      .map((cell) => (cell ? PIECE_UNICODE[cell.color === "w" ? cell.type.toUpperCase() : cell.type] : "·"))
+      .join(" ");
+    return `${8 - i} ${cells}`;
+  });
+  lines.push("  a b c d e f g h");
+  return "```\n" + lines.join("\n") + "\n```";
+}
+
+// На русской раскладке "е2е4" легко напечатать кириллическими е/а, которые
+// выглядят как латинские, но ими не являются — chess.js такое не распознает.
+// Нормализуем самые частые омоглифы перед разбором хода.
+function normalizeMoveText(text) {
+  return text
+    .trim()
+    .replace(/а/g, "a")
+    .replace(/А/g, "A")
+    .replace(/е/g, "e")
+    .replace(/Е/g, "E");
+}
+
+// Пытается распознать ход из текста сообщения — либо в UCI-формате
+// (e2e4, e7e8q), либо обычной шахматной нотацией (SAN: e4, Nf3, O-O, exd5).
+// Применяет ход к переданному объекту chess.js и возвращает Move, либо
+// null, если это на ход вообще не похоже (тогда сообщение уйдёт в обычный чат).
+function tryApplyUserMove(chess, rawText) {
+  const text = normalizeMoveText(rawText);
+  const uciMatch = text.match(/^([a-h][1-8])[\s-]?([a-h][1-8])\s*=?\s*([qrbn])?$/i);
+  try {
+    if (uciMatch) {
+      const [, from, to, promo] = uciMatch;
+      return chess.move({ from, to, promotion: (promo || "q").toLowerCase() }) || null;
+    }
+    return chess.move(text) || null;
+  } catch {
+    return null;
+  }
+}
+
+// ==== Простой шахматный движок для хода бота (material + PST + minimax) ====
+const PIECE_VALUES = { p: 100, n: 320, b: 330, r: 500, q: 900, k: 0 };
+
+// Позиционные бонусы (с точки зрения белых, индекс 0 = 8-я горизонталь) —
+// чтобы бот тянулся в центр пешками/конями, а не просто считал материал.
+// Для остальных фигур обходимся без таблиц: на глубине поиска в несколько
+// полуходов материала + этих двух таблиц достаточно для вменяемой игры.
+const PST_PAWN = [
+  0, 0, 0, 0, 0, 0, 0, 0,
+  50, 50, 50, 50, 50, 50, 50, 50,
+  10, 10, 20, 30, 30, 20, 10, 10,
+  5, 5, 10, 25, 25, 10, 5, 5,
+  0, 0, 0, 20, 20, 0, 0, 0,
+  5, -5, -10, 0, 0, -10, -5, 5,
+  5, 10, 10, -20, -20, 10, 10, 5,
+  0, 0, 0, 0, 0, 0, 0, 0,
+];
+const PST_KNIGHT = [
+  -50, -40, -30, -30, -30, -30, -40, -50,
+  -40, -20, 0, 0, 0, 0, -20, -40,
+  -30, 0, 10, 15, 15, 10, 0, -30,
+  -30, 5, 15, 20, 20, 15, 5, -30,
+  -30, 0, 15, 20, 20, 15, 0, -30,
+  -30, 5, 10, 15, 15, 10, 5, -30,
+  -40, -20, 0, 5, 5, 0, -20, -40,
+  -50, -40, -30, -30, -30, -30, -40, -50,
+];
+const PST = { p: PST_PAWN, n: PST_KNIGHT };
+
+function squareIndex(square, color) {
+  const file = square.charCodeAt(0) - "a".charCodeAt(0);
+  const rank = parseInt(square[1], 10) - 1; // 0 = 1-я горизонталь
+  const rankFromTop = color === "w" ? 7 - rank : rank; // таблицы выше — сверху вниз, для чёрных зеркалим
+  return rankFromTop * 8 + file;
+}
+
+function evaluateBoard(chess) {
+  let score = 0;
+  for (const row of chess.board()) {
+    for (const cell of row) {
+      if (!cell) continue;
+      const value = PIECE_VALUES[cell.type];
+      const table = PST[cell.type];
+      const bonus = table ? table[squareIndex(cell.square, cell.color)] : 0;
+      score += (cell.color === "w" ? 1 : -1) * (value + bonus);
+    }
+  }
+  return score;
+}
+
+const MATE_SCORE = 100000;
+
+function minimax(chess, depth, alpha, beta, maximizing) {
+  if (chess.isCheckmate()) return maximizing ? -MATE_SCORE - depth : MATE_SCORE + depth;
+  if (chess.isDraw() || chess.isStalemate()) return 0;
+  if (depth === 0) return evaluateBoard(chess);
+
+  const moves = chess.moves({ verbose: true });
+  moves.sort((a, b) => (b.captured ? 1 : 0) - (a.captured ? 1 : 0)); // взятия вперёд — отсечения эффективнее
+
+  let best = maximizing ? -Infinity : Infinity;
+  for (const m of moves) {
+    chess.move(m);
+    const score = minimax(chess, depth - 1, alpha, beta, !maximizing);
+    chess.undo();
+
+    if (maximizing) {
+      best = Math.max(best, score);
+      alpha = Math.max(alpha, best);
+    } else {
+      best = Math.min(best, score);
+      beta = Math.min(beta, best);
+    }
+    if (beta <= alpha) break;
+  }
+  return best;
+}
+
+const CHESS_SEARCH_DEPTH = 3; // полуходов вперёд для хода бота — баланс силы игры и скорости ответа
+
+function findBestMove(chess) {
+  const color = chess.turn(); // чей сейчас ход — ходит бот
+  const moves = chess.moves({ verbose: true });
+  moves.sort((a, b) => (b.captured ? 1 : 0) - (a.captured ? 1 : 0));
+
+  let bestMove = null;
+  let bestScore = color === "w" ? -Infinity : Infinity;
+
+  for (const m of moves) {
+    chess.move(m);
+    const score = minimax(chess, CHESS_SEARCH_DEPTH - 1, -Infinity, Infinity, color !== "w");
+    chess.undo();
+
+    if (color === "w" ? score > bestScore : score < bestScore) {
+      bestScore = score;
+      bestMove = m;
+    }
+  }
+  return bestMove;
+}
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+const CHESS_START_PHRASES = [
+  "го, давай сыграем. Ты за белых, ходи первым — пиши как e2e4 или обычной нотацией типа Nf3.",
+  "чё бы и не сыграть. Бери белых, начинай — формат хода e2e4 или Nf3, как удобнее.",
+  "ладно, давай. Ты белыми, я чёрными — жду твой ход (e2e4 или Nf3, без разницы).",
+];
+const CHESS_CHECKMATE_WIN_PHRASES = ["мат, я выиграл. Ну ты держался норм", "всё, мат. Реванш будешь брать?"];
+const CHESS_CHECKMATE_LOSE_PHRASES = ["ну и мат мне... красиво сыграл", "мат мне, засчитано — забирай победу"];
+const CHESS_DRAW_PHRASES = ["ничья, разошлись как в море корабли", "пат или ничья короче — никто не выиграл"];
+const CHESS_RESIGN_PHRASES = ["принято, партия окончена", "ладно, сдался — так сдался"];
+
 // ==== Фолбэк между провайдерами/моделями ====
 // Индекс цели (провайдер+модель), на которой бот последний раз успешно
 // ответил — начинаем с неё же, чтобы не долбить мёртвую цель на каждый запрос.
@@ -860,11 +1078,12 @@ async function loadPersistedState() {
   if (!redis) return;
 
   try {
-    const [historyKeys, aliasKeys, usernameKeys, genderKeys, savedIdx, savedPinnedIdx] = await Promise.all([
+    const [historyKeys, aliasKeys, usernameKeys, genderKeys, chessKeys, savedIdx, savedPinnedIdx] = await Promise.all([
       redis.keys("history:*"),
       redis.keys("aliases:*"),
       redis.keys("usernames:*"),
       redis.keys("genders:*"),
+      redis.keys("chess:*"),
       redis.get("activeTargetIndex"),
       redis.get("pinnedTargetIndex"),
     ]);
@@ -910,6 +1129,16 @@ async function loadPersistedState() {
       })
     );
 
+    await Promise.all(
+      chessKeys.map(async (key) => {
+        const chatId = Number(key.slice("chess:".length));
+        const data = await redis.get(key);
+        if (data && typeof data === "object" && typeof data.fen === "string") {
+          chessGames.set(chatId, data);
+        }
+      })
+    );
+
     if (typeof savedIdx === "number" && Number.isInteger(savedIdx) && savedIdx >= 0 && savedIdx < TARGETS.length) {
       activeTargetIndex = savedIdx;
     }
@@ -925,7 +1154,7 @@ async function loadPersistedState() {
 
     console.log(
       `Восстановлено из Redis: истории — ${historyKeys.length}, алиасы — ${aliasKeys.length}, ` +
-        `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}` +
+        `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}, шахматные партии — ${chessKeys.length}` +
         (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "") +
         (pinnedTargetIndex !== null ? `, закреплена вручную — индекс ${pinnedTargetIndex}` : "")
     );
@@ -1251,6 +1480,10 @@ bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
   let userText = ctx.message.text;
+  // Сырой текст без последующих преобразований userText (вырезание имени,
+  // добавление префиксов) — нужен для распознавания шахматных ходов,
+  // которые парсит не LLM, а chess.js.
+  const rawText = ctx.message.text;
 
   // Определяем пол пораньше (до проверки триггеров), чтобы выбрать нужный
   // блок — мужской или женский. Смотрим по исходному тексту сообщения.
@@ -1353,6 +1586,101 @@ bot.on("message:text", async (ctx) => {
     if (isOwnerMentioned && !startsWithName && !isReplyToBot && !isMentioned) {
       userText = `[позвали через тег настоящего Жени @${OWNER_USERNAME}] ${userText}`;
     }
+  }
+
+  // ==== Шахматы ====
+  // Дошли сюда — значит сообщение точно адресовано боту (в личке всегда,
+  // в группе — прошло проверку выше). Если для чата уже идёт партия,
+  // пробуем понять сообщение как ход/команду партии; если это ни на что
+  // из этого не похоже — просто продолжаем как обычное сообщение в чат
+  // ниже (можно болтать параллельно с игрой).
+  const chessGame = getChessGame(chatId);
+
+  if (chessGame) {
+    if (CHESS_RESIGN_REGEX.test(rawText)) {
+      await clearChessGame(chatId);
+      await ctx.reply(pickRandom(CHESS_RESIGN_PHRASES));
+      return;
+    }
+
+    if (CHESS_BOARD_REGEX.test(rawText)) {
+      const chess = new Chess(chessGame.fen);
+      await ctx.reply(formatBoard(chess), { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (CHESS_NEW_GAME_REGEX.test(rawText)) {
+      const userColor = chessGame.userColor;
+      const chess = startChessGame(chatId, userColor);
+      const colorNote = userColor === "w" ? ", ты снова белыми — ходи" : ", ты снова чёрными — жду мой ход первым";
+      await ctx.reply(`окей, погнали заново${colorNote}`);
+      if (userColor === "b") {
+        const botMove = findBestMove(chess);
+        chess.move(botMove);
+        chessGames.set(chatId, { fen: chess.fen(), userColor });
+        saveChessGame(chatId);
+        await ctx.reply(`Мой ход: ${botMove.san}\n${formatBoard(chess)}`, { parse_mode: "Markdown" });
+      }
+      return;
+    }
+
+    const chess = new Chess(chessGame.fen);
+    if (chess.turn() === chessGame.userColor) {
+      const move = tryApplyUserMove(chess, rawText);
+      if (move) {
+        chessGames.set(chatId, { fen: chess.fen(), userColor: chessGame.userColor });
+        saveChessGame(chatId);
+
+        if (chess.isCheckmate()) {
+          await ctx.reply(`${move.san}\n${formatBoard(chess)}\n\n${pickRandom(CHESS_CHECKMATE_LOSE_PHRASES)}`, {
+            parse_mode: "Markdown",
+          });
+          await clearChessGame(chatId);
+          return;
+        }
+        if (chess.isDraw() || chess.isStalemate()) {
+          await ctx.reply(`${move.san}\n${formatBoard(chess)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`, {
+            parse_mode: "Markdown",
+          });
+          await clearChessGame(chatId);
+          return;
+        }
+
+        // Ходит бот
+        const botMove = findBestMove(chess);
+        chess.move(botMove);
+        chessGames.set(chatId, { fen: chess.fen(), userColor: chessGame.userColor });
+        saveChessGame(chatId);
+        const checkNote = chess.isCheck() ? " шах" : "";
+
+        if (chess.isCheckmate()) {
+          await ctx.reply(
+            `Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess)}\n\n${pickRandom(CHESS_CHECKMATE_WIN_PHRASES)}`,
+            { parse_mode: "Markdown" }
+          );
+          await clearChessGame(chatId);
+          return;
+        }
+        if (chess.isDraw() || chess.isStalemate()) {
+          await ctx.reply(`Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`, {
+            parse_mode: "Markdown",
+          });
+          await clearChessGame(chatId);
+          return;
+        }
+
+        await ctx.reply(`Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess)}`, { parse_mode: "Markdown" });
+        return;
+      }
+      // Не похоже на ход — падаем ниже в обычный чат, ничего не делаем
+    }
+  } else if (CHESS_INTENT_REGEX.test(rawText)) {
+    // Партии нет, но упомянули шахматы — считаем приглашением и стартуем.
+    // Пользователь всегда играет белыми и ходит первым — так меньше
+    // путаницы, чем спрашивать/угадывать цвет.
+    startChessGame(chatId, "w");
+    await ctx.reply(pickRandom(CHESS_START_PHRASES));
+    return;
   }
 
   // Пол уже определён выше (до блока с banter-триггерами) — тут просто
