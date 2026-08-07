@@ -672,7 +672,22 @@ function startChessGame(chatId, userId, userColor, view, playerName) {
   // пользователя в этом чате (если она была) — чтобы выбор
   // "фигурками"/"буквами" не сбрасывался при "новая партия" или смене сторон.
   const resolvedView = view || chessGames.get(key)?.view || "ascii";
-  chessGames.set(key, { fen: chess.fen(), userColor, view: resolvedView, playerName });
+  // captured — что кем съедено за партию: captured.w — белые фигуры,
+  // которых не стало (их съели чёрные), captured.b — наоборот. Список
+  // типов фигур (chess.js буквы: p,n,b,r,q), сбрасывается с новой партией.
+  // moveStyle — в каком формате пользователь пишет ходы в ЭТОЙ партии
+  // ("uci" — e2e4, или "san" — Nf3) — чтобы бот отвечал своим ходом в
+  // том же формате, а не всегда SAN-нотацией (см. formatChessMove).
+  // Определяется по первому ходу пользователя, дальше обновляется на
+  // каждом его ходу (мало ли переключится посреди партии).
+  chessGames.set(key, {
+    fen: chess.fen(),
+    userColor,
+    view: resolvedView,
+    playerName,
+    captured: { w: [], b: [] },
+    moveStyle: chessGames.get(key)?.moveStyle || "san",
+  });
   saveChessGame(chatId, userId);
   return chess;
 }
@@ -729,26 +744,61 @@ function formatBoardUnicode(chess) {
   return lines.join("\n");
 }
 
+// Порядок для сортировки съеденных фигур в счёте — сильные впереди,
+// чисто эстетика вывода, на подсчёт не влияет.
+const CHESS_PIECE_ORDER = ["q", "r", "b", "n", "p"];
+function sortCapturedPieces(list) {
+  return [...list].sort((a, b) => CHESS_PIECE_ORDER.indexOf(a) - CHESS_PIECE_ORDER.indexOf(b));
+}
+
+// Строка символов съеденных фигур одного цвета в нужном виде отображения.
+function capturedPiecesGlyphs(list, color, view) {
+  const sorted = sortCapturedPieces(list);
+  if (sorted.length === 0) return "—";
+  if (view === "unicode") {
+    const map = color === "w" ? UNICODE_WHITE : UNICODE_BLACK;
+    return sorted.map((t) => map[t]).join("");
+  }
+  return sorted.map((t) => (color === "w" ? t.toUpperCase() : t)).join("");
+}
+
+// Строка счёта под доской — сколько и каких фигур съедено у каждой
+// стороны. captured — { w: [...], b: [...] }, где captured.w — типы
+// белых фигур, которых не стало (их съел чёрный), и наоборот.
+function formatCapturedLine(captured, userColor, view) {
+  if (!captured) return null;
+  const oppColor = userColor === "w" ? "b" : "w";
+  const yourLost = captured[userColor] || [];
+  const myLost = captured[oppColor] || [];
+  if (yourLost.length === 0 && myLost.length === 0) return null;
+  const yourGlyphs = capturedPiecesGlyphs(yourLost, userColor, view);
+  const myGlyphs = capturedPiecesGlyphs(myLost, oppColor, view);
+  return `Съедено у тебя: ${yourGlyphs} (${yourLost.length}) | у меня: ${myGlyphs} (${myLost.length})`;
+}
+
 // userColor — какой стороной играет пользователь в ЭТОЙ партии (после
 // смены сторон бот тоже может быть белыми и ходить первым, см. ниже),
 // view — "ascii" (буквы, по умолчанию) или "unicode" (символы фигур),
 // переключается за партию через CHESS_VIEW_*_REGEX ниже. playerName —
 // с кем идёт партия, показывается заголовком над доской (актуально в
 // группах, где партий с ботом может быть несколько одновременно).
-function formatBoard(chess, userColor, view, playerName) {
+// captured — счёт съеденных фигур (см. formatCapturedLine), опционален.
+function formatBoard(chess, userColor, view, playerName, captured) {
   const board = view === "unicode" ? formatBoardUnicode(chess) : formatBoardAscii(chess);
 
   let caption;
   if (view === "unicode") {
     // Символы легенды тоже с VS15 (см. комментарий у UNICODE_WHITE/BLACK) —
     // легенда в том же ```-блоке, что и доска, поэтому должна рендериться
-    // так же узко, иначе сама строка легенды может "поплыть".
-    const wLegend = "kqrbnp".split("").map((t) => UNICODE_WHITE[t]).join("");
-    const bLegend = "kqrbnp".split("").map((t) => UNICODE_BLACK[t]).join("");
+    // так же узко, иначе сама строка легенды может "поплыть". Одна фигура
+    // на сторону достаточно для примера — раньше показывали все шесть,
+    // это было лишним.
+    const wPiece = UNICODE_WHITE.k;
+    const bPiece = UNICODE_BLACK.k;
     caption =
       userColor === "w"
-        ? `(${wLegend} — твои белые, ${bLegend} — мои чёрные)`
-        : `(${bLegend} — твои чёрные, ${wLegend} — мои белые)`;
+        ? `(${wPiece} — твои белые, ${bPiece} — мои чёрные)`
+        : `(${bPiece} — твои чёрные, ${wPiece} — мои белые)`;
   } else {
     caption =
       userColor === "w"
@@ -756,8 +806,11 @@ function formatBoard(chess, userColor, view, playerName) {
         : "(строчные — твои чёрные, заглавные — мои белые)";
   }
 
+  const capturedLine = formatCapturedLine(captured, userColor, view);
+  const captionBlock = capturedLine ? `${caption}\n${capturedLine}` : caption;
+
   const header = playerName ? `Партия с ${playerName}:\n` : "";
-  return header + "```\n" + board + "\n" + caption + "\n```";
+  return header + "```\n" + board + "\n" + captionBlock + "\n```";
 }
 
 // На русской раскладке "е2е4" легко напечатать кириллическими е/а, которые
@@ -780,6 +833,10 @@ function normalizeMoveText(text) {
 // ходом. Применяет ход к переданному объекту chess.js и возвращает Move,
 // либо null, если ни один токен на ход не похож (тогда сообщение уйдёт в
 // обычный чат).
+// Возвращает { move, style }, где style — "uci" (e2e4) или "san" (Nf3) —
+// в каком формате пользователь фактически написал ЭТОТ ход, чтобы бот мог
+// ответить своим ходом в том же формате (см. formatChessMove). null, если
+// ни один токен на ход не похож.
 function tryApplyUserMove(chess, rawText) {
   const text = normalizeMoveText(rawText);
   const tokens = text.split(/[\s,;]+/).filter(Boolean);
@@ -794,16 +851,26 @@ function tryApplyUserMove(chess, rawText) {
           to: to.toLowerCase(),
           promotion: (promo || "q").toLowerCase(),
         });
-        if (move) return move;
+        if (move) return { move, style: "uci" };
       } else {
         const move = chess.move(token);
-        if (move) return move;
+        if (move) return { move, style: "san" };
       }
     } catch {
       // не подошло — пробуем следующий токен сообщения
     }
   }
   return null;
+}
+
+// Форматирует ход в нужном стиле — "uci" (e2e4, при превращении e7e8q) или
+// "san" (Nf3, exd5, O-O) — так бот отвечает ходом в той же нотации, в
+// которой пишет ходы пользователь в этой партии, а не всегда SAN.
+function formatChessMove(move, style) {
+  if (style === "uci") {
+    return `${move.from}${move.to}${move.promotion || ""}`;
+  }
+  return move.san;
 }
 
 // Похоже ли сообщение на ПОПЫТКУ хода (по форме, не по легальности) —
@@ -1293,10 +1360,32 @@ function findBestCheckersMove(board, color) {
 function startCheckersGame(chatId, userId, userColor, view, playerName) {
   const key = checkersMapKey(chatId, userId);
   const resolvedView = view || checkersGames.get(key)?.view || "ascii";
-  const state = { board: createInitialCheckersBoard(), turn: "w", userColor, view: resolvedView, playerName };
+  // captured — как и в шахматах: captured.w — сколько/какие белые шашки
+  // съедены (их съели чёрные), captured.b — наоборот. Элемент списка —
+  // "man" (простая) или "king" (дамка).
+  const state = {
+    board: createInitialCheckersBoard(),
+    turn: "w",
+    userColor,
+    view: resolvedView,
+    playerName,
+    captured: { w: [], b: [] },
+  };
   checkersGames.set(key, state);
   saveCheckersGame(chatId, userId);
   return state;
+}
+
+// Из хода-взятия (move.jumps, см. generateCheckersMoves) достаёт, какие
+// именно фигуры были съедены — смотрим на board ДО применения хода
+// (applyCheckersMove уже убирает их с доски). Возвращает массив
+// { color, king } — пусто, если ход не был взятием.
+function collectCheckersCaptures(board, move) {
+  if (!move.jumps) return [];
+  return move.jumps.map((j) => {
+    const cell = board[j.capR][j.capC];
+    return { color: cell.color, king: cell.king };
+  });
 }
 
 // Символы вида "картинками": простые — белый/чёрный кружок, дамки —
@@ -1320,7 +1409,32 @@ function checkersCellGlyph(cell, row, col, view) {
   return cell.king ? letter.toUpperCase() : letter;
 }
 
-function formatCheckersBoard(board, userColor, view, playerName) {
+// Строка съеденных шашек одного цвета в нужном виде — дамки вперёд, эстетика.
+function checkersCapturedGlyphs(list, color, view) {
+  if (list.length === 0) return "—";
+  const sorted = [...list].sort((a, b) => (b === "king") - (a === "king"));
+  if (view === "unicode") {
+    const man = color === "w" ? CHECKERS_UNICODE.wMan : CHECKERS_UNICODE.bMan;
+    const king = color === "w" ? CHECKERS_UNICODE.wKing : CHECKERS_UNICODE.bKing;
+    return sorted.map((t) => (t === "king" ? king : man)).join("");
+  }
+  const letter = color === "w" ? "w" : "b";
+  return sorted.map((t) => (t === "king" ? letter.toUpperCase() : letter)).join("");
+}
+
+// Строка счёта под доской, тот же принцип, что и у formatCapturedLine в шахматах.
+function formatCheckersCapturedLine(captured, userColor, view) {
+  if (!captured) return null;
+  const oppColor = userColor === "w" ? "b" : "w";
+  const yourLost = captured[userColor] || [];
+  const myLost = captured[oppColor] || [];
+  if (yourLost.length === 0 && myLost.length === 0) return null;
+  const yourGlyphs = checkersCapturedGlyphs(yourLost, userColor, view);
+  const myGlyphs = checkersCapturedGlyphs(myLost, oppColor, view);
+  return `Съедено у тебя: ${yourGlyphs} (${yourLost.length}) | у меня: ${myGlyphs} (${myLost.length})`;
+}
+
+function formatCheckersBoard(board, userColor, view, playerName, captured) {
   const lines = ["  +------------------------+"];
   for (let row = 0; row < 8; row++) {
     const rank = 8 - row;
@@ -1343,8 +1457,11 @@ function formatCheckersBoard(board, userColor, view, playerName) {
         : "(b/B — твои чёрные, w/W — мои белые; заглавная — дамка)";
   }
 
+  const capturedLine = formatCheckersCapturedLine(captured, userColor, view);
+  const captionBlock = capturedLine ? `${caption}\n${capturedLine}` : caption;
+
   const header = playerName ? `Партия в шашки с ${playerName}:\n` : "";
-  return header + "```\n" + board_ + "\n" + caption + "\n```";
+  return header + "```\n" + board_ + "\n" + captionBlock + "\n```";
 }
 
 // Разбирает попытку хода вида "b6-c5" (тихий ход) или "b6:d4" /
@@ -2086,6 +2203,200 @@ bot.command("gender", async (ctx) => {
   await ctx.reply(`ок, записал: ${targetLabel} — ${gender === "m" ? "мужской" : "женский"}`);
 });
 
+// ==== Погода (Open-Meteo, без ключа) ====
+// Триггер — слово "погода"/"погоды" в сообщении, адресованном боту (та же
+// гейтовая логика, что и у остального: в личке всегда, в группе — после
+// имени/реплая/упоминания, см. ниже перед основным блоком). Понимает и
+// текущую погоду ("погода в Киеве"), и прогноз ("погода в Киеве на 10
+// дней"/"на неделю"). Города — на русском (в т.ч. в разных падежах, см.
+// geocodeCity) и на английском, для любой точки на планете — используется
+// геокодер Open-Meteo (geocoding-api.open-meteo.com), а не захардкоженный
+// список городов.
+const WMO_WEATHER = {
+  0: { icon: "☀️", desc: "ясно" },
+  1: { icon: "🌤", desc: "малооблачно" },
+  2: { icon: "⛅", desc: "переменная облачность" },
+  3: { icon: "☁️", desc: "пасмурно" },
+  45: { icon: "🌫", desc: "туман" },
+  48: { icon: "🌫", desc: "изморозь" },
+  51: { icon: "🌦", desc: "морось слабая" },
+  53: { icon: "🌦", desc: "морось" },
+  55: { icon: "🌧", desc: "морось сильная" },
+  56: { icon: "🌧", desc: "ледяная морось слабая" },
+  57: { icon: "🌧", desc: "ледяная морось сильная" },
+  61: { icon: "🌦", desc: "дождь слабый" },
+  63: { icon: "🌧", desc: "дождь" },
+  65: { icon: "🌧", desc: "дождь сильный" },
+  66: { icon: "🌧", desc: "ледяной дождь слабый" },
+  67: { icon: "🌧", desc: "ледяной дождь сильный" },
+  71: { icon: "🌨", desc: "снег слабый" },
+  73: { icon: "❄️", desc: "снег" },
+  75: { icon: "❄️", desc: "снег сильный" },
+  77: { icon: "❄️", desc: "снежная крупа" },
+  80: { icon: "🌦", desc: "ливень слабый" },
+  81: { icon: "🌧", desc: "ливень" },
+  82: { icon: "⛈", desc: "ливень сильный" },
+  85: { icon: "🌨", desc: "снегопад слабый" },
+  86: { icon: "❄️", desc: "снегопад сильный" },
+  95: { icon: "⛈", desc: "гроза" },
+  96: { icon: "⛈", desc: "гроза с градом" },
+  99: { icon: "⛈", desc: "гроза с сильным градом" },
+};
+function describeWeatherCode(code) {
+  return WMO_WEATHER[code] || { icon: "🌡", desc: "погода без сюрпризов" };
+}
+
+// Разбирает намерение "погода в <город>[ на N дней|на неделю]" из текста.
+// Возвращает { city, days } (days=1 — текущая погода) или null.
+// ВАЖНО: \b в JS работает через \w, который НЕ включает кириллицу (то же
+// уже отмечено в parseRequestedUserColor выше) — поэтому тут вместо \b
+// используются обычные пробелы/якоря начала-конца строки.
+function parseWeatherIntent(text) {
+  if (!/погод[аы]/i.test(text)) return null;
+  const afterMatch = text.match(/погод[аы](.*)$/is);
+  if (!afterMatch) return null;
+  let rest = afterMatch[1].trim();
+  if (!rest) return null;
+
+  let days = 1;
+  const weekMatch = /(?:^|\s)на\s+недел[а-яё]*/i.exec(rest);
+  const daysMatch = /(?:^|\s)на\s+(\d{1,2})\s*(?:дн[а-яё]*|days?)/i.exec(rest);
+  if (daysMatch) {
+    days = Math.min(16, Math.max(1, parseInt(daysMatch[1], 10)));
+    rest = rest.slice(0, daysMatch.index).trim();
+  } else if (weekMatch) {
+    days = 7;
+    rest = rest.slice(0, weekMatch.index).trim();
+  }
+
+  const hadPreposition = /^(?:в|во|для|по)\s+/i.test(rest);
+  rest = rest.replace(/^(?:в|во|для|по)\s+/i, "").trim();
+  rest = rest.replace(/[.,!?;:]+$/g, "").trim();
+  if (!rest) return null;
+  // Без предлога ("погода Львов") принимаем, только если похоже на имя
+  // города (с большой буквы) — иначе просто разговорное упоминание погоды
+  // ("хорошая погода сегодня") улетало бы в геокодер как имя города.
+  if (!hadPreposition && !/^[А-ЯЁA-Z]/.test(rest)) return null;
+  return { city: rest, days };
+}
+
+// Геокодинг с фолбэком на грамматические падежи: Open-Meteo матчит только
+// по ПРЕФИКСУ индексированного имени (см. docs geocoding-api.open-meteo.com),
+// а "Киеве"/"Одессе" — это предложный падеж, не префикс "Киев"/"Одесса".
+// Большинство русских окончаний падежей — это 1-2 лишних символа В КОНЦЕ
+// слова, так что обрубание хвоста по одному символу обычно и даёт нужный
+// префикс ("Киеве" → "Киев" — точное совпадение, "Одессе" → "Одесс" —
+// префикс "Одессы"). Пробуем от полной строки и короче, до 3 символов.
+async function geocodeCity(rawCity) {
+  const base = rawCity.trim();
+  const candidates = [base];
+  for (let len = base.length - 1; len >= Math.min(3, base.length); len--) {
+    candidates.push(base.slice(0, len));
+  }
+
+  for (const candidate of candidates) {
+    if (candidate.length < 2) continue;
+    try {
+      const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
+        candidate
+      )}&count=1&language=ru&format=json`;
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const data = await res.json();
+      const hit = data?.results?.[0];
+      if (hit) {
+        return {
+          name: hit.name,
+          country: hit.country || "",
+          admin1: hit.admin1 || "",
+          latitude: hit.latitude,
+          longitude: hit.longitude,
+          timezone: hit.timezone || "auto",
+        };
+      }
+    } catch (err) {
+      console.error(`Геокодинг "${candidate}" не удался:`, err.message);
+    }
+  }
+  return null;
+}
+
+function locationLabel(place) {
+  const parts = [place.name];
+  if (place.admin1 && place.admin1 !== place.name) parts.push(place.admin1);
+  if (place.country) parts.push(place.country);
+  return parts.join(", ");
+}
+
+async function fetchCurrentWeatherText(place) {
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
+    `&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m` +
+    `&timezone=${encodeURIComponent(place.timezone)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`open-meteo forecast: ${res.status}`);
+  const data = await res.json();
+  const c = data.current;
+  const w = describeWeatherCode(c.weather_code);
+  return (
+    `Погода в ${locationLabel(place)} сейчас:\n` +
+    `${w.icon} ${w.desc}, ${Math.round(c.temperature_2m)}°C (ощущается как ${Math.round(c.apparent_temperature)}°C)\n` +
+    `💧 влажность ${c.relative_humidity_2m}% · 💨 ветер ${Math.round(c.wind_speed_10m)} м/с`
+  );
+}
+
+async function fetchForecastWeatherText(place, days) {
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
+    `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
+    `&forecast_days=${days}&timezone=${encodeURIComponent(place.timezone)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`open-meteo forecast: ${res.status}`);
+  const data = await res.json();
+  const d = data.daily;
+  const lines = [`Погода в ${locationLabel(place)} на ${days} ${daysWordForm(days)}:`];
+  for (let i = 0; i < d.time.length; i++) {
+    const w = describeWeatherCode(d.weather_code[i]);
+    const date = formatShortDate(d.time[i]);
+    const tMax = Math.round(d.temperature_2m_max[i]);
+    const tMin = Math.round(d.temperature_2m_min[i]);
+    const precip = d.precipitation_probability_max[i];
+    lines.push(`${date} ${w.icon} ${tMin}…${tMax}°C, осадки ${precip}%`);
+  }
+  return lines.join("\n");
+}
+
+// "1 день" / "2 дня" / "5 дней" — русское словообразование числительных.
+function daysWordForm(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return "день";
+  if ([2, 3, 4].includes(mod10) && ![12, 13, 14].includes(mod100)) return "дня";
+  return "дней";
+}
+
+function formatShortDate(isoDate) {
+  const [, month, day] = isoDate.split("-");
+  return `${day}.${month}`;
+}
+
+async function handleWeatherQuery(ctx, intent) {
+  await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+  const place = await geocodeCity(intent.city);
+  if (!place) {
+    await ctx.reply(`не нашёл такой город — "${intent.city}". Проверь название и попробуй ещё раз`);
+    return;
+  }
+  try {
+    const text =
+      intent.days > 1 ? await fetchForecastWeatherText(place, intent.days) : await fetchCurrentWeatherText(place);
+    await ctx.reply(text);
+  } catch (err) {
+    console.error("Ошибка получения погоды:", err);
+    await ctx.reply("не получилось узнать погоду, сервис погоды сейчас недоступен — попробуй позже");
+  }
+}
+
 // ==== Реакция стикером на присланную песню/аудио ====
 // Отдельно от текстовых ответов через LLM — тут модель вообще не участвует,
 // это чисто механическая реакция: пришло аудио/голосовое → шлём стикер из
@@ -2219,6 +2530,16 @@ bot.on("message:text", async (ctx) => {
     }
   }
 
+  // ==== Погода ====
+  // Проверяем ДО шахмат/шашек и обычного чата — сработавший запрос
+  // погоды отвечает сразу через API, а не через LLM (даты/проценты
+  // осадков модель может просто выдумать).
+  const weatherIntent = parseWeatherIntent(stripNameTrigger(rawText));
+  if (weatherIntent) {
+    await handleWeatherQuery(ctx, weatherIntent);
+    return;
+  }
+
   // ==== Шахматы ====
   // Дошли сюда — значит сообщение точно адресовано боту (в личке всегда,
   // в группе — прошло проверку выше). Партия привязана к паре
@@ -2252,19 +2573,32 @@ bot.on("message:text", async (ctx) => {
     // проигнорировав сам ход.
     const chess = new Chess(chessGame.fen);
     if (chess.turn() === chessGame.userColor) {
-      const move = tryApplyUserMove(chess, rawText);
-      if (move) {
+      const applied = tryApplyUserMove(chess, rawText);
+      if (applied) {
+        const { move, style } = applied;
+        // Съеденную ходом пользователя фигуру (если был размен) — в счёт.
+        // move.captured — тип чужой фигуры, которую съели (принадлежит
+        // противнику хода, т.е. боту), кладём в captured[botColor].
+        const prevCaptured = chessGame.captured || { w: [], b: [] };
+        const captured = { w: [...prevCaptured.w], b: [...prevCaptured.b] };
+        const botColor = chessGame.userColor === "w" ? "b" : "w";
+        if (move.captured) captured[botColor].push(move.captured);
+
         chessGames.set(chessMapKey(chatId, userId), {
           fen: chess.fen(),
           userColor: chessGame.userColor,
           view: chessGame.view,
           playerName: chessGame.playerName,
+          captured,
+          moveStyle: style,
         });
         saveChessGame(chatId, userId);
 
+        const userMoveText = formatChessMove(move, style);
+
         if (chess.isCheckmate()) {
           await ctx.reply(
-            `${move.san}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}\n\n${pickRandom(CHESS_CHECKMATE_LOSE_PHRASES)}`,
+            `${userMoveText}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName, captured)}\n\n${pickRandom(CHESS_CHECKMATE_LOSE_PHRASES)}`,
             { parse_mode: "Markdown" }
           );
           await clearChessGame(chatId, userId);
@@ -2272,7 +2606,7 @@ bot.on("message:text", async (ctx) => {
         }
         if (chess.isDraw() || chess.isStalemate()) {
           await ctx.reply(
-            `${move.san}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`,
+            `${userMoveText}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName, captured)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`,
             { parse_mode: "Markdown" }
           );
           await clearChessGame(chatId, userId);
@@ -2282,18 +2616,23 @@ bot.on("message:text", async (ctx) => {
         // Ходит бот
         const botMove = findBestMove(chess);
         chess.move(botMove);
+        // Съеденную ходом бота фигуру пользователя — тоже в счёт.
+        if (botMove.captured) captured[chessGame.userColor].push(botMove.captured);
         chessGames.set(chessMapKey(chatId, userId), {
           fen: chess.fen(),
           userColor: chessGame.userColor,
           view: chessGame.view,
           playerName: chessGame.playerName,
+          captured,
+          moveStyle: style,
         });
         saveChessGame(chatId, userId);
         const checkNote = chess.isCheck() ? " шах" : "";
+        const botMoveText = formatChessMove(botMove, style);
 
         if (chess.isCheckmate()) {
           await ctx.reply(
-            `Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}\n\n${pickRandom(CHESS_CHECKMATE_WIN_PHRASES)}`,
+            `Мой ход: ${botMoveText}${checkNote}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName, captured)}\n\n${pickRandom(CHESS_CHECKMATE_WIN_PHRASES)}`,
             { parse_mode: "Markdown" }
           );
           await clearChessGame(chatId, userId);
@@ -2301,7 +2640,7 @@ bot.on("message:text", async (ctx) => {
         }
         if (chess.isDraw() || chess.isStalemate()) {
           await ctx.reply(
-            `Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`,
+            `Мой ход: ${botMoveText}${checkNote}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName, captured)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`,
             { parse_mode: "Markdown" }
           );
           await clearChessGame(chatId, userId);
@@ -2309,7 +2648,7 @@ bot.on("message:text", async (ctx) => {
         }
 
         await ctx.reply(
-          `Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}`,
+          `Мой ход: ${botMoveText}${checkNote}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName, captured)}`,
           { parse_mode: "Markdown" }
         );
         return;
@@ -2339,12 +2678,14 @@ bot.on("message:text", async (ctx) => {
         chessGames.set(chessMapKey(chatId, userId), { ...chessGame, view: newView });
         saveChessGame(chatId, userId);
       }
-      await ctx.reply(formatBoard(chess, chessGame.userColor, newView, chessGame.playerName), { parse_mode: "Markdown" });
+      await ctx.reply(formatBoard(chess, chessGame.userColor, newView, chessGame.playerName, chessGame.captured), {
+        parse_mode: "Markdown",
+      });
       return;
     }
 
     if (CHESS_BOARD_REGEX.test(rawText)) {
-      await ctx.reply(formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName), {
+      await ctx.reply(formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName, chessGame.captured), {
         parse_mode: "Markdown",
       });
       return;
@@ -2361,16 +2702,21 @@ bot.on("message:text", async (ctx) => {
       if (userColor === "b") {
         const botMove = findBestMove(newChess);
         newChess.move(botMove);
+        const captured = { w: [], b: [] };
+        if (botMove.captured) captured[userColor].push(botMove.captured);
         chessGames.set(chessMapKey(chatId, userId), {
           fen: newChess.fen(),
           userColor,
           view: chessGame.view,
           playerName: chessGame.playerName,
+          captured,
+          moveStyle: "san",
         });
         saveChessGame(chatId, userId);
-        await ctx.reply(`Мой ход: ${botMove.san}\n${formatBoard(newChess, userColor, chessGame.view, chessGame.playerName)}`, {
-          parse_mode: "Markdown",
-        });
+        await ctx.reply(
+          `Мой ход: ${botMove.san}\n${formatBoard(newChess, userColor, chessGame.view, chessGame.playerName, captured)}`,
+          { parse_mode: "Markdown" }
+        );
       }
       return;
     }
@@ -2401,9 +2747,11 @@ bot.on("message:text", async (ctx) => {
       await ctx.reply(pickRandom(CHESS_START_PHRASES_BLACK));
       const botMove = findBestMove(chess);
       chess.move(botMove);
-      chessGames.set(chessMapKey(chatId, userId), { fen: chess.fen(), userColor, view, playerName });
+      const captured = { w: [], b: [] };
+      if (botMove.captured) captured[userColor].push(botMove.captured);
+      chessGames.set(chessMapKey(chatId, userId), { fen: chess.fen(), userColor, view, playerName, captured, moveStyle: "san" });
       saveChessGame(chatId, userId);
-      await ctx.reply(`Мой ход: ${botMove.san}\n${formatBoard(chess, userColor, view, playerName)}`, {
+      await ctx.reply(`Мой ход: ${botMove.san}\n${formatBoard(chess, userColor, view, playerName, captured)}`, {
         parse_mode: "Markdown",
       });
     } else {
@@ -2422,17 +2770,25 @@ bot.on("message:text", async (ctx) => {
     if (checkersGame.turn === checkersGame.userColor) {
       const move = tryApplyCheckersMove(checkersGame.board, checkersGame.userColor, rawText);
       if (move) {
+        // Съеденные ходом пользователя шашки — до применения хода, доска
+        // ещё содержит съедаемые фигуры (см. collectCheckersCaptures).
+        const prevCaptured = checkersGame.captured || { w: [], b: [] };
+        const captured = { w: [...prevCaptured.w], b: [...prevCaptured.b] };
+        for (const c of collectCheckersCaptures(checkersGame.board, move)) {
+          captured[c.color].push(c.king ? "king" : "man");
+        }
+
         let board = applyCheckersMove(checkersGame.board, move);
         const opponentColor = checkersGame.userColor === "w" ? "b" : "w";
         const moveNote = move.jumps ? move.jumps.map((j) => rcToSquare(j.toR, j.toC)).join(":") : rcToSquare(move.toR, move.toC);
 
         const userWinner = checkCheckersWinner(board, opponentColor);
-        checkersGames.set(checkersMapKey(chatId, userId), { ...checkersGame, board, turn: opponentColor });
+        checkersGames.set(checkersMapKey(chatId, userId), { ...checkersGame, board, turn: opponentColor, captured });
         saveCheckersGame(chatId, userId);
 
         if (userWinner) {
           await ctx.reply(
-            `${moveNote}\n${formatCheckersBoard(board, checkersGame.userColor, checkersGame.view, checkersGame.playerName)}\n\n${pickRandom(CHECKERS_LOSE_PHRASES)}`,
+            `${moveNote}\n${formatCheckersBoard(board, checkersGame.userColor, checkersGame.view, checkersGame.playerName, captured)}\n\n${pickRandom(CHECKERS_LOSE_PHRASES)}`,
             { parse_mode: "Markdown" }
           );
           await clearCheckersGame(chatId, userId);
@@ -2441,18 +2797,21 @@ bot.on("message:text", async (ctx) => {
 
         // Ходит бот
         const botMove = findBestCheckersMove(board, opponentColor);
+        for (const c of collectCheckersCaptures(board, botMove)) {
+          captured[c.color].push(c.king ? "king" : "man");
+        }
         board = applyCheckersMove(board, botMove);
         const botMoveNote = botMove.jumps
           ? botMove.jumps.map((j) => rcToSquare(j.toR, j.toC)).join(":")
           : rcToSquare(botMove.toR, botMove.toC);
 
         const botWinner = checkCheckersWinner(board, checkersGame.userColor);
-        checkersGames.set(checkersMapKey(chatId, userId), { ...checkersGame, board, turn: checkersGame.userColor });
+        checkersGames.set(checkersMapKey(chatId, userId), { ...checkersGame, board, turn: checkersGame.userColor, captured });
         saveCheckersGame(chatId, userId);
 
         if (botWinner) {
           await ctx.reply(
-            `Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, checkersGame.userColor, checkersGame.view, checkersGame.playerName)}\n\n${pickRandom(CHECKERS_WIN_PHRASES)}`,
+            `Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, checkersGame.userColor, checkersGame.view, checkersGame.playerName, captured)}\n\n${pickRandom(CHECKERS_WIN_PHRASES)}`,
             { parse_mode: "Markdown" }
           );
           await clearCheckersGame(chatId, userId);
@@ -2460,7 +2819,7 @@ bot.on("message:text", async (ctx) => {
         }
 
         await ctx.reply(
-          `Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, checkersGame.userColor, checkersGame.view, checkersGame.playerName)}`,
+          `Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, checkersGame.userColor, checkersGame.view, checkersGame.playerName, captured)}`,
           { parse_mode: "Markdown" }
         );
         return;
@@ -2481,15 +2840,16 @@ bot.on("message:text", async (ctx) => {
         checkersGames.set(checkersMapKey(chatId, userId), { ...checkersGame, view: newView });
         saveCheckersGame(chatId, userId);
       }
-      await ctx.reply(formatCheckersBoard(checkersGame.board, checkersGame.userColor, newView, checkersGame.playerName), {
-        parse_mode: "Markdown",
-      });
+      await ctx.reply(
+        formatCheckersBoard(checkersGame.board, checkersGame.userColor, newView, checkersGame.playerName, checkersGame.captured),
+        { parse_mode: "Markdown" }
+      );
       return;
     }
 
     if (CHESS_BOARD_REGEX.test(rawText)) {
       await ctx.reply(
-        formatCheckersBoard(checkersGame.board, checkersGame.userColor, checkersGame.view, checkersGame.playerName),
+        formatCheckersBoard(checkersGame.board, checkersGame.userColor, checkersGame.view, checkersGame.playerName, checkersGame.captured),
         { parse_mode: "Markdown" }
       );
       return;
@@ -2501,16 +2861,21 @@ bot.on("message:text", async (ctx) => {
       const colorNote = userColor === "w" ? ", ты снова белыми — ходи" : ", ты чёрными — я белыми и хожу первым";
       await ctx.reply(`окей, погнали заново${colorNote}`);
       if (userColor === "b") {
+        const captured = { w: [], b: [] };
         const botMove = findBestCheckersMove(newState.board, "w");
+        for (const c of collectCheckersCaptures(newState.board, botMove)) {
+          captured[c.color].push(c.king ? "king" : "man");
+        }
         const board = applyCheckersMove(newState.board, botMove);
         const botMoveNote = botMove.jumps
           ? botMove.jumps.map((j) => rcToSquare(j.toR, j.toC)).join(":")
           : rcToSquare(botMove.toR, botMove.toC);
-        checkersGames.set(checkersMapKey(chatId, userId), { ...newState, board, turn: "b" });
+        checkersGames.set(checkersMapKey(chatId, userId), { ...newState, board, turn: "b", captured });
         saveCheckersGame(chatId, userId);
-        await ctx.reply(`Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, userColor, checkersGame.view, checkersGame.playerName)}`, {
-          parse_mode: "Markdown",
-        });
+        await ctx.reply(
+          `Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, userColor, checkersGame.view, checkersGame.playerName, captured)}`,
+          { parse_mode: "Markdown" }
+        );
       }
       return;
     }
@@ -2533,13 +2898,17 @@ bot.on("message:text", async (ctx) => {
     if (userColor === "b") {
       await ctx.reply(pickRandom(CHECKERS_START_PHRASES_BLACK));
       const botMove = findBestCheckersMove(state.board, "w");
+      const captured = { w: [], b: [] };
+      for (const c of collectCheckersCaptures(state.board, botMove)) {
+        captured[c.color].push(c.king ? "king" : "man");
+      }
       const board = applyCheckersMove(state.board, botMove);
       const botMoveNote = botMove.jumps
         ? botMove.jumps.map((j) => rcToSquare(j.toR, j.toC)).join(":")
         : rcToSquare(botMove.toR, botMove.toC);
-      checkersGames.set(checkersMapKey(chatId, userId), { ...state, board, turn: "b" });
+      checkersGames.set(checkersMapKey(chatId, userId), { ...state, board, turn: "b", captured });
       saveCheckersGame(chatId, userId);
-      await ctx.reply(`Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, userColor, state.view, playerName)}`, {
+      await ctx.reply(`Мой ход: ${botMoveNote}\n${formatCheckersBoard(board, userColor, state.view, playerName, captured)}`, {
         parse_mode: "Markdown",
       });
     } else {
