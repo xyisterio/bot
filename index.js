@@ -585,53 +585,126 @@ function pushHistory(chatId, role, content) {
 // отсечением на несколько полуходов вперёд (материал + позиционные бонусы
 // за центр) — бот реально перебирает варианты, а не ходит наугад.
 // Партия (FEN + цвет пользователя) хранится в памяти и зеркалится в Redis
-// (ключ chess:{chatId}), как и остальная память бота — см. loadPersistedState.
+// (ключ chess:{chatId}:{userId}), как и остальная память бота — см.
+// loadPersistedState. Ключ включает userId (не только chatId!) — это
+// значит, что в одном чате (особенно группе) у РАЗНЫХ людей могут идти
+// СВОИ независимые партии с ботом одновременно, и ходить в партии может
+// только тот, кто её начал — см. chessMapKey/getChessGame ниже.
 
 const CHESS_INTENT_REGEX = /шахмат/i;
 const CHESS_RESIGN_REGEX = /сда(ю|л)/i;
 const CHESS_BOARD_REGEX = /покажи доск|^доска\??$|как там доска/i;
-const CHESS_NEW_GAME_REGEX = /нов(ую|ая) парти|давай заново|начн[её]м заново|переиграем/i;
+const CHESS_NEW_GAME_REGEX =
+  /нов(ую|ая) парти|давай заново|начн[её]м заново|переиграем|играй за (бел|черн|чёрн)|сыграй за (бел|черн|чёрн)|поменяемся (сторонами|цветами)|смени(м)? (сторону|цвет)/i;
+// Переключение вида доски: буквы <-> юникод-символы фигур.
+const CHESS_VIEW_UNICODE_REGEX = /фигурк|значк|символ|юникод/i;
+const CHESS_VIEW_ASCII_REGEX = /букв/i;
 
-const chessGames = new Map(); // chatId -> { fen, userColor: "w" | "b" }
+// chatId:userId -> { fen, userColor: "w" | "b", view: "ascii" | "unicode", playerName }
+const chessGames = new Map();
 
-function getChessGame(chatId) {
-  return chessGames.get(chatId) || null;
+function chessMapKey(chatId, userId) {
+  return `${chatId}:${userId}`;
 }
 
-async function saveChessGame(chatId) {
+function getChessGame(chatId, userId) {
+  return chessGames.get(chessMapKey(chatId, userId)) || null;
+}
+
+// Пытается понять из текста, какой стороной хочет играть пользователь —
+// используется и при старте партии ("сыграем в шахматы за чёрных"), и при
+// смене сторон в существующей ("играй за белых"). Возвращает null, если
+// цвет явно не запрошен — тогда вызывающий код берёт значение по умолчанию.
+function parseRequestedUserColor(text) {
+  if (/за\s*ч[её]рн|ч[её]рными|ч[её]рных\b/i.test(text)) return "b";
+  if (/за\s*бел|белыми|белых\b/i.test(text)) return "w";
+  return null;
+}
+
+async function saveChessGame(chatId, userId) {
   if (!redis) return;
   try {
-    await redis.set(`chess:${chatId}`, chessGames.get(chatId));
+    await redis.set(`chess:${chatId}:${userId}`, chessGames.get(chessMapKey(chatId, userId)));
   } catch (err) {
-    console.error(`Redis: не удалось сохранить шахматную партию чата ${chatId}:`, err);
+    console.error(`Redis: не удалось сохранить шахматную партию ${chatId}:${userId}:`, err);
   }
 }
 
-async function clearChessGame(chatId) {
-  chessGames.delete(chatId);
+async function clearChessGame(chatId, userId) {
+  chessGames.delete(chessMapKey(chatId, userId));
   if (!redis) return;
   try {
-    await redis.del(`chess:${chatId}`);
+    await redis.del(`chess:${chatId}:${userId}`);
   } catch (err) {
-    console.error(`Redis: не удалось удалить шахматную партию чата ${chatId}:`, err);
+    console.error(`Redis: не удалось удалить шахматную партию ${chatId}:${userId}:`, err);
   }
 }
 
-function startChessGame(chatId, userColor) {
+function startChessGame(chatId, userId, userColor, view, playerName) {
   const chess = new Chess();
-  chessGames.set(chatId, { fen: chess.fen(), userColor });
-  saveChessGame(chatId);
+  const key = chessMapKey(chatId, userId);
+  // Вид доски по умолчанию наследуем от предыдущей партии этого же
+  // пользователя в этом чате (если она была) — чтобы выбор
+  // "фигурками"/"буквами" не сбрасывался при "новая партия" или смене сторон.
+  const resolvedView = view || chessGames.get(key)?.view || "ascii";
+  chessGames.set(key, { fen: chess.fen(), userColor, view: resolvedView, playerName });
+  saveChessGame(chatId, userId);
   return chess;
 }
 
-function formatBoard(chess) {
+// Юникод-символы фигур для вида "картинками". Полые ♔♘♙... — белые,
+// залитые ♚♞♟... — чёрные (стандартное начертание).
+const UNICODE_WHITE = { p: "♙", n: "♘", b: "♗", r: "♖", q: "♕", k: "♔" };
+const UNICODE_BLACK = { p: "♟", n: "♞", b: "♝", r: "♜", q: "♛", k: "♚" };
+
+function formatBoardAscii(chess) {
   // chess.ascii() сам рисует доску буквами (заглавные — белые, строчные —
   // чёрные, точки — пустые клетки) с подписанными горизонталями/вертикалями.
-  // Юникод-символы фигур (♔♛ и т.п.) тут принципиально не используем: в
-  // разных шрифтах/темах "полые" (белые) и "залитые" (чёрные) варианты
-  // легко визуально путаются — особенно мелким текстом на телефоне, а
-  // буквы читаются однозначно независимо от шрифта.
-  return "```\n" + chess.ascii() + "\n(заглавные — твои белые, строчные — мои чёрные)\n```";
+  return chess.ascii();
+}
+
+function formatBoardUnicode(chess) {
+  // Ручная отрисовка тем же макетом, что и chess.ascii(), но клетками с
+  // юникод-символами фигур вместо латинских букв — вид "как на скриншоте".
+  const rows = chess.board(); // 8 строк, rows[0] — 8-я горизонталь, rows[7] — 1-я
+  const lines = ["  +------------------------+"];
+  for (let i = 0; i < 8; i++) {
+    const rank = 8 - i;
+    const cells = rows[i].map((cell) => {
+      if (!cell) return "·";
+      return (cell.color === "w" ? UNICODE_WHITE : UNICODE_BLACK)[cell.type];
+    });
+    lines.push(`${rank} | ${cells.join("  ")} |`);
+  }
+  lines.push("  +------------------------+");
+  lines.push("    a  b  c  d  e  f  g  h");
+  return lines.join("\n");
+}
+
+// userColor — какой стороной играет пользователь в ЭТОЙ партии (после
+// смены сторон бот тоже может быть белыми и ходить первым, см. ниже),
+// view — "ascii" (буквы, по умолчанию) или "unicode" (символы фигур),
+// переключается за партию через CHESS_VIEW_*_REGEX ниже. playerName —
+// с кем идёт партия, показывается заголовком над доской (актуально в
+// группах, где партий с ботом может быть несколько одновременно).
+function formatBoard(chess, userColor, view, playerName) {
+  const board = view === "unicode" ? formatBoardUnicode(chess) : formatBoardAscii(chess);
+
+  let caption;
+  if (view === "unicode") {
+    caption =
+      userColor === "w"
+        ? "(♔♕♖♗♘♙ — твои белые, ♚♛♜♝♞♟ — мои чёрные)"
+        : "(♚♛♜♝♞♟ — твои чёрные, ♔♕♖♗♘♙ — мои белые)";
+  } else {
+    caption =
+      userColor === "w"
+        ? "(заглавные — твои белые, строчные — мои чёрные)"
+        : "(строчные — твои чёрные, заглавные — мои белые)";
+  }
+
+  const header = playerName ? `Партия с ${playerName}:\n` : "";
+  return header + "```\n" + board + "\n" + caption + "\n```";
 }
 
 // На русской раскладке "е2е4" легко напечатать кириллическими е/а, которые
@@ -800,10 +873,15 @@ function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-const CHESS_START_PHRASES = [
+const CHESS_START_PHRASES_WHITE = [
   "го, давай сыграем. Ты за белых, ходи первым — пиши как e2e4 или обычной нотацией типа Nf3.",
   "чё бы и не сыграть. Бери белых, начинай — формат хода e2e4 или Nf3, как удобнее.",
   "ладно, давай. Ты белыми, я чёрными — жду твой ход (e2e4 или Nf3, без разницы).",
+];
+const CHESS_START_PHRASES_BLACK = [
+  "го, давай сыграем. Ты за чёрных, значит я белыми и хожу первым.",
+  "чё бы и не сыграть. Бери чёрных — я тогда за белых, начинаю.",
+  "ладно, давай. Ты чёрными, я белыми — открываю партию.",
 ];
 const CHESS_CHECKMATE_WIN_PHRASES = ["мат, я выиграл. Ну ты держался норм", "всё, мат. Реванш будешь брать?"];
 const CHESS_CHECKMATE_LOSE_PHRASES = ["ну и мат мне... красиво сыграл", "мат мне, засчитано — забирай победу"];
@@ -1153,10 +1231,12 @@ async function loadPersistedState() {
 
     await Promise.all(
       chessKeys.map(async (key) => {
-        const chatId = Number(key.slice("chess:".length));
+        // Ключ вида chess:{chatId}:{userId} — карту храним под тем же
+        // составным ключом, что и chessMapKey() в рантайме.
+        const mapKey = key.slice("chess:".length);
         const data = await redis.get(key);
         if (data && typeof data === "object" && typeof data.fen === "string") {
-          chessGames.set(chatId, data);
+          chessGames.set(mapKey, data);
         }
       })
     );
@@ -1612,15 +1692,21 @@ bot.on("message:text", async (ctx) => {
 
   // ==== Шахматы ====
   // Дошли сюда — значит сообщение точно адресовано боту (в личке всегда,
-  // в группе — прошло проверку выше). Если для чата уже идёт партия,
-  // пробуем понять сообщение как ход/команду партии; если это ни на что
-  // из этого не похоже — просто продолжаем как обычное сообщение в чат
-  // ниже (можно болтать параллельно с игрой).
-  const chessGame = getChessGame(chatId);
+  // в группе — прошло проверку выше). Партия привязана к паре
+  // chatId+userId (см. chessMapKey), поэтому в одном чате (особенно
+  // группе) у разных людей могут одновременно идти свои отдельные партии,
+  // и ходить в партии может только тот, кто её начал — сообщения других
+  // людей просто не видят чужую chessGame и уходят в обычный чат/заводят
+  // свою партию. Если для этого пользователя уже идёт партия, пробуем
+  // понять сообщение как ход/команду партии; если это ни на что из этого
+  // не похоже — просто продолжаем как обычное сообщение в чат ниже (можно
+  // болтать параллельно с игрой).
+  const userId = ctx.from.id;
+  const chessGame = getChessGame(chatId, userId);
 
   if (chessGame) {
     if (CHESS_RESIGN_REGEX.test(rawText)) {
-      await clearChessGame(chatId);
+      await clearChessGame(chatId, userId);
       await ctx.reply(pickRandom(CHESS_RESIGN_PHRASES));
       return;
     }
@@ -1633,48 +1719,64 @@ bot.on("message:text", async (ctx) => {
     if (chess.turn() === chessGame.userColor) {
       const move = tryApplyUserMove(chess, rawText);
       if (move) {
-        chessGames.set(chatId, { fen: chess.fen(), userColor: chessGame.userColor });
-        saveChessGame(chatId);
+        chessGames.set(chessMapKey(chatId, userId), {
+          fen: chess.fen(),
+          userColor: chessGame.userColor,
+          view: chessGame.view,
+          playerName: chessGame.playerName,
+        });
+        saveChessGame(chatId, userId);
 
         if (chess.isCheckmate()) {
-          await ctx.reply(`${move.san}\n${formatBoard(chess)}\n\n${pickRandom(CHESS_CHECKMATE_LOSE_PHRASES)}`, {
-            parse_mode: "Markdown",
-          });
-          await clearChessGame(chatId);
+          await ctx.reply(
+            `${move.san}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}\n\n${pickRandom(CHESS_CHECKMATE_LOSE_PHRASES)}`,
+            { parse_mode: "Markdown" }
+          );
+          await clearChessGame(chatId, userId);
           return;
         }
         if (chess.isDraw() || chess.isStalemate()) {
-          await ctx.reply(`${move.san}\n${formatBoard(chess)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`, {
-            parse_mode: "Markdown",
-          });
-          await clearChessGame(chatId);
+          await ctx.reply(
+            `${move.san}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`,
+            { parse_mode: "Markdown" }
+          );
+          await clearChessGame(chatId, userId);
           return;
         }
 
         // Ходит бот
         const botMove = findBestMove(chess);
         chess.move(botMove);
-        chessGames.set(chatId, { fen: chess.fen(), userColor: chessGame.userColor });
-        saveChessGame(chatId);
+        chessGames.set(chessMapKey(chatId, userId), {
+          fen: chess.fen(),
+          userColor: chessGame.userColor,
+          view: chessGame.view,
+          playerName: chessGame.playerName,
+        });
+        saveChessGame(chatId, userId);
         const checkNote = chess.isCheck() ? " шах" : "";
 
         if (chess.isCheckmate()) {
           await ctx.reply(
-            `Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess)}\n\n${pickRandom(CHESS_CHECKMATE_WIN_PHRASES)}`,
+            `Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}\n\n${pickRandom(CHESS_CHECKMATE_WIN_PHRASES)}`,
             { parse_mode: "Markdown" }
           );
-          await clearChessGame(chatId);
+          await clearChessGame(chatId, userId);
           return;
         }
         if (chess.isDraw() || chess.isStalemate()) {
-          await ctx.reply(`Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`, {
-            parse_mode: "Markdown",
-          });
-          await clearChessGame(chatId);
+          await ctx.reply(
+            `Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}\n\n${pickRandom(CHESS_DRAW_PHRASES)}`,
+            { parse_mode: "Markdown" }
+          );
+          await clearChessGame(chatId, userId);
           return;
         }
 
-        await ctx.reply(`Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess)}`, { parse_mode: "Markdown" });
+        await ctx.reply(
+          `Мой ход: ${botMove.san}${checkNote}\n${formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName)}`,
+          { parse_mode: "Markdown" }
+        );
         return;
       }
       // Ход не распознан. Если сообщение по форме — попытка хода
@@ -1687,34 +1789,73 @@ bot.on("message:text", async (ctx) => {
         );
         return;
       }
-      // Иначе — проверяем, не команда ли это ("покажи доску", "новая партия").
+      // Иначе — проверяем, не команда ли это ("покажи доску", "новая партия", смена вида/сторон).
+    }
+
+    // Смена вида отображения доски — не трогает саму партию, только то,
+    // как её рисуем дальше.
+    if (CHESS_VIEW_UNICODE_REGEX.test(rawText) || CHESS_VIEW_ASCII_REGEX.test(rawText)) {
+      const newView = CHESS_VIEW_UNICODE_REGEX.test(rawText) ? "unicode" : "ascii";
+      if (newView !== chessGame.view) {
+        chessGames.set(chessMapKey(chatId, userId), { ...chessGame, view: newView });
+        saveChessGame(chatId, userId);
+      }
+      await ctx.reply(formatBoard(chess, chessGame.userColor, newView, chessGame.playerName), { parse_mode: "Markdown" });
+      return;
     }
 
     if (CHESS_BOARD_REGEX.test(rawText)) {
-      await ctx.reply(formatBoard(chess), { parse_mode: "Markdown" });
+      await ctx.reply(formatBoard(chess, chessGame.userColor, chessGame.view, chessGame.playerName), {
+        parse_mode: "Markdown",
+      });
       return;
     }
 
     if (CHESS_NEW_GAME_REGEX.test(rawText)) {
-      const userColor = chessGame.userColor;
-      const newChess = startChessGame(chatId, userColor);
-      const colorNote = userColor === "w" ? ", ты снова белыми — ходи" : ", ты снова чёрными — жду мой ход первым";
+      // Если явно попросили сторону ("играй за белых") — берём её, иначе
+      // просто переигрываем теми же цветами, что и раньше.
+      const userColor = parseRequestedUserColor(rawText) || chessGame.userColor;
+      const newChess = startChessGame(chatId, userId, userColor, chessGame.view, chessGame.playerName);
+      const colorNote = userColor === "w" ? ", ты снова белыми — ходи" : ", ты чёрными — я белыми и хожу первым";
       await ctx.reply(`окей, погнали заново${colorNote}`);
       if (userColor === "b") {
         const botMove = findBestMove(newChess);
         newChess.move(botMove);
-        chessGames.set(chatId, { fen: newChess.fen(), userColor });
-        saveChessGame(chatId);
-        await ctx.reply(`Мой ход: ${botMove.san}\n${formatBoard(newChess)}`, { parse_mode: "Markdown" });
+        chessGames.set(chessMapKey(chatId, userId), {
+          fen: newChess.fen(),
+          userColor,
+          view: chessGame.view,
+          playerName: chessGame.playerName,
+        });
+        saveChessGame(chatId, userId);
+        await ctx.reply(`Мой ход: ${botMove.san}\n${formatBoard(newChess, userColor, chessGame.view, chessGame.playerName)}`, {
+          parse_mode: "Markdown",
+        });
       }
       return;
     }
   } else if (CHESS_INTENT_REGEX.test(rawText)) {
-    // Партии нет, но упомянули шахматы — считаем приглашением и стартуем.
-    // Пользователь всегда играет белыми и ходит первым — так меньше
-    // путаницы, чем спрашивать/угадывать цвет.
-    startChessGame(chatId, "w");
-    await ctx.reply(pickRandom(CHESS_START_PHRASES));
+    // Партии для этого пользователя нет, но упомянули шахматы — считаем
+    // приглашением и стартуем именно ЕГО партию (chatId+userId), не трогая
+    // партии других людей в этом же чате. По умолчанию пользователь играет
+    // белыми и ходит первым, но можно сразу попросить чёрных ("сыграем в
+    // шахматы за чёрных") — тогда бот берёт белые и ходит первым.
+    const userColor = parseRequestedUserColor(rawText) || "w";
+    const playerName = getDisplayName(chatId, ctx.from);
+    const chess = startChessGame(chatId, userId, userColor, undefined, playerName);
+    const view = chessGames.get(chessMapKey(chatId, userId)).view;
+    if (userColor === "b") {
+      await ctx.reply(pickRandom(CHESS_START_PHRASES_BLACK));
+      const botMove = findBestMove(chess);
+      chess.move(botMove);
+      chessGames.set(chessMapKey(chatId, userId), { fen: chess.fen(), userColor, view, playerName });
+      saveChessGame(chatId, userId);
+      await ctx.reply(`Мой ход: ${botMove.san}\n${formatBoard(chess, userColor, view, playerName)}`, {
+        parse_mode: "Markdown",
+      });
+    } else {
+      await ctx.reply(pickRandom(CHESS_START_PHRASES_WHITE));
+    }
     return;
   }
 
