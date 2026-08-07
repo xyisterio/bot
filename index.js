@@ -1,4 +1,4 @@
-import { Bot } from "grammy";
+import { Bot, InlineKeyboard } from "grammy";
 import express from "express";
 import { Redis } from "@upstash/redis";
 import { Chess } from "chess.js";
@@ -1524,6 +1524,250 @@ const CHECKERS_WIN_PHRASES = ["всё, тебе больше нечем ходи
 const CHECKERS_LOSE_PHRASES = ["хм, мне ходить нечем — забирай победу", "сдаюсь по правилам, ты выиграл эту партию"];
 const CHECKERS_RESIGN_PHRASES = ["принято, партия в шашки окончена", "ладно, сдался — так сдался"];
 
+// ==== Крокодил (объясни слово жестами/словами, чат угадывает) ====
+// Состояние — на весь ЧАТ (не на пару с юзером, как шахматы/шашки): один
+// раунд одновременно, ведущего видит только сам ведущий (слово шлётся
+// через answerCallbackQuery({show_alert:true}) — Telegram показывает такой
+// алерт ТОЛЬКО тому, кто нажал кнопку, даже в группе, независимо от того,
+// что происходит в самом чате). Раунд стартует, когда кто-то жмёт кнопку
+// "хочу быть ведущим"; после неё выбирает сложность слова, дальше уже сам
+// придумывает, как объяснять — бот в объяснение не вмешивается, только
+// сверяет обычные текстовые сообщения остальных со словом.
+const KROKODIL_INTENT_REGEX = /крокодил/i;
+
+// Словарь слов НЕ захардкожен в коде — при старте бот качает два открытых
+// набора данных и сам строит из них список слов с уровнями сложности:
+//   1) hermitdave/FrequencyWords (MIT) — 50 тыс. русских слов, отсортированных
+//      по частоте встречаемости (корпус субтитров);
+//   2) LussRus/Rus_words (существительные) — большой список форм русских
+//      существительных, используем как фильтр "это вообще существительное",
+//      чтобы не выхватывать из частотного списка глаголы/местоимения/наречия
+//      (без него в топе частот сплошные "просто"/"знаю"/"почему" и т.п.).
+// Пересечение двух списков даёт частотно-ранжированные существительные:
+// чем чаще слово встречается в живой речи — тем оно "легче" для угадывания.
+// Результат — тысячи слов вместо небольшого статичного списка, слова не
+// повторяются, пока не пройден весь пул нужной сложности (см. pickKrokodilWord).
+const KROKODIL_FREQ_URL =
+  "https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/ru/ru_50k.txt";
+const KROKODIL_NOUNS_URL =
+  "https://raw.githubusercontent.com/LussRus/Rus_words/master/UTF8/json/nouns/summary.json";
+const KROKODIL_DICT_TIMEOUT_MS = 20000;
+
+// Служебные/местоименные/междометные слова — в частотном списке субтитров
+// их и так почти не остаётся после фильтра по существительным (см. выше),
+// но некоторые "существительные"-омонимы всё же проскакивают (например
+// "врач" — существительное, а "просто"/"ладно" по ошибке попадают в базу
+// существительных как отдельные словоформы) — отсекаем явно.
+const KROKODIL_STOPWORDS = new Set(
+  `я не что в и ты это на с он мы как вы да мне у нет меня так но
+   все она же его к бы по только ее было вот от еще о из ему теперь
+   когда даже ну вдруг ли если уже или ни быть был него до вас
+   нибудь опять уж вам ведь там потом себя ничего ей может они тут
+   где есть надо ней для тебя их чем была сам чтоб без будто чего
+   раз тоже себе под будет тогда кто этот того потому этого какой
+   совсем ним здесь этом один почти мой тем чтобы нее сейчас были
+   куда зачем всех никогда можно при наконец два об другой хоть
+   после над больше тот через эти нас про всего них какая много
+   разве три эту моя впрочем хорошо свою этой перед иногда лучше
+   чуть том нельзя такой им более всегда конечно всю между
+   сэр мистер боже ладно тебе просто знаю всё почему очень могу
+   спасибо нам нужно хочу знаешь думаю время должна должен нужна
+   нужен пожалуйста хочешь сделать увидимся такое немного слишком
+   возможно должны точно наверное правда хотя вообще именно
+   короче блин типа сюда туда отсюда оттуда ага угу эй ого
+   ой ах эх ух фу ба тсс алло привет пока пожалуй якобы вроде
+   кажется значит итак словом однако причем притом также затем
+   поэтому оттого отчего почём кой сколь коли ежели абы
+   дабы либо иль аж авось буде вон вот те эва эвон энто`
+    .trim()
+    .split(/\s+/)
+);
+
+// Крошечный запасной словарь — только на случай, если при старте бота
+// GitHub недоступен (сеть легла и т.п.) и скачать основной словарь не
+// вышло. В обычной работе не используется — см. loadKrokodilDictionary.
+const KROKODIL_FALLBACK_WORDS = {
+  easy: ["кот", "стол", "окно", "мяч", "книга", "чашка", "машина", "дом", "часы", "телефон", "яблоко", "рыба", "птица", "ключ", "снег"],
+  medium: ["врач", "светофор", "холодильник", "вулкан", "аквариум", "парашют", "компас", "глобус", "будильник", "барабан", "скрипка", "антенна", "лабиринт", "гейзер", "карнавал"],
+  hard: ["ностальгия", "справедливость", "парадокс", "интуиция", "ирония", "гравитация", "метафора", "харизма", "эмпатия", "меланхолия", "феномен", "инерция", "суверенитет", "аномалия", "иерархия"],
+};
+
+// Текущий словарь — на старте это KROKODIL_FALLBACK_WORDS, после успешной
+// загрузки (см. loadKrokodilDictionary, вызывается в startBot) заменяется
+// на полноценный, скачанный из сети.
+let krokodilDictionary = KROKODIL_FALLBACK_WORDS;
+
+async function fetchTextWithTimeout(url) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), KROKODIL_DICT_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+    return await res.text();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// Качает оба источника, пересекает их и раскладывает по трём уровням
+// сложности по позиции в частотном списке (чем ближе к началу — тем
+// более обиходное слово). Вызывается один раз при старте бота; если
+// что-то пошло не так — тихо остаётся на KROKODIL_FALLBACK_WORDS.
+async function loadKrokodilDictionary() {
+  try {
+    const [freqText, nounsText] = await Promise.all([
+      fetchTextWithTimeout(KROKODIL_FREQ_URL),
+      fetchTextWithTimeout(KROKODIL_NOUNS_URL),
+    ]);
+
+    const nounsRaw = JSON.parse(nounsText);
+    const nounSet = new Set();
+    for (const w of nounsRaw) {
+      // Только строчные — так отсеиваются имена собственные (Аббасиды и т.п.)
+      if (typeof w === "string" && /^[а-яё]+$/.test(w)) nounSet.add(w);
+    }
+
+    const seen = new Set();
+    const filtered = [];
+    for (const line of freqText.split("\n")) {
+      const word = line.trim().split(/\s+/)[0];
+      if (!word) continue;
+      if (!/^[а-яё]+$/.test(word)) continue;
+      if (word.length < 4 || word.length > 15) continue;
+      if (KROKODIL_STOPWORDS.has(word)) continue;
+      if (!nounSet.has(word)) continue;
+      if (/(.)\1{3,}/.test(word)) continue; // явные опечатки типа "ааааа"
+      if (seen.has(word)) continue;
+      seen.add(word);
+      filtered.push(word);
+    }
+
+    if (filtered.length < 500) {
+      throw new Error(`подозрительно мало слов после фильтрации: ${filtered.length}`);
+    }
+
+    krokodilDictionary = {
+      easy: filtered.slice(0, 500),
+      medium: filtered.slice(500, 2500),
+      hard: filtered.slice(2500),
+    };
+
+    console.log(
+      `Крокодил: словарь загружен — лёгких ${krokodilDictionary.easy.length}, ` +
+        `средних ${krokodilDictionary.medium.length}, сложных ${krokodilDictionary.hard.length}`
+    );
+  } catch (err) {
+    console.error("Крокодил: не удалось загрузить словарь из сети, остаюсь на встроенном запасном:", err.message);
+  }
+}
+
+const KROKODIL_DIFFICULTY_LABEL = { easy: "лёгкие", medium: "средние", hard: "сложные" };
+
+// chatId -> состояние раунда. status: "idle" (никто не ведёт) |
+// "choosing" (кто-то нажал "хочу быть ведущим", выбирает сложность) |
+// "active" (слово загадано, идёт раунд).
+const krokodilGames = new Map();
+// chatId -> Map<userId, {name, score}> — счёт копится между раундами и не
+// сбрасывается при завершении конкретного раунда/игры.
+const krokodilScores = new Map();
+
+function getKrokodilGame(chatId) {
+  return krokodilGames.get(chatId) || null;
+}
+
+function getKrokodilScoreMap(chatId) {
+  if (!krokodilScores.has(chatId)) krokodilScores.set(chatId, new Map());
+  return krokodilScores.get(chatId);
+}
+
+async function saveKrokodilGame(chatId) {
+  if (!redis) return;
+  try {
+    const game = krokodilGames.get(chatId);
+    if (game) await redis.set(`krokodil:${chatId}`, game);
+    else await redis.del(`krokodil:${chatId}`);
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить раунд крокодила ${chatId}:`, err);
+  }
+}
+
+async function saveKrokodilScores(chatId) {
+  if (!redis) return;
+  try {
+    await redis.set(`krokodil_scores:${chatId}`, Object.fromEntries(getKrokodilScoreMap(chatId)));
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить счёт крокодила ${chatId}:`, err);
+  }
+}
+
+// Нормализация слова/токена для сравнения: нижний регистр, ё->е (частая
+// вольность написания), без пунктуации. Совпадение — только точное
+// (после нормализации): "работа" ≠ "работник" ≠ "робота".
+function normalizeKrokodilToken(s) {
+  return (s || "").toLowerCase().replace(/ё/g, "е");
+}
+
+function krokodilTokenMatches(token, secret) {
+  const a = normalizeKrokodilToken(token);
+  const b = normalizeKrokodilToken(secret);
+  if (!a || !b) return false;
+  return a === b;
+}
+
+// Выбирает случайное неиспользованное слово нужной сложности для этого
+// чата; когда слова кончаются — список "использованных" очищается и
+// начинается по новой (слова могут повторяться, но не раньше, чем весь
+// список для этой сложности будет пройден).
+function pickKrokodilWord(chatId, difficulty) {
+  const pool = krokodilDictionary[difficulty] || krokodilDictionary.medium;
+  const game = getKrokodilGame(chatId);
+  let used = (game && Array.isArray(game.usedWords) ? game.usedWords : []).filter((w) => pool.includes(w));
+
+  let available = pool.filter((w) => !used.includes(w));
+  if (available.length === 0) {
+    used = [];
+    available = pool;
+  }
+
+  const word = available[Math.floor(Math.random() * available.length)];
+  return { word, usedWords: [...used, word] };
+}
+
+function krokodilIdleKeyboard() {
+  return new InlineKeyboard().text("🐊 Хочу быть ведущим", "krokodil:host");
+}
+
+function krokodilDifficultyKeyboard() {
+  return new InlineKeyboard()
+    .text("🟢 Легко", "krokodil:diff:easy")
+    .text("🟡 Средне", "krokodil:diff:medium")
+    .text("🔴 Сложно", "krokodil:diff:hard");
+}
+
+function krokodilActiveKeyboard() {
+  return new InlineKeyboard()
+    .text("🔁 Показать слово", "krokodil:show")
+    .text("🔄 Другое слово", "krokodil:reroll")
+    .row()
+    .text("🏳 Сдаюсь", "krokodil:giveup");
+}
+
+function krokodilPlayerLabel(user) {
+  return user.username ? `@${user.username}` : user.first_name || "игрок";
+}
+
+// Топ игроков чата по очкам — используется и в отдельной команде, и в
+// сообщении, которым бот объявляет старт нового ожидания ведущего.
+function formatKrokodilLeaderboard(chatId) {
+  const map = getKrokodilScoreMap(chatId);
+  if (map.size === 0) return "пока никто не отгадал ни одного слова — очков нет";
+  const rows = [...map.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10)
+    .map((e, i) => `${i + 1}. ${e.name} — ${e.score}`);
+  return "🏆 Таблица лидеров крокодила:\n" + rows.join("\n");
+}
+
 // ==== Фолбэк между провайдерами/моделями ====
 // Индекс цели (провайдер+модель), на которой бот последний раз успешно
 // ответил — начинаем с неё же, чтобы не долбить мёртвую цель на каждый запрос.
@@ -1814,13 +2058,26 @@ async function loadPersistedState() {
   if (!redis) return;
 
   try {
-    const [historyKeys, aliasKeys, usernameKeys, genderKeys, chessKeys, checkersKeys, savedIdx, savedPinnedIdx] = await Promise.all([
+    const [
+      historyKeys,
+      aliasKeys,
+      usernameKeys,
+      genderKeys,
+      chessKeys,
+      checkersKeys,
+      krokodilKeys,
+      krokodilScoreKeys,
+      savedIdx,
+      savedPinnedIdx,
+    ] = await Promise.all([
       redis.keys("history:*"),
       redis.keys("aliases:*"),
       redis.keys("usernames:*"),
       redis.keys("genders:*"),
       redis.keys("chess:*"),
       redis.keys("checkers:*"),
+      redis.keys("krokodil:*"),
+      redis.keys("krokodil_scores:*"),
       redis.get("activeTargetIndex"),
       redis.get("pinnedTargetIndex"),
     ]);
@@ -1890,6 +2147,27 @@ async function loadPersistedState() {
       })
     );
 
+    await Promise.all(
+      krokodilKeys.map(async (key) => {
+        const chatId = Number(key.slice("krokodil:".length));
+        const data = await redis.get(key);
+        if (data && typeof data === "object" && typeof data.status === "string") {
+          krokodilGames.set(chatId, data);
+        }
+      })
+    );
+
+    await Promise.all(
+      krokodilScoreKeys.map(async (key) => {
+        const chatId = Number(key.slice("krokodil_scores:".length));
+        const data = await redis.get(key);
+        if (data && typeof data === "object") {
+          const map = getKrokodilScoreMap(chatId);
+          for (const [userId, value] of Object.entries(data)) map.set(Number(userId), value);
+        }
+      })
+    );
+
     if (typeof savedIdx === "number" && Number.isInteger(savedIdx) && savedIdx >= 0 && savedIdx < TARGETS.length) {
       activeTargetIndex = savedIdx;
     }
@@ -1906,7 +2184,8 @@ async function loadPersistedState() {
     console.log(
       `Восстановлено из Redis: истории — ${historyKeys.length}, алиасы — ${aliasKeys.length}, ` +
         `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}, шахматные партии — ${chessKeys.length}, ` +
-        `шашечные партии — ${checkersKeys.length}` +
+        `шашечные партии — ${checkersKeys.length}, раунды крокодила — ${krokodilKeys.length}, ` +
+        `счёт крокодила — ${krokodilScoreKeys.length} чатов` +
         (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "") +
         (pinnedTargetIndex !== null ? `, закреплена вручную — индекс ${pinnedTargetIndex}` : "")
     );
@@ -2207,6 +2486,182 @@ bot.command("gender", async (ctx) => {
   await ctx.reply(`ок, записал: ${targetLabel} — ${gender === "m" ? "мужской" : "женский"}`);
 });
 
+// ==== Команда и кнопки для крокодила ====
+// /krokodil работает как обычная команда — независимо от того, что в
+// группе бот обычно отвечает только "по имени"/реплаем/упоминанием (это
+// правило касается message:text, а не bot.command). Показывает либо
+// приглашение стать ведущим (если раунда сейчас нет), либо статус
+// текущего раунда — и в обоих случаях таблицу лидеров чата.
+async function sendKrokodilIdleMessage(ctx, chatId) {
+  const text = `🐊 Крокодил свободен — жми кнопку, чтобы стать ведущим и получить слово.\n\n${formatKrokodilLeaderboard(chatId)}`;
+  await ctx.reply(text, { reply_markup: krokodilIdleKeyboard() });
+}
+
+bot.command("krokodil", async (ctx) => {
+  const chatId = ctx.chat.id;
+  const game = getKrokodilGame(chatId);
+
+  if (!game || game.status === "idle") {
+    await sendKrokodilIdleMessage(ctx, chatId);
+    return;
+  }
+
+  if (game.status === "choosing") {
+    await ctx.reply(`${game.candidateName} сейчас выбирает сложность слова — подожди секунду`);
+    return;
+  }
+
+  // status === "active"
+  await ctx.reply(
+    `идёт раунд — ведёт ${game.hostName}, остальные угадывают словом в чат.\n\n${formatKrokodilLeaderboard(chatId)}`
+  );
+});
+
+// Естественный триггер вроде "Женя, крокодил" — та же логика, что у
+// шахмат/шашек (см. KROKODIL_INTENT_REGEX ниже, используется в основном
+// обработчике текстовых сообщений).
+
+bot.on("callback_query:data", async (ctx) => {
+  const data = ctx.callbackQuery.data;
+  if (!data.startsWith("krokodil:")) return;
+
+  const chatId = ctx.chat.id;
+  const action = data.slice("krokodil:".length);
+  const game = getKrokodilGame(chatId);
+  const clicker = ctx.callbackQuery.from;
+
+  // --- Кто-то хочет стать ведущим ---
+  if (action === "host") {
+    if (game && game.status === "active") {
+      await ctx.answerCallbackQuery({ text: "раунд уже идёт — дождись, пока кто-то отгадает", show_alert: true });
+      return;
+    }
+    if (game && game.status === "choosing" && game.candidateId !== clicker.id) {
+      await ctx.answerCallbackQuery({ text: `${game.candidateName} уже выбирает слово — подожди`, show_alert: true });
+      return;
+    }
+
+    krokodilGames.set(chatId, {
+      status: "choosing",
+      candidateId: clicker.id,
+      candidateName: krokodilPlayerLabel(clicker),
+      usedWords: game?.usedWords || [],
+    });
+    saveKrokodilGame(chatId);
+
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.editMessageText(`${krokodilPlayerLabel(clicker)} выбирает сложность слова...`, {
+        reply_markup: krokodilDifficultyKeyboard(),
+      });
+    } catch (err) {
+      console.error("Не удалось обновить сообщение крокодила (выбор сложности):", err.message);
+    }
+    return;
+  }
+
+  // --- Выбор сложности (только тот, кто нажал "хочу быть ведущим") ---
+  if (action.startsWith("diff:")) {
+    if (!game || game.status !== "choosing" || game.candidateId !== clicker.id) {
+      await ctx.answerCallbackQuery({ text: "эта кнопка не для тебя", show_alert: true });
+      return;
+    }
+
+    const difficulty = action.slice("diff:".length);
+    const { word, usedWords } = pickKrokodilWord(chatId, difficulty);
+
+    krokodilGames.set(chatId, {
+      status: "active",
+      hostId: clicker.id,
+      hostName: krokodilPlayerLabel(clicker),
+      word,
+      difficulty,
+      usedWords,
+    });
+    saveKrokodilGame(chatId);
+
+    // show_alert: true — Telegram показывает этот текст ТОЛЬКО тому, кто
+    // нажал кнопку (даже в группе), поэтому слово не палится остальным.
+    await ctx.answerCallbackQuery({
+      text: `Твоё слово (${KROKODIL_DIFFICULTY_LABEL[difficulty]}): ${word}\n\nОбъясняй жестами/синонимами, само слово и однокоренные говорить нельзя!`,
+      show_alert: true,
+    });
+
+    try {
+      await ctx.editMessageText(
+        `🐊 Раунд начался! Ведёт ${krokodilPlayerLabel(clicker)} (сложность: ${KROKODIL_DIFFICULTY_LABEL[difficulty]}).\nОстальные — пишите отгадки прямо в чат.`,
+        { reply_markup: krokodilActiveKeyboard() }
+      );
+    } catch (err) {
+      console.error("Не удалось обновить сообщение крокодила (старт раунда):", err.message);
+    }
+    return;
+  }
+
+  // --- Ведущий просит показать слово ещё раз ---
+  if (action === "show") {
+    if (!game || game.status !== "active") {
+      await ctx.answerCallbackQuery({ text: "раунд уже не активен", show_alert: true });
+      return;
+    }
+    if (game.hostId !== clicker.id) {
+      await ctx.answerCallbackQuery({ text: "эта кнопка только для ведущего", show_alert: true });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: `твоё слово: ${game.word}`, show_alert: true });
+    return;
+  }
+
+  // --- Ведущий просит другое слово той же сложности ---
+  if (action === "reroll") {
+    if (!game || game.status !== "active") {
+      await ctx.answerCallbackQuery({ text: "раунд уже не активен", show_alert: true });
+      return;
+    }
+    if (game.hostId !== clicker.id) {
+      await ctx.answerCallbackQuery({ text: "эта кнопка только для ведущего", show_alert: true });
+      return;
+    }
+    const { word, usedWords } = pickKrokodilWord(chatId, game.difficulty);
+    krokodilGames.set(chatId, { ...game, word, usedWords });
+    saveKrokodilGame(chatId);
+    await ctx.answerCallbackQuery({
+      text: `новое слово (${KROKODIL_DIFFICULTY_LABEL[game.difficulty]}): ${word}`,
+      show_alert: true,
+    });
+    return;
+  }
+
+  // --- Ведущий сдаётся — раунд заканчивается без победителя ---
+  if (action === "giveup") {
+    if (!game || game.status !== "active") {
+      await ctx.answerCallbackQuery({ text: "раунд уже не активен", show_alert: true });
+      return;
+    }
+    if (game.hostId !== clicker.id) {
+      await ctx.answerCallbackQuery({ text: "эта кнопка только для ведущего", show_alert: true });
+      return;
+    }
+
+    const revealedWord = game.word;
+    krokodilGames.set(chatId, { status: "idle", usedWords: game.usedWords });
+    saveKrokodilGame(chatId);
+
+    await ctx.answerCallbackQuery({ text: "ладно, раунд окончен" });
+    try {
+      await ctx.editMessageText(
+        `🏳 ${game.hostName} сдался, слово было: «${revealedWord}».\n\n${formatKrokodilLeaderboard(chatId)}`,
+        { reply_markup: krokodilIdleKeyboard() }
+      );
+    } catch (err) {
+      console.error("Не удалось обновить сообщение крокодила (сдался):", err.message);
+    }
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+});
+
 // ==== Погода (Open-Meteo, без ключа) ====
 // Триггер — слово "погода"/"погоды" в сообщении, адресованном боту (та же
 // гейтовая логика, что и у остального: в личке всегда, в группе — после
@@ -2502,6 +2957,39 @@ bot.on("message:text", async (ctx) => {
           message_thread_id: ctx.message.message_thread_id,
         })
         .catch((err) => console.error("Не удалось отправить banter_female-стикер:", err));
+    }
+  }
+
+  // Проверка отгадки в крокодиле — срабатывает на ЛЮБОЕ сообщение в чате,
+  // без обращения к боту по имени (иначе играть было бы неудобно: в
+  // реальной игре отгадки просто выкрикивают). Ведущего из проверки
+  // исключаем — его собственные подсказки не должны засчитываться сами
+  // себе. Если слово отгадано — раунд сразу завершается и открывается
+  // кнопка для следующего ведущего.
+  {
+    const krokodilGame = getKrokodilGame(chatId);
+    if (krokodilGame && krokodilGame.status === "active" && ctx.from.id !== krokodilGame.hostId) {
+      const tokens = rawText.toLowerCase().replace(/ё/g, "е").match(/[a-zа-я]+/gi) || [];
+      const guessed = tokens.some((t) => krokodilTokenMatches(t, krokodilGame.word));
+      if (guessed) {
+        const scoreMap = getKrokodilScoreMap(chatId);
+        const label = krokodilPlayerLabel(ctx.from);
+        const prev = scoreMap.get(ctx.from.id) || { name: label, score: 0 };
+        const updated = { name: label, score: prev.score + 1 };
+        scoreMap.set(ctx.from.id, updated);
+        saveKrokodilScores(chatId);
+
+        krokodilGames.set(chatId, { status: "idle", usedWords: krokodilGame.usedWords });
+        saveKrokodilGame(chatId);
+
+        await ctx.reply(
+          `🎉 ${label} угадал(а) слово «${krokodilGame.word}»! +1 очко (теперь ${updated.score}).\n\n${formatKrokodilLeaderboard(
+            chatId
+          )}`,
+          { reply_markup: krokodilIdleKeyboard(), reply_parameters: { message_id: ctx.message.message_id } }
+        );
+        return; // раунд закрыт — дальше это сообщение никуда не идёт (ни в чат-триггеры, ни в LLM)
+      }
     }
   }
 
@@ -2955,6 +3443,23 @@ bot.on("message:text", async (ctx) => {
       await ctx.reply(pickRandom(CHECKERS_START_PHRASES_WHITE));
     }
     return;
+  } else if (KROKODIL_INTENT_REGEX.test(rawText)) {
+    // "Женя, крокодил" — тот же смысл, что и кнопка /krokodil: показываем
+    // приглашение стать ведущим (или статус текущего раунда), не отдаём
+    // сообщение в обычный LLM-чат.
+    const krokodilGame = getKrokodilGame(chatId);
+    if (!krokodilGame || krokodilGame.status === "idle") {
+      await sendKrokodilIdleMessage(ctx, chatId);
+    } else if (krokodilGame.status === "choosing") {
+      await ctx.reply(`${krokodilGame.candidateName} сейчас выбирает сложность слова — подожди секунду`);
+    } else {
+      await ctx.reply(
+        `идёт раунд — ведёт ${krokodilGame.hostName}, остальные угадывают словом в чат.\n\n${formatKrokodilLeaderboard(
+          chatId
+        )}`
+      );
+    }
+    return;
   }
 
   // Дошли сюда — значит ни шахматной, ни шашечной партии с этим
@@ -3038,6 +3543,7 @@ async function registerCommands() {
     { command: "aliases", description: "показать список алиасов" },
     { command: "gender", description: "посмотреть/задать пол (свой или реплаем)" },
     { command: "model", description: "выбрать модель / посмотреть текущую" },
+    { command: "krokodil", description: "сыграть в крокодил (объясни слово)" },
   ]);
   console.log("Команды зарегистрированы в Telegram");
 }
@@ -3051,7 +3557,7 @@ registerCommands().catch((err) =>
 // и висящие апдейты — помогает от 409 Conflict при передеплое, когда
 // старый инстанс на Render ещё не до конца отключился от getUpdates.
 async function startBot() {
-  await loadPersistedState();
+  await Promise.all([loadPersistedState(), loadKrokodilDictionary()]);
 
   try {
     await bot.api.deleteWebhook({ drop_pending_updates: true });
