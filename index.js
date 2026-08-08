@@ -6,10 +6,19 @@ import { Chess } from "chess.js";
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // опционально
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY; // опционально
 const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY; // опционально
 const PORT = process.env.PORT || 3000;
+
+// Gemini поддерживает НЕСКОЛЬКО ключей (с разных аккаунтов) через запятую в
+// GEMINI_API_KEYS — каждый аккаунт free tier даёт свою отдельную дневную
+// квоту, так что несколько ключей суммарно дают больше запросов в день, не
+// требуя платного тира. GEMINI_API_KEY (в единственном числе) по-прежнему
+// работает как раньше — для обратной совместимости, если ключ один.
+const GEMINI_API_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "")
+  .split(",")
+  .map((k) => k.trim())
+  .filter(Boolean);
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан в переменных окружения");
 if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY не задан в переменных окружения");
@@ -107,52 +116,72 @@ const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 20000;
 // просто в логах будут повторяющиеся 429 от gemini весь день.
 const MODEL_COOLDOWN_MS = Number(process.env.MODEL_COOLDOWN_MS) || 5 * 60 * 1000;
 
-// Единый список целей для фолбэка: [{ provider, model, baseUrl, apiKey }, ...]
+// Единый список целей для фолбэка: [{ provider, model, baseUrl, apiKey, keyIndex, keyCount }, ...]
 // Порядок провайдеров — из PROVIDER_ORDER, порядок моделей внутри — как задано в env.
+// apiKeys — массив (обычно из одного ключа; у gemini может быть несколько —
+// см. GEMINI_API_KEYS выше). Провайдер без ключей вообще пропускается.
 const PROVIDER_CONFIGS = {
   gemini: {
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    apiKey: GEMINI_API_KEY,
+    apiKeys: GEMINI_API_KEYS,
     models: GEMINI_MODELS,
   },
   groq: {
     baseUrl: "https://api.groq.com/openai/v1/chat/completions",
-    apiKey: GROQ_API_KEY,
+    apiKeys: [GROQ_API_KEY].filter(Boolean),
     models: GROQ_MODELS,
   },
   huggingface: {
     baseUrl: "https://router.huggingface.co/v1/chat/completions",
-    apiKey: HUGGINGFACE_API_KEY,
+    apiKeys: [HUGGINGFACE_API_KEY].filter(Boolean),
     models: HUGGINGFACE_MODELS,
   },
   openrouter: {
     baseUrl: "https://openrouter.ai/api/v1/chat/completions",
-    apiKey: OPENROUTER_API_KEY,
+    apiKeys: [OPENROUTER_API_KEY].filter(Boolean),
     models: OPENROUTER_MODELS,
   },
 };
 
+// Модель — внешний цикл, ключ/аккаунт — внутренний: если у основной модели
+// (напр. gemini-flash-latest) кончилась квота на одном аккаунте, бот сперва
+// пробует ту же модель на СЛЕДУЮЩЕМ аккаунте, и только исчерпав все аккаунты —
+// переходит к следующей модели/провайдеру. Так множественные ключи реально
+// продлевают дневной лимит, а не просто добавляются "в конец очереди".
 const TARGETS = PROVIDER_ORDER.flatMap((providerName) => {
   const cfg = PROVIDER_CONFIGS[providerName];
   if (!cfg) {
     console.warn(`Неизвестный провайдер в PROVIDER_ORDER: "${providerName}", пропускаю`);
     return [];
   }
-  if (!cfg.apiKey) {
+  if (!cfg.apiKeys.length) {
     console.warn(`Нет API-ключа для провайдера "${providerName}", пропускаю`);
     return [];
   }
-  return cfg.models.map((model) => ({
-    provider: providerName,
-    model,
-    baseUrl: cfg.baseUrl,
-    apiKey: cfg.apiKey,
-  }));
+  return cfg.models.flatMap((model) =>
+    cfg.apiKeys.map((apiKey, keyIndex) => ({
+      provider: providerName,
+      model,
+      baseUrl: cfg.baseUrl,
+      apiKey,
+      keyIndex, // 0-based индекс аккаунта — для лейблов/логов при keyCount > 1
+      keyCount: cfg.apiKeys.length,
+    }))
+  );
 });
+
+// Человекочитаемая подпись цели для UI/логов: "gemini/gemini-flash-latest",
+// а если у провайдера несколько ключей — ещё и номер аккаунта, чтобы в
+// /model и в логах можно было понять, какой из нескольких Gemini-ключей
+// сейчас в cooldown, а какой ещё свободен.
+function targetLabel(target) {
+  const base = `${target.provider}/${target.model}`;
+  return target.keyCount > 1 ? `${base} (аккаунт ${target.keyIndex + 1})` : base;
+}
 
 if (TARGETS.length === 0) {
   throw new Error(
-    "Не задано ни одной рабочей модели — проверь PROVIDER_ORDER, GROQ_API_KEY / GEMINI_API_KEY"
+    "Не задано ни одной рабочей модели — проверь PROVIDER_ORDER, GROQ_API_KEY / GEMINI_API_KEY(S)"
   );
 }
 
@@ -2112,7 +2141,7 @@ async function callTarget(target, messages) {
   } catch (err) {
     if (err.name === "AbortError") {
       const timeoutErr = new Error(
-        `${target.provider}/${target.model} не ответил за ${REQUEST_TIMEOUT_MS}мс — таймаут`
+        `${targetLabel(target)} не ответил за ${REQUEST_TIMEOUT_MS}мс — таймаут`
       );
       timeoutErr.status = 504;
       throw timeoutErr;
@@ -2147,7 +2176,7 @@ async function callTarget(target, messages) {
   // модель в TARGETS (см. askLLM). Само событие видно в логах Render.
   if (choice?.finish_reason === "length") {
     console.warn(
-      `[callTarget] ${target.provider}/${target.model}: ответ обрезан по finish_reason=length, ухожу на фолбэк ("${reply}")`
+      `[callTarget] ${targetLabel(target)}: ответ обрезан по finish_reason=length, ухожу на фолбэк ("${reply}")`
     );
     const err = new Error(`${target.provider} обрезал ответ по длине`);
     err.status = 500; // считается фолбэк-достойной (см. isFallbackWorthy)
@@ -2164,7 +2193,7 @@ async function callTarget(target, messages) {
   if (!reply) throw new Error(`Пустой ответ от ${target.provider} после очистки вариантов`);
 
   if (looksLikeReasoningLeak(reply)) {
-    console.warn(`[callTarget] ${target.provider}/${target.model}: похоже на утечку рассуждений вместо ответа: "${reply}"`);
+    console.warn(`[callTarget] ${targetLabel(target)}: похоже на утечку рассуждений вместо ответа: "${reply}"`);
     throw new Error(`${target.provider} прислал утечку рассуждений вместо ответа`);
   }
 
@@ -2217,7 +2246,7 @@ async function askLLM(chatId, userText) {
       // самого API (важно для роутеров HF/OpenRouter: реальный бэкенд может
       // отличаться от target.model, который мы запросили).
       console.log(
-        `[DEBUG rawReply от ${target.provider}/${target.model}` +
+        `[DEBUG rawReply от ${targetLabel(target)}` +
           (actualModel && actualModel !== target.model ? ` → фактически ответил: ${actualModel}` : "") +
           (systemFingerprint ? ` | fingerprint: ${systemFingerprint}` : "") +
           `]:`,
@@ -2228,7 +2257,7 @@ async function askLLM(chatId, userText) {
 
       cooldownUntil[idx] = 0; // на успехе снимаем cooldown, если он был
       if (idx !== activeTargetIndex) {
-        console.warn(`Переключился на "${target.provider}/${target.model}" (индекс ${idx})`);
+        console.warn(`Переключился на "${targetLabel(target)}" (индекс ${idx})`);
         activeTargetIndex = idx;
         saveActiveTargetIndex();
       }
@@ -2242,7 +2271,7 @@ async function askLLM(chatId, userText) {
     } catch (err) {
       lastErr = err;
       console.error(
-        `Ошибка [${target.provider}/${target.model}]:`,
+        `Ошибка [${targetLabel(target)}]:`,
         err.status ?? "-",
         err.body ?? err.message
       );
@@ -2585,14 +2614,14 @@ bot.command("aliases", async (ctx) => {
 function buildModelsStatusText() {
   const now = Date.now();
   const active = TARGETS[activeTargetIndex];
-  let text = `сейчас отвечаю через: ${active.provider}/${active.model}`;
+  let text = `сейчас отвечаю через: ${targetLabel(active)}`;
 
   if (pinnedTargetIndex !== null) {
     const pinned = TARGETS[pinnedTargetIndex];
     text +=
       cooldownUntil[pinnedTargetIndex] > now
-        ? `\n📌 закреплено: ${pinned.provider}/${pinned.model} (сейчас в cooldown, пока отвечаю в авто-режиме)`
-        : `\n📌 закреплено вручную: ${pinned.provider}/${pinned.model}`;
+        ? `\n📌 закреплено: ${targetLabel(pinned)} (сейчас в cooldown, пока отвечаю в авто-режиме)`
+        : `\n📌 закреплено вручную: ${targetLabel(pinned)}`;
   }
 
   const cooling = TARGETS
@@ -2600,7 +2629,7 @@ function buildModelsStatusText() {
     .filter((x) => x.until > now);
   if (cooling.length) {
     const list = cooling
-      .map((x) => `${x.t.provider}/${x.t.model} (ещё ~${Math.ceil((x.until - now) / 1000)}с)`)
+      .map((x) => `${targetLabel(x.t)} (ещё ~${Math.ceil((x.until - now) / 1000)}с)`)
       .join(", ");
     text += `\nв cooldown: ${list}`;
   }
@@ -2618,7 +2647,7 @@ function buildModelsKeyboard() {
     let mark = cold ? "⏳" : "✅";
     if (i === activeTargetIndex) mark += "👉";
     if (i === pinnedTargetIndex) mark += "📌";
-    const label = `${mark} ${t.provider}/${t.model}`.slice(0, 64); // лимит Telegram на текст кнопки
+    const label = `${mark} ${targetLabel(t)}`.slice(0, 64); // лимит Telegram на текст кнопки
     return [{ text: label, callback_data: `setmodel:${i}` }];
   });
   rows.push([{ text: "🔄 авто (снять закрепление)", callback_data: "setmodel:auto" }]);
@@ -3225,7 +3254,7 @@ async function askRecapLLM(userPrompt) {
     } catch (err) {
       lastErr = err;
       console.error(
-        `Ошибка пересказа [${target.provider}/${target.model}]:`,
+        `Ошибка пересказа [${targetLabel(target)}]:`,
         err.status ?? "-",
         err.body ?? err.message
       );
