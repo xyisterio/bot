@@ -3362,7 +3362,31 @@ async function handleRecapQuery(ctx, chatId, requestedCount) {
 const PHOTO_CAPTION_PROMPT =
   "Кратко опиши по-русски, что на этой фотографии — 1 короткое предложение, без вступлений вроде «на фото изображено». " +
   "Если это скриншот текста/переписки — перескажи суть текста, а не то, как он оформлен. Если еда — что за блюдо. " +
-  "Если мем/шутка — в чём соль. Пиши только суть, без markdown и кавычек.";
+  "Если мем/шутка — в чём соль. Пиши только суть, без markdown и кавычек.\n\n" +
+  "После описания, отдельной последней строкой, добавь тег классификации кадра — он не показывается пользователю, только тебе для принятия решения:\n" +
+  '- [reaction: nice] — если это визуально красивый, качественный кадр природы/пейзажа/заката, симпатичного животного, или аппетитно снятая еда.\n' +
+  '- [reaction: girl] — если на фото девушка/женщина, и снимок красивый, приятный на вид (портрет, качественное фото) — не важно, реальное это фото или явно скачанное из интернета.\n' +
+  '- [reaction: none] — если ничего из вышеперечисленного: неясное/смазанное/плохого качества фото, случайный скриншот, посредственное фото человека (не девушки), обычная случайная картинка без художественной ценности.\n' +
+  "Ставь ровно один тег из трёх, всегда, даже если это none.";
+
+// Реакции (нативные Telegram emoji-реакции на сообщение) для красивых фото —
+// см. классификацию в PHOTO_CAPTION_PROMPT выше. Ключ "none" сознательно не
+// сюда не попадает — на него реакцию просто не ставим.
+const PHOTO_REACTION_EMOJI = {
+  nice: "🔥",
+  girl: "❤️",
+};
+
+// Вычленяет тег "[reaction: ключ]" из ответа vision-модели (последняя строка)
+// и возвращает { caption, reactionKey } — чистое описание без тега и ключ
+// категории (null, если тег "none" или тега нет вовсе / он не распознан).
+function extractPhotoReaction(text) {
+  const match = text.match(/\n?\[reaction:\s*([a-zA-Zа-яёА-ЯЁ_]+)\]\s*$/i);
+  if (!match) return { caption: text.trim(), reactionKey: null };
+  const key = match[1].toLowerCase();
+  const clean = text.slice(0, match.index).trim();
+  return { caption: clean || text.trim(), reactionKey: PHOTO_REACTION_EMOJI[key] ? key : null };
+}
 
 // Скачивает файл из Telegram (по file_id) и возвращает его как base64 —
 // именно скачиваем сами и шлём как data-URI, а не передаём модели прямую
@@ -3401,7 +3425,7 @@ async function captionPhoto(ctx, fileId) {
     },
   ];
   const { reply } = await callTarget(visionTarget, messages);
-  return reply;
+  return extractPhotoReaction(reply);
 }
 
 // ==== Реакция стикером на присланную песню/аудио ====
@@ -3468,6 +3492,7 @@ bot.on("message:photo", async (ctx) => {
   }
 
   let caption;
+  let reactionKey;
   try {
     // Берём не самый большой размер (обычно последний в массиве) — он
     // сильно тяжелее в скачивании и токенах, а для короткого текстового
@@ -3475,7 +3500,7 @@ bot.on("message:photo", async (ctx) => {
     // берём его же.
     const sizes = ctx.message.photo;
     const photo = sizes.length > 1 ? sizes[sizes.length - 2] : sizes[sizes.length - 1];
-    caption = await captionPhoto(ctx, photo.file_id);
+    ({ caption, reactionKey } = await captionPhoto(ctx, photo.file_id));
   } catch (err) {
     console.error(`Не удалось распознать фото в чате ${chatId}:`, err.status ?? "-", err.body ?? err.message);
     if (toBot) {
@@ -3502,6 +3527,18 @@ bot.on("message:photo", async (ctx) => {
   // боту, бот мог найти описание конкретно этой картинки (см. блок про
   // реплай на чужое фото в bot.on("message:text") ниже).
   rememberPhotoCaption(chatId, ctx.message.message_id, displayName, caption);
+
+  // Реакция эмодзи (нативная Telegram-реакция) на красивые/приятные фото —
+  // см. классификацию в PHOTO_CAPTION_PROMPT. Ставим её независимо от того,
+  // toBot или нет (красивый закат остаётся красивым закатом, даже если его
+  // никто не адресовал боту) — но только если фото реально распознали.
+  // Ошибку реакции (например, если у бота не хватает прав в чате) не считаем
+  // критичной — тихо логируем и не мешаем остальной обработке.
+  if (reactionKey) {
+    ctx.react(PHOTO_REACTION_EMOJI[reactionKey]).catch((err) =>
+      console.error(`Не удалось поставить реакцию на фото в чате ${chatId}:`, err.description ?? err.message)
+    );
+  }
 
   if (!toBot) {
     // Не адресовано боту — тихо кладём в обычную историю диалога, чтобы
@@ -3732,7 +3769,7 @@ bot.on("message:text", async (ctx) => {
           try {
             const sizes = repliedTo.photo;
             const photo = sizes.length > 1 ? sizes[sizes.length - 2] : sizes[sizes.length - 1];
-            const caption = await captionPhoto(ctx, photo.file_id);
+            const { caption } = await captionPhoto(ctx, photo.file_id);
             info = { name: repliedName, caption };
             rememberPhotoCaption(chatId, repliedTo.message_id, repliedName, caption);
           } catch (err) {
