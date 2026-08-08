@@ -49,6 +49,15 @@ const GROQ_MODELS = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile,openai/g
   .map((m) => m.trim())
   .filter(Boolean);
 
+// Отдельная модель для распознавания фото (см. блок "Фото" и bot.on("message:photo")
+// ниже) — сознательно НЕ смешана с обычным GROQ_MODELS/фолбэком: это узкоспециальная
+// vision-модель, а не модель общего назначения для болтовни, и дёргаем мы её
+// отдельным точечным вызовом (см. captionPhoto), в обход обычного askLLM. На
+// момент написания единственная реально поддерживаемая vision-модель на Groq —
+// qwen/qwen3.6-27b (Llama 4 Scout/Maverick, которые раньше тоже умели в картинки,
+// Groq сняла с доступа в течение 2026 года — см. console.groq.com/docs/vision).
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
+
 const GEMINI_MODELS = (process.env.GEMINI_MODEL || "gemini-flash-latest,gemini-3.5-flash")
   .split(",")
   .map((m) => m.trim())
@@ -569,6 +578,40 @@ function pushHistory(chatId, role, content) {
   h.push({ role, content });
   while (h.length > HISTORY_LIMIT) h.shift();
   saveHistory(chatId);
+}
+
+// ==== Лог сообщений чата (для команды "о чём тут речь") ====
+// Отдельно от HISTORY выше (та — только реплики самого диалога с ботом,
+// максимум HISTORY_LIMIT штук, и нужна модели для контекста ответа).
+// Этот лог — «сырая» лента ВСЕХ сообщений в группе (даже не адресованных
+// боту), чтобы потом можно было попросить пересказать, о чём был разговор,
+// пока бота не звали. Сообщения от других ботов сюда не попадают (см.
+// вызов pushChatLog — фильтр по ctx.from.is_bot). Личные чаты не логируем —
+// там и так есть обычная история диалога.
+const CHAT_LOG_LIMIT = 300; // сколько последних сообщений держим в логе на чат
+const chatLogs = new Map(); // chatId -> [{ name, text, ts, toBot }]
+
+function getChatLog(chatId) {
+  if (!chatLogs.has(chatId)) chatLogs.set(chatId, []);
+  return chatLogs.get(chatId);
+}
+
+async function saveChatLog(chatId) {
+  if (!redis) return;
+  try {
+    await redis.set(`chatlog:${chatId}`, getChatLog(chatId));
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить лог чата ${chatId}:`, err);
+  }
+}
+
+// toBot — было ли сообщение обращением к боту (по имени/реплаем/тегом) —
+// нужно, чтобы при пересказе отдельно отметить "общался(-ась) с ботом о...".
+function pushChatLog(chatId, name, text, toBot) {
+  const log = getChatLog(chatId);
+  log.push({ name, text, ts: Date.now(), toBot: !!toBot });
+  while (log.length > CHAT_LOG_LIMIT) log.shift();
+  saveChatLog(chatId);
 }
 
 // ==== Шахматы ====
@@ -2234,6 +2277,7 @@ async function loadPersistedState() {
   try {
     const [
       historyKeys,
+      chatLogKeys,
       aliasKeys,
       usernameKeys,
       genderKeys,
@@ -2245,6 +2289,7 @@ async function loadPersistedState() {
       savedPinnedIdx,
     ] = await Promise.all([
       redis.keys("history:*"),
+      redis.keys("chatlog:*"),
       redis.keys("aliases:*"),
       redis.keys("usernames:*"),
       redis.keys("genders:*"),
@@ -2261,6 +2306,14 @@ async function loadPersistedState() {
         const chatId = Number(key.slice("history:".length));
         const data = await redis.get(key);
         if (Array.isArray(data)) histories.set(chatId, data);
+      })
+    );
+
+    await Promise.all(
+      chatLogKeys.map(async (key) => {
+        const chatId = Number(key.slice("chatlog:".length));
+        const data = await redis.get(key);
+        if (Array.isArray(data)) chatLogs.set(chatId, data);
       })
     );
 
@@ -2356,7 +2409,7 @@ async function loadPersistedState() {
     }
 
     console.log(
-      `Восстановлено из Redis: истории — ${historyKeys.length}, алиасы — ${aliasKeys.length}, ` +
+      `Восстановлено из Redis: истории — ${historyKeys.length}, логи чатов — ${chatLogKeys.length}, алиасы — ${aliasKeys.length}, ` +
         `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}, шахматные партии — ${chessKeys.length}, ` +
         `шашечные партии — ${checkersKeys.length}, раунды крокодила — ${krokodilKeys.length}, ` +
         `счёт крокодила — ${krokodilScoreKeys.length} чатов` +
@@ -3108,6 +3161,166 @@ async function handleWeatherQuery(ctx, intent) {
   }
 }
 
+// ==== Пересказ чата ("о чём тут речь?") ====
+// Отдельная механика поверх ChatLog (см. pushChatLog выше): пользователь
+// просит вкратце пересказать последние N сообщений в группе — например
+// "Женя, о чём тут речь? 100" или "Женя, что я пропустил, 50 сообщений".
+// Число — сколько последних сообщений взять из лога; если не указано,
+// берём DEFAULT_RECAP_COUNT. Сообщения от других ботов в лог не попадают
+// вообще (см. фильтр ctx.from.is_bot в bot.on("message:text")), так что
+// отдельно фильтровать их тут не нужно.
+const RECAP_INTENT_REGEX =
+  /(о\s*чём|о\s*чем)\s+(тут|здесь|в\s+чате)?\s*(речь|говорил|шла\s+речь)|что\s+(тут|здесь)?\s*(обсужда|происходи|писали|было|творил)|перескаж|пересказ|что\s+я\s+пропустил|краткое\s+содержан|саммари\s+чата|сумму\s+чата/i;
+const DEFAULT_RECAP_COUNT = 50;
+const MAX_RECAP_COUNT = CHAT_LOG_LIMIT;
+
+// Вытаскивает запрошенное число сообщений из текста ("... речь? 100" -> 100).
+// Если чисел несколько — берём первое; если чисел нет — null (сработает
+// DEFAULT_RECAP_COUNT).
+function parseRecapCount(text) {
+  const match = text.match(/\d{1,4}/);
+  if (!match) return null;
+  const n = Number(match[0]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.min(n, MAX_RECAP_COUNT);
+}
+
+const RECAP_SYSTEM_PROMPT = `Тебе дана выгрузка последних сообщений группового Telegram-чата в формате "Имя: текст" (для сообщений, адресованных боту, будет пометка "(обращался к боту)"). Твоя задача — коротко и по делу пересказать, о чём шла речь.
+
+Правила:
+- Пиши по-русски, живым разговорным языком, без канцелярита и без вступлений вроде "вот пересказ".
+- Формат — короткие пункты (списком через дефис), 3-7 пунктов, каждый пункт — максимум 1-2 строки. Указывай, кто о чём говорил, если это понятно из текста.
+- Ничего не выдумывай сверх того, что реально написано в переписке.
+- Если человек за это время в основном (или только) переписывался с ботом, а не с остальными — сделай по нему отдельный короткий пункт вида "Имя общался(-ась) с ботом о том-то", не пересказывая ответы бота подробно.
+- Мелкие технические реплики (одно слово, эмодзи, "+1" и т.п.) не заслуживают отдельного пункта — просто пропускай их.
+- Если по существу обсуждать нечего (болтовня ни о чём, спам) — так и скажи одной фразой, без списка.`;
+
+// Отдельный вызов LLM в обход основной истории диалога (askLLM/pushHistory) —
+// пересказ не должен засорять контекст обычного чата с ботом и не должен
+// зависеть от него.
+async function askRecapLLM(userPrompt) {
+  const messages = [
+    { role: "system", content: RECAP_SYSTEM_PROMPT },
+    { role: "user", content: userPrompt },
+  ];
+
+  const now = Date.now();
+  let order = [...TARGETS.keys()].sort((a, b) => {
+    const aCold = cooldownUntil[a] > now ? 1 : 0;
+    const bCold = cooldownUntil[b] > now ? 1 : 0;
+    return aCold - bCold || a - b;
+  });
+  if (pinnedTargetIndex !== null && cooldownUntil[pinnedTargetIndex] <= now) {
+    order = [pinnedTargetIndex, ...order.filter((idx) => idx !== pinnedTargetIndex)];
+  }
+
+  let lastErr;
+  for (const idx of order) {
+    const target = TARGETS[idx];
+    try {
+      const { reply: rawReply } = await callTarget(target, messages);
+      const { text: reply } = extractSticker(rawReply); // пересказу стикеры не нужны, просто чистим тег если модель его всё же добавила
+      cooldownUntil[idx] = 0;
+      return reply;
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `Ошибка пересказа [${target.provider}/${target.model}]:`,
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+      if (err.status && !isFallbackWorthy(err.status)) break;
+      cooldownUntil[idx] = Date.now() + MODEL_COOLDOWN_MS;
+    }
+  }
+
+  throw lastErr ?? new Error("Все провайдеры и модели недоступны");
+}
+
+async function handleRecapQuery(ctx, chatId, requestedCount) {
+  const log = getChatLog(chatId);
+  if (log.length === 0) {
+    await ctx.reply("пока не набралось сообщений в этом чате, чтобы что-то пересказывать");
+    return;
+  }
+
+  const count = Math.max(1, Math.min(requestedCount || DEFAULT_RECAP_COUNT, log.length));
+  const slice = log.slice(-count);
+
+  const transcript = slice
+    .map((m) => `${m.name}${m.toBot ? " (обращался к боту)" : ""}: ${m.text}`)
+    .join("\n");
+
+  await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+  try {
+    const reply = await askRecapLLM(
+      `Вот последние ${slice.length} сообщений чата:\n\n${transcript}`
+    );
+    await ctx.reply(reply, {
+      reply_parameters: { message_id: ctx.message.message_id },
+      message_thread_id: ctx.message.message_thread_id,
+    });
+  } catch (err) {
+    console.error("Ошибка при пересказе чата:", err);
+    await ctx.reply("не получилось собрать пересказ, попробуй чуть позже");
+  }
+}
+
+// ==== Фото (пассивное распознавание для лога/пересказа) ====
+// Идея: НЕ дёргать основные диалоговые модели (Gemini и т.п.) на каждое
+// фото — вместо этого каждое фото в группе тихо (без ответа в чат) уходит
+// на отдельную vision-модель (Qwen на Groq, см. GROQ_VISION_MODEL), и её
+// короткое описание попадает и в ChatLog (для команды "о чём тут речь"),
+// и в обычную HISTORY диалога (см. pushHistory) — чтобы если кто-то потом
+// в обычном разговоре спросит бота (на любой модели, необязательно Groq)
+// "а что было на фото" — та модель уже увидит текстовое описание в
+// контексте и сможет ответить, сама картинку не разбирая и не тратя на
+// это токены. Работает только в группах — см. фильтр isGroup в хендлере.
+const PHOTO_CAPTION_PROMPT =
+  "Кратко опиши по-русски, что на этой фотографии — 1 короткое предложение, без вступлений вроде «на фото изображено». " +
+  "Если это скриншот текста/переписки — перескажи суть текста, а не то, как он оформлен. Если еда — что за блюдо. " +
+  "Если мем/шутка — в чём соль. Пиши только суть, без markdown и кавычек.";
+
+// Скачивает файл из Telegram (по file_id) и возвращает его как base64 —
+// именно скачиваем сами и шлём как data-URI, а не передаём модели прямую
+// ссылку вида api.telegram.org/file/bot<TOKEN>/... — иначе токен бота
+// улетел бы третьей стороне (серверам Groq, которые бы сами фетчили URL).
+async function fetchTelegramFileBase64(ctx, fileId) {
+  const file = await ctx.api.getFile(fileId);
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Не удалось скачать файл из Telegram: ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  const mime = file.file_path.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
+  return { base64: buf.toString("base64"), mime };
+}
+
+// Отдельный точечный вызов vision-модели — в обход askLLM/TARGETS-фолбэка:
+// тут только одна конкретная модель (GROQ_VISION_MODEL), без перебора
+// провайдеров, потому что это узкоспециальная задача, а не общий чат.
+// callTarget переиспользуем как есть — он уже умеет reasoning_effort для
+// qwen-моделей на groq, таймаут, чистку <think>/утечек рассуждений и т.п.
+async function captionPhoto(ctx, fileId) {
+  const { base64, mime } = await fetchTelegramFileBase64(ctx, fileId);
+  const visionTarget = {
+    provider: "groq",
+    model: GROQ_VISION_MODEL,
+    baseUrl: PROVIDER_CONFIGS.groq.baseUrl,
+    apiKey: GROQ_API_KEY,
+  };
+  const messages = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: PHOTO_CAPTION_PROMPT },
+        { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } },
+      ],
+    },
+  ];
+  const { reply } = await callTarget(visionTarget, messages);
+  return reply;
+}
+
 // ==== Реакция стикером на присланную песню/аудио ====
 // Отдельно от текстовых ответов через LLM — тут модель вообще не участвует,
 // это чисто механическая реакция: пришло аудио/голосовое → шлём стикер из
@@ -3127,6 +3340,61 @@ bot.on(["message:audio", "message:voice"], async (ctx) => {
     reply_parameters: { message_id: ctx.message.message_id },
     message_thread_id: ctx.message.message_thread_id,
   });
+});
+
+// ==== Фото в группе — пассивный лог, без ответа в чат ====
+// Срабатывает на КАЖДОЕ фото в группе (не только адресованное боту) — см.
+// пояснение к captionPhoto выше. Бот при этом ничего не пишет в чат: это
+// чисто фоновая запись в ChatLog + HISTORY, а не реакция на сообщение.
+// Фото от других ботов игнорируем (как и в общем текстовом логе).
+bot.on("message:photo", async (ctx) => {
+  const chatId = ctx.chat.id;
+  const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+  if (!isGroup) return; // в личке фото не разбираем вообще — см. обсуждение в чате с разработчиком
+  if (ctx.from.is_bot) return;
+
+  rememberUsername(chatId, ctx.from);
+  const displayName = getDisplayName(chatId, ctx.from);
+
+  // Была ли подпись/реплай адресованы боту — тот же набор сигналов, что и
+  // для обычных текстовых сообщений (см. bot.on("message:text")), только
+  // источник текста — caption, а не сам текст сообщения (у фото его нет).
+  const captionText = ctx.message.caption || "";
+  const isReplyToBot = ctx.message.reply_to_message?.from?.id === ctx.me.id;
+  const isMentioned =
+    ctx.message.caption_entities?.some(
+      (e) =>
+        e.type === "mention" &&
+        captionText.substring(e.offset, e.offset + e.length).toLowerCase() ===
+          `@${ctx.me.username?.toLowerCase()}`
+    ) ?? false;
+  const toBot = nameTriggerRegex.test(captionText) || isReplyToBot || isMentioned || ownerMentionRegex.test(captionText);
+
+  try {
+    // Берём не самый большой размер (обычно последний в массиве) — он
+    // сильно тяжелее в скачивании и токенах, а для короткого текстового
+    // описания достаточно среднего качества. Если размер всего один —
+    // берём его же.
+    const sizes = ctx.message.photo;
+    const photo = sizes.length > 1 ? sizes[sizes.length - 2] : sizes[sizes.length - 1];
+
+    const caption = await captionPhoto(ctx, photo.file_id);
+
+    const logLine = captionText ? `[фото: ${caption}] ${captionText}` : `[фото] ${caption}`;
+    pushChatLog(chatId, displayName, logLine, toBot);
+    // Кладём и в обычную историю диалога — чтобы модель, к которой в
+    // будущем обратятся в этом чате (не обязательно на Groq), уже видела
+    // текстовое описание фото в контексте, не разбирая картинку сама.
+    // ВАЖНО: HISTORY_LIMIT всего 12 сообщений — в очень активном чате с
+    // частыми фото это описание может довольно быстро "вытолкнуть" из
+    // контекста реальные реплики. Если станет мешать — либо поднять
+    // HISTORY_LIMIT, либо не класть сюда, оставить только ChatLog.
+    pushHistory(chatId, "user", `${displayName} прислал(а) фото: ${caption}`);
+  } catch (err) {
+    // Намеренно тихо: это фоновая обработка, а не ответ на прямой запрос,
+    // спамить в чат ошибками про каждое неудачно распознанное фото не надо.
+    console.error(`Не удалось распознать фото в чате ${chatId}:`, err.status ?? "-", err.body ?? err.message);
+  }
 });
 
 bot.on("message:text", async (ctx) => {
@@ -3229,8 +3497,17 @@ bot.on("message:text", async (ctx) => {
             .toLowerCase() === `@${ctx.me.username?.toLowerCase()}`
       ) ?? false;
     const isOwnerMentioned = ownerMentionRegex.test(userText);
+    const isAddressedToBot = startsWithName || isReplyToBot || isMentioned || isOwnerMentioned;
 
-    if (!startsWithName && !isReplyToBot && !isMentioned && !isOwnerMentioned) {
+    // Пишем сообщение в лог чата (см. pushChatLog) ДО фильтра "не наше
+    // сообщение — молчим" ниже — иначе в лог попадали бы только реплики,
+    // адресованные боту, и пересказывать было бы нечего. Сообщения от
+    // других ботов не логируем.
+    if (!ctx.from.is_bot) {
+      pushChatLog(chatId, getDisplayName(chatId, ctx.from), rawText, isAddressedToBot);
+    }
+
+    if (!isAddressedToBot) {
       return; // не наше сообщение — молчим
     }
 
@@ -3292,6 +3569,16 @@ bot.on("message:text", async (ctx) => {
   const weatherIntent = parseWeatherIntent(stripNameTrigger(rawText));
   if (weatherIntent) {
     await handleWeatherQuery(ctx, weatherIntent);
+    return;
+  }
+
+  // ==== Пересказ чата ("Женя, о чём тут речь? 100") ====
+  // Только в группах — лог (ChatLog) заполняется исключительно там, в
+  // личке пересказывать нечего (там и так вся история — это диалог с
+  // самим ботом). Отвечает не через обычный askLLM/историю чата, а через
+  // отдельный askRecapLLM на основе лога сообщений — см. handleRecapQuery.
+  if (isGroup && RECAP_INTENT_REGEX.test(stripNameTrigger(rawText))) {
+    await handleRecapQuery(ctx, chatId, parseRecapCount(rawText));
     return;
   }
 

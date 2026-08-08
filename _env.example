@@ -1,0 +1,50 @@
+BOT_TOKEN=твой_токен_от_BotFather
+
+# Порядок провайдеров через запятую — бот пробует их слева направо,
+# переключаясь на следующий при ошибке/лимите/недоступности модели.
+# Провайдер без заданного ключа просто пропускается.
+PROVIDER_ORDER=gemini,groq,huggingface,openrouter
+
+# Gemini (ключ бесплатно на aistudio.google.com/apikey)
+GEMINI_API_KEY=твой_ключ_от_aistudio.google.com
+GEMINI_MODEL=gemini-flash-latest,gemini-3.5-flash
+
+# Groq (ключ бесплатно на console.groq.com/keys) — используется как фолбэк
+GROQ_API_KEY=твой_ключ_от_console.groq.com
+GROQ_MODEL=openai/gpt-oss-120b,llama-3.3-70b-versatile
+
+# Отдельная vision-модель на Groq для распознавания фото в группах (см.
+# раздел "Фото" в README) — не смешана с GROQ_MODEL выше, дёргается точечно
+# только для картинок. Менять не обязательно, если Groq не снимет модель
+# с доступа раньше срока (актуальный список — console.groq.com/docs/vision).
+GROQ_VISION_MODEL=qwen/qwen3.6-27b
+
+# Hugging Face Inference Providers (ключ бесплатно на huggingface.co/settings/tokens,
+# нужны права "Make calls to Inference Providers"). Это единый роутер к разным
+# бэкендам (Together, Fireworks, Cerebras и др.) — ПЕРЕД использованием зайди в
+# huggingface.co/settings/inference-providers и отключи там провайдеров,
+# которые используют данные для обучения моделей — это настройка аккаунта,
+# из кода/env она не управляется.
+HUGGINGFACE_API_KEY=твой_токен_от_huggingface.co
+HUGGINGFACE_MODEL=meta-llama/Llama-3.3-70B-Instruct,Qwen/Qwen2.5-72B-Instruct
+
+# OpenRouter (ключ бесплатно на openrouter.ai/keys) — агрегатор с бесплатными
+# (:free) моделями, состав ротируется, смотри актуальный список на
+# openrouter.ai/models с фильтром free. Бесплатный тир: 20 запросов/мин,
+# 50/день без пополнения баланса (или 1000/день после разовой покупки от
+# $10 кредитов — лимит остаётся навсегда, даже если кредиты потрачены).
+OPENROUTER_API_KEY=твой_ключ_от_openrouter.ai
+OPENROUTER_MODEL=meta-llama/llama-3.3-70b-instruct:free,qwen/qwen3-coder:free
+
+# Upstash Redis — без этого история переписки, алиасы, пол и активная
+# модель хранятся только в памяти процесса и сбрасываются при каждом
+# рестарте/передеплое. Бесплатная база на upstash.com, взять во вкладке
+# базы данных: Details -> REST API -> "UPSTASH_REDIS_REST_URL" / "...TOKEN"
+UPSTASH_REDIS_REST_URL=https://твоя-база.upstash.io
+UPSTASH_REDIS_REST_TOKEN=твой_токен
+
+# Тег настоящего Жени в Telegram (без @) — если кто-то в группе позовёт
+# его через этот тег, бот тоже среагирует и "встрянет" вместо него
+OWNER_USERNAME=EVGEN1Y_V
+
+PORT=3000
