@@ -2871,9 +2871,13 @@ bot.command("krokodil_reset", async (ctx) => {
 // незавершённая шахматная/шашечная партия не перехватывала это сообщение
 // как попытку хода.
 
-bot.on("callback_query:data", async (ctx) => {
+// ВАЖНО: как и у setmodel-обработчика выше — на чужой префикс нужно явно
+// передавать управление дальше через next(), иначе апдейт не дойдёт до
+// обработчиков ниже по цепочке (например, выбора фильма — см.
+// bot.on("callback_query:data") для "movie:" дальше по файлу).
+bot.on("callback_query:data", async (ctx, next) => {
   const data = ctx.callbackQuery.data;
-  if (!data.startsWith("krokodil:")) return;
+  if (!data.startsWith("krokodil:")) return next();
 
   const chatId = ctx.chat.id;
   const action = data.slice("krokodil:".length);
@@ -3244,28 +3248,60 @@ async function handleWeatherQuery(ctx, intent) {
   }
 }
 
-// ==== Поиск фильмов (TMDB) ====
-// Триггер — "фильм <название>[ год]" (или "кино <название>[ год]"),
-// адресованное боту (та же гейтовая логика, что у погоды/анекдотов — в
-// личке всегда, в группе после имени/реплая/упоминания). Год в конце —
-// опциональный: "фильм Аватар 2009" сразу уточняет поиск и, если под этот
-// год попадает ровно один результат, карточка уходит без меню выбора;
-// без года (или если под указанный год попало несколько фильмов, например
-// ремейки/сиквелы с тем же годом) — динамические кнопки в столбик, как в
-// крокодиле (см. krokodilIdleKeyboard/krokodilActiveKeyboard выше и
+// ==== Поиск фильмов/сериалов/мультфильмов (TMDB) ====
+// Триггер — слово из MOVIE_TRIGGER_WORDS В САМОМ НАЧАЛЕ сообщения (после
+// вырезанного обращения к боту), например "фильм <название>[ год]". Это
+// специально anchored к началу строки: "Женя, как тебе фильм Аватар?" НЕ
+// матчится (сообщение начинается с "как", а не с триггерного слова) и
+// просто уходит в обычный LLM-чат — так можно обсудить фильм с моделью, а
+// не только запросить карточку из TMDB. Год в конце — опциональный: если
+// под указанный год попадает ровно один результат, карточка уходит сразу
+// без меню выбора; без года (или при нескольких результатах того же года)
+// — динамические кнопки в столбик, как в крокодиле (см.
+// krokodilIdleKeyboard/krokodilActiveKeyboard выше и
 // bot.on("callback_query:data") ниже для "movie:").
+//
+// Триггерные слова определяют не только текст запроса, но и куда идти в
+// TMDB (kind: "movie" — /search/movie, "tv" — /search/tv) и нужно ли
+// после поиска отфильтровать результаты по жанру "Анимация" (id=16) —
+// TMDB не разделяет мультфильмы на отдельный тип контента, это обычные
+// movie/tv с этим жанром, так что фильтруем сами по genre_ids результата
+// поиска (см. filterAnimated). Порядок в списке важен: более длинные/
+// специфичные слова ("мультсериал", "мультфильм") должны идти раньше
+// более коротких, которые являются их префиксом ("мульт"), иначе в
+// alternation-регэкспе короткая альтернатива матчится первой и обрежет
+// "фильм"/"сериал" из хвоста слова.
+const MOVIE_TRIGGER_WORDS = [
+  ["мультсериал", { kind: "tv", animated: true }],
+  ["мультфильм", { kind: "movie", animated: true }],
+  ["мульт", { kind: "movie", animated: true }],
+  ["сериал", { kind: "tv", animated: false }],
+  ["фильм", { kind: "movie", animated: false }],
+  ["кино", { kind: "movie", animated: false }],
+];
+
 // ВАЖНО: не \b — в JS \b завязан на \w, который не включает кириллицу,
 // поэтому \b после кириллической буквы никогда не срабатывает (та же
 // проблема разобрана в комментарии к nameTriggerRegex выше). Вместо этого
 // негативный lookahead: следующий символ не должен быть кириллической
-// буквой (чтобы "фильммания" не матчилось как триггер "фильм").
-const MOVIE_INTENT_REGEX = /^(?:фильм|кино)(?![а-яёА-ЯЁ])[:,]?\s*(.+)/i;
+// буквой (чтобы "фильммания" не матчилось как триггер "фильм"). Само
+// триггерное слово захватываем в группу — по нему в parseMovieIntent
+// определяем kind/animated.
+const MOVIE_INTENT_REGEX = new RegExp(
+  `^(${MOVIE_TRIGGER_WORDS.map(([w]) => w).join("|")})(?![а-яёА-ЯЁ])[:,]?\\s*(.+)`,
+  "i"
+);
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500";
+const TMDB_ANIMATION_GENRE_ID = 16;
 
 function parseMovieIntent(text) {
   const match = MOVIE_INTENT_REGEX.exec(text.trim());
   if (!match) return null;
-  let rest = match[1].trim();
+
+  const config = MOVIE_TRIGGER_WORDS.find(([word]) => word === match[1].toLowerCase())?.[1];
+  if (!config) return null; // не должно случиться — группа взята из того же списка слов
+
+  let rest = match[2].trim();
   if (!rest) return null;
 
   // Год в конце строки — "Аватар 2009" -> query "Аватар", year "2009".
@@ -3278,34 +3314,65 @@ function parseMovieIntent(text) {
   }
   rest = rest.replace(/[.,!?;:]+$/g, "").trim();
   if (!rest) return null;
-  return { query: rest, year };
+
+  return { query: rest, year, kind: config.kind, animated: config.animated };
 }
 
-async function searchTmdbMovies(query, year) {
+// Единая точка поиска для movie/tv — приводит разные поля TMDB (title/name,
+// release_date/first_air_date) к общему виду, чтобы дальше по коду не
+// разбирать kind на каждом шагу.
+async function searchTmdbTitles(kind, query, year) {
+  const endpoint = kind === "tv" ? "tv" : "movie";
   const params = new URLSearchParams({
     api_key: TMDB_API_KEY,
     query,
     language: "ru-RU",
     include_adult: "false",
   });
-  if (year) params.set("year", year);
-  const url = `https://api.themoviedb.org/3/search/movie?${params.toString()}`;
+  if (year) params.set(kind === "tv" ? "first_air_date_year" : "year", year);
+
+  const url = `https://api.themoviedb.org/3/search/${endpoint}?${params.toString()}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`tmdb search: ${res.status}`);
+  if (!res.ok) throw new Error(`tmdb search ${endpoint}: ${res.status}`);
   const data = await res.json();
-  return data.results || [];
+
+  return (data.results || []).map((r) => ({
+    id: r.id,
+    title: kind === "tv" ? r.name : r.title,
+    date: kind === "tv" ? r.first_air_date : r.release_date,
+    genreIds: r.genre_ids || [],
+  }));
 }
 
-async function fetchTmdbMovieDetails(id) {
-  const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_API_KEY}&language=ru-RU`;
+// Отфильтровывает результаты по жанру "Анимация" — но только если после
+// фильтра что-то остаётся: если у TMDB для конкретного тайтла genre_ids
+// почему-то пуст/не проставлен, лучше показать что нашлось, чем ответить
+// "ничего нет" на ровном месте.
+function filterAnimated(results) {
+  const animated = results.filter((r) => r.genreIds.includes(TMDB_ANIMATION_GENRE_ID));
+  return animated.length ? animated : results;
+}
+
+async function fetchTmdbDetails(kind, id) {
+  const endpoint = kind === "tv" ? "tv" : "movie";
+  const url = `https://api.themoviedb.org/3/${endpoint}/${id}?api_key=${TMDB_API_KEY}&language=ru-RU`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`tmdb details: ${res.status}`);
-  return res.json();
+  if (!res.ok) throw new Error(`tmdb details ${endpoint}: ${res.status}`);
+  const data = await res.json();
+  return {
+    title: kind === "tv" ? data.name : data.title,
+    date: kind === "tv" ? data.first_air_date : data.release_date,
+    voteAverage: data.vote_average,
+    genres: data.genres || [],
+    overview: data.overview,
+    posterPath: data.poster_path,
+    seasons: kind === "tv" ? data.number_of_seasons : null,
+  };
 }
 
 // Экранирование под parse_mode: "HTML" — набор спецсимволов у Telegram тут
 // значительно меньше, чем у Markdown (только &, <, >), поэтому безопаснее
-// для произвольного текста описания фильма с TMDB, чем ручное экранирование
+// для произвольного текста описания с TMDB, чем ручное экранирование
 // звёздочек/подчёркиваний markdown.
 function escapeHtml(s) {
   return String(s || "")
@@ -3314,32 +3381,35 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;");
 }
 
-// Собирает и отправляет карточку фильма (постер + подпись) по id TMDB.
+// Собирает и отправляет карточку (постер + подпись) по id и kind TMDB.
 // threadId — id темы группового чата (проброс из исходного сообщения или
-// из callback_query, см. вызовы ниже), replyToMessageId — опционально,
-// на какое сообщение отвечать (не используется при отправке из callback,
-// там это уже не нужно — старое меню к этому моменту удалено/отредактировано).
-async function sendMovieCard(ctx, movieId, { threadId, replyToMessageId } = {}) {
-  let movie;
+// из callback_query, см. вызовы ниже), replyToMessageId — опционально, на
+// какое сообщение отвечать (не используется при отправке из callback, там
+// это уже не нужно — старое меню к этому моменту удалено).
+async function sendMovieCard(ctx, kind, id, { threadId, replyToMessageId } = {}) {
+  let item;
   try {
-    movie = await fetchTmdbMovieDetails(movieId);
+    item = await fetchTmdbDetails(kind, id);
   } catch (err) {
-    console.error("Ошибка получения карточки фильма TMDB:", err.message);
-    await ctx.reply("не получилось загрузить карточку фильма, TMDB сейчас недоступен — попробуй позже");
+    console.error("Ошибка получения карточки TMDB:", err.message);
+    await ctx.reply("не получилось загрузить карточку, TMDB сейчас недоступен — попробуй позже");
     return;
   }
 
-  const year = movie.release_date ? movie.release_date.slice(0, 4) : "";
-  const rating = movie.vote_average ? movie.vote_average.toFixed(1) : null;
-  const genres = (movie.genres || []).map((g) => g.name).join(", ");
+  const year = item.date ? item.date.slice(0, 4) : "";
+  const rating = item.voteAverage ? item.voteAverage.toFixed(1) : null;
+  const genres = item.genres.map((g) => g.name).join(", ");
 
-  let caption = `<b>${escapeHtml(movie.title)}</b>${year ? ` (${year})` : ""}\n`;
+  let caption = `<b>${escapeHtml(item.title)}</b>${year ? ` (${year})` : ""}\n`;
   if (rating) caption += `⭐ ${rating}/10 на TMDB\n`;
   if (genres) caption += `🎬 ${genres}\n`;
+  if (kind === "tv" && item.seasons) {
+    caption += `📺 сезонов: ${item.seasons}\n`;
+  }
   // Лимит подписи к фото у Telegram — 1024 символа, оставляем запас под
-  // остальные строки выше (название/рейтинг/жанры).
-  if (movie.overview) {
-    let overview = escapeHtml(movie.overview);
+  // остальные строки выше (название/рейтинг/жанры/сезоны).
+  if (item.overview) {
+    let overview = escapeHtml(item.overview);
     if (overview.length > 800) overview = `${overview.slice(0, 800)}…`;
     caption += `\n${overview}`;
   } else {
@@ -3349,12 +3419,17 @@ async function sendMovieCard(ctx, movieId, { threadId, replyToMessageId } = {}) 
   const opts = { parse_mode: "HTML", message_thread_id: threadId };
   if (replyToMessageId) opts.reply_parameters = { message_id: replyToMessageId };
 
-  if (movie.poster_path) {
-    await ctx.replyWithPhoto(`${TMDB_IMAGE_BASE}${movie.poster_path}`, { ...opts, caption });
+  if (item.posterPath) {
+    await ctx.replyWithPhoto(`${TMDB_IMAGE_BASE}${item.posterPath}`, { ...opts, caption });
   } else {
     // Постера нет — шлём тем же форматированием обычным текстом.
     await ctx.reply(caption, opts);
   }
+}
+
+function kindNoun(kind, animated) {
+  if (kind === "tv") return animated ? "мультсериал" : "сериал";
+  return animated ? "мультфильм" : "фильм";
 }
 
 async function handleMovieQuery(ctx, intent) {
@@ -3367,15 +3442,17 @@ async function handleMovieQuery(ctx, intent) {
 
   let results;
   try {
-    results = await searchTmdbMovies(intent.query, intent.year);
+    results = await searchTmdbTitles(intent.kind, intent.query, intent.year);
   } catch (err) {
-    console.error("Ошибка поиска фильма TMDB:", err.message);
-    await ctx.reply("не получилось поискать фильм, TMDB сейчас недоступен — попробуй позже");
+    console.error("Ошибка поиска TMDB:", err.message);
+    await ctx.reply("не получилось поискать, TMDB сейчас недоступен — попробуй позже");
     return;
   }
 
+  if (intent.animated) results = filterAnimated(results);
+
   if (!results.length) {
-    await ctx.reply(`не нашёл фильм «${intent.query}»${intent.year ? ` (${intent.year})` : ""}`);
+    await ctx.reply(`не нашёл ${kindNoun(intent.kind, intent.animated)} «${intent.query}»${intent.year ? ` (${intent.year})` : ""}`);
     return;
   }
 
@@ -3383,12 +3460,12 @@ async function handleMovieQuery(ctx, intent) {
   // выборку до этого года (TMDB и без этого фильтрует не строго).
   let candidates = results;
   if (intent.year) {
-    const sameYear = results.filter((m) => (m.release_date || "").startsWith(intent.year));
+    const sameYear = results.filter((r) => (r.date || "").startsWith(intent.year));
     if (sameYear.length) candidates = sameYear;
   }
 
   if (candidates.length === 1) {
-    await sendMovieCard(ctx, candidates[0].id, {
+    await sendMovieCard(ctx, intent.kind, candidates[0].id, {
       threadId: ctx.message.message_thread_id,
       replyToMessageId: ctx.message.message_id,
     });
@@ -3398,10 +3475,12 @@ async function handleMovieQuery(ctx, intent) {
   // Несколько вариантов — динамические кнопки в столбик (по одной в ряд),
   // как в крокодиле. Ограничиваем 8 штуками, чтобы меню не разрасталось —
   // дальше по релевантности TMDB это обычно уже совсем не то, что искали.
+  // kind кладём прямо в callback_data ("movie:movie:<id>"/"movie:tv:<id>"),
+  // чтобы при нажатии знать, какой TMDB-эндпоинт дёргать за деталями.
   const keyboard = new InlineKeyboard();
-  for (const movie of candidates.slice(0, 8)) {
-    const yearLabel = movie.release_date ? movie.release_date.slice(0, 4) : "год неизвестен";
-    keyboard.text(`${movie.title} (${yearLabel})`, `movie:${movie.id}`).row();
+  for (const item of candidates.slice(0, 8)) {
+    const yearLabel = item.date ? item.date.slice(0, 4) : "год неизвестен";
+    keyboard.text(`${item.title} (${yearLabel})`, `movie:${intent.kind}:${item.id}`).row();
   }
 
   await ctx.reply(`нашлось несколько вариантов для «${intent.query}», выбери:`, {
@@ -3411,15 +3490,15 @@ async function handleMovieQuery(ctx, intent) {
   });
 }
 
-// Обработка нажатия на кнопку выбора фильма из меню выше. Как и у
-// setmodel-обработчика — явно передаём управление дальше через next() на
-// чужой префикс, иначе апдейт не дойдёт до крокодила и остальных
-// callback_query-обработчиков дальше по цепочке.
+// Обработка нажатия на кнопку выбора из меню выше. Как и у остальных
+// callback_query-обработчиков в этом файле (см. setmodel/крокодил выше) —
+// явно передаём управление дальше через next() на чужой префикс, иначе
+// апдейт не дойдёт до обработчиков дальше по цепочке.
 bot.on("callback_query:data", async (ctx, next) => {
   const data = ctx.callbackQuery.data;
   if (!data.startsWith("movie:")) return next();
 
-  const movieId = data.slice("movie:".length);
+  const [, kind, id] = data.split(":");
   await ctx.answerCallbackQuery();
 
   const threadId = ctx.callbackQuery.message?.message_thread_id;
@@ -3431,10 +3510,10 @@ bot.on("callback_query:data", async (ctx, next) => {
   try {
     await ctx.deleteMessage();
   } catch (err) {
-    console.error("Не удалось удалить меню выбора фильма:", err.message);
+    console.error("Не удалось удалить меню выбора:", err.message);
   }
 
-  await sendMovieCard(ctx, movieId, { threadId });
+  await sendMovieCard(ctx, kind, id, { threadId });
 });
 
 // ==== Пересказ чата ("о чём тут речь?") ====
