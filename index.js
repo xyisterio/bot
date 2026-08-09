@@ -10,6 +10,16 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY; // опциональ
 const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY; // опционально
 const PORT = process.env.PORT || 3000;
 
+// TMDB (themoviedb.org) — для поиска фильмов по команде "фильм <название>"
+// (см. блок "Поиск фильмов (TMDB)" ниже). Опционально: без ключа бот просто
+// вежливо ответит, что поиск фильмов не настроен, а не упадёт при старте.
+// Ключ (v3 auth, простой api_key-параметр, не Bearer-токен v4) — бесплатно
+// на themoviedb.org/settings/api после регистрации.
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
+if (!TMDB_API_KEY) {
+  console.warn("TMDB_API_KEY не задан — команда поиска фильмов будет отвечать, что функция не настроена");
+}
+
 // Gemini поддерживает НЕСКОЛЬКО ключей (с разных аккаунтов) через запятую в
 // GEMINI_API_KEYS — каждый аккаунт free tier даёт свою отдельную дневную
 // квоту, так что несколько ключей суммарно дают больше запросов в день, не
@@ -3234,6 +3244,194 @@ async function handleWeatherQuery(ctx, intent) {
   }
 }
 
+// ==== Поиск фильмов (TMDB) ====
+// Триггер — "фильм <название>[ год]" (или "кино <название>[ год]"),
+// адресованное боту (та же гейтовая логика, что у погоды/анекдотов — в
+// личке всегда, в группе после имени/реплая/упоминания). Год в конце —
+// опциональный: "фильм Аватар 2009" сразу уточняет поиск и, если под этот
+// год попадает ровно один результат, карточка уходит без меню выбора;
+// без года (или если под указанный год попало несколько фильмов, например
+// ремейки/сиквелы с тем же годом) — динамические кнопки в столбик, как в
+// крокодиле (см. krokodilIdleKeyboard/krokodilActiveKeyboard выше и
+// bot.on("callback_query:data") ниже для "movie:").
+const MOVIE_INTENT_REGEX = /^(?:фильм|кино)\b[:,]?\s*(.+)/i;
+const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500";
+
+function parseMovieIntent(text) {
+  const match = MOVIE_INTENT_REGEX.exec(text.trim());
+  if (!match) return null;
+  let rest = match[1].trim();
+  if (!rest) return null;
+
+  // Год в конце строки — "Аватар 2009" -> query "Аватар", year "2009".
+  // Диапазон 19xx/20xx, чтобы не хватать случайные числа не-годы.
+  let year = null;
+  const yearMatch = rest.match(/(?:^|\s)((?:19|20)\d{2})\s*$/);
+  if (yearMatch) {
+    year = yearMatch[1];
+    rest = rest.slice(0, yearMatch.index).trim();
+  }
+  rest = rest.replace(/[.,!?;:]+$/g, "").trim();
+  if (!rest) return null;
+  return { query: rest, year };
+}
+
+async function searchTmdbMovies(query, year) {
+  const params = new URLSearchParams({
+    api_key: TMDB_API_KEY,
+    query,
+    language: "ru-RU",
+    include_adult: "false",
+  });
+  if (year) params.set("year", year);
+  const url = `https://api.themoviedb.org/3/search/movie?${params.toString()}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`tmdb search: ${res.status}`);
+  const data = await res.json();
+  return data.results || [];
+}
+
+async function fetchTmdbMovieDetails(id) {
+  const url = `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_API_KEY}&language=ru-RU`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`tmdb details: ${res.status}`);
+  return res.json();
+}
+
+// Экранирование под parse_mode: "HTML" — набор спецсимволов у Telegram тут
+// значительно меньше, чем у Markdown (только &, <, >), поэтому безопаснее
+// для произвольного текста описания фильма с TMDB, чем ручное экранирование
+// звёздочек/подчёркиваний markdown.
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Собирает и отправляет карточку фильма (постер + подпись) по id TMDB.
+// threadId — id темы группового чата (проброс из исходного сообщения или
+// из callback_query, см. вызовы ниже), replyToMessageId — опционально,
+// на какое сообщение отвечать (не используется при отправке из callback,
+// там это уже не нужно — старое меню к этому моменту удалено/отредактировано).
+async function sendMovieCard(ctx, movieId, { threadId, replyToMessageId } = {}) {
+  let movie;
+  try {
+    movie = await fetchTmdbMovieDetails(movieId);
+  } catch (err) {
+    console.error("Ошибка получения карточки фильма TMDB:", err.message);
+    await ctx.reply("не получилось загрузить карточку фильма, TMDB сейчас недоступен — попробуй позже");
+    return;
+  }
+
+  const year = movie.release_date ? movie.release_date.slice(0, 4) : "";
+  const rating = movie.vote_average ? movie.vote_average.toFixed(1) : null;
+  const genres = (movie.genres || []).map((g) => g.name).join(", ");
+
+  let caption = `<b>${escapeHtml(movie.title)}</b>${year ? ` (${year})` : ""}\n`;
+  if (rating) caption += `⭐ ${rating}/10 на TMDB\n`;
+  if (genres) caption += `🎬 ${genres}\n`;
+  // Лимит подписи к фото у Telegram — 1024 символа, оставляем запас под
+  // остальные строки выше (название/рейтинг/жанры).
+  if (movie.overview) {
+    let overview = escapeHtml(movie.overview);
+    if (overview.length > 800) overview = `${overview.slice(0, 800)}…`;
+    caption += `\n${overview}`;
+  } else {
+    caption += `\nописания нет`;
+  }
+
+  const opts = { parse_mode: "HTML", message_thread_id: threadId };
+  if (replyToMessageId) opts.reply_parameters = { message_id: replyToMessageId };
+
+  if (movie.poster_path) {
+    await ctx.replyWithPhoto(`${TMDB_IMAGE_BASE}${movie.poster_path}`, { ...opts, caption });
+  } else {
+    // Постера нет — шлём тем же форматированием обычным текстом.
+    await ctx.reply(caption, opts);
+  }
+}
+
+async function handleMovieQuery(ctx, intent) {
+  if (!TMDB_API_KEY) {
+    await ctx.reply("поиск фильмов сейчас не настроен — не задан TMDB_API_KEY");
+    return;
+  }
+
+  await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+
+  let results;
+  try {
+    results = await searchTmdbMovies(intent.query, intent.year);
+  } catch (err) {
+    console.error("Ошибка поиска фильма TMDB:", err.message);
+    await ctx.reply("не получилось поискать фильм, TMDB сейчас недоступен — попробуй позже");
+    return;
+  }
+
+  if (!results.length) {
+    await ctx.reply(`не нашёл фильм «${intent.query}»${intent.year ? ` (${intent.year})` : ""}`);
+    return;
+  }
+
+  // Если год указан и под него попадает хотя бы один результат — сужаем
+  // выборку до этого года (TMDB и без этого фильтрует не строго).
+  let candidates = results;
+  if (intent.year) {
+    const sameYear = results.filter((m) => (m.release_date || "").startsWith(intent.year));
+    if (sameYear.length) candidates = sameYear;
+  }
+
+  if (candidates.length === 1) {
+    await sendMovieCard(ctx, candidates[0].id, {
+      threadId: ctx.message.message_thread_id,
+      replyToMessageId: ctx.message.message_id,
+    });
+    return;
+  }
+
+  // Несколько вариантов — динамические кнопки в столбик (по одной в ряд),
+  // как в крокодиле. Ограничиваем 8 штуками, чтобы меню не разрасталось —
+  // дальше по релевантности TMDB это обычно уже совсем не то, что искали.
+  const keyboard = new InlineKeyboard();
+  for (const movie of candidates.slice(0, 8)) {
+    const yearLabel = movie.release_date ? movie.release_date.slice(0, 4) : "год неизвестен";
+    keyboard.text(`${movie.title} (${yearLabel})`, `movie:${movie.id}`).row();
+  }
+
+  await ctx.reply(`нашлось несколько вариантов для «${intent.query}», выбери:`, {
+    reply_markup: keyboard,
+    reply_parameters: { message_id: ctx.message.message_id },
+    message_thread_id: ctx.message.message_thread_id,
+  });
+}
+
+// Обработка нажатия на кнопку выбора фильма из меню выше. Как и у
+// setmodel-обработчика — явно передаём управление дальше через next() на
+// чужой префикс, иначе апдейт не дойдёт до крокодила и остальных
+// callback_query-обработчиков дальше по цепочке.
+bot.on("callback_query:data", async (ctx, next) => {
+  const data = ctx.callbackQuery.data;
+  if (!data.startsWith("movie:")) return next();
+
+  const movieId = data.slice("movie:".length);
+  await ctx.answerCallbackQuery();
+
+  const threadId = ctx.callbackQuery.message?.message_thread_id;
+
+  // Убираем меню выбора — по запросу удаляем само сообщение с кнопками
+  // целиком (а не просто снимаем клавиатуру), чтобы вместо него сразу шла
+  // карточка. Если удалить не вышло (например, прошло больше 48 часов —
+  // Telegram такое не даёт удалить ботам), тихо оставляем меню как есть.
+  try {
+    await ctx.deleteMessage();
+  } catch (err) {
+    console.error("Не удалось удалить меню выбора фильма:", err.message);
+  }
+
+  await sendMovieCard(ctx, movieId, { threadId });
+});
+
 // ==== Пересказ чата ("о чём тут речь?") ====
 // Отдельная механика поверх ChatLog (см. pushChatLog выше): пользователь
 // просит вкратце пересказать последние N сообщений в группе — например
@@ -3859,6 +4057,16 @@ bot.on("message:text", async (ctx) => {
   const weatherIntent = parseWeatherIntent(stripNameTrigger(rawText));
   if (weatherIntent) {
     await handleWeatherQuery(ctx, weatherIntent);
+    return;
+  }
+
+  // ==== Поиск фильмов ("Женя, фильм Аватар 2009") ====
+  // Проверяем в том же месте, что и погоду/анекдоты — до шахмат/шашек и
+  // обычного чата, по той же причине (иначе может перехватиться как
+  // попытка хода в незавершённой партии).
+  const movieIntent = parseMovieIntent(stripNameTrigger(rawText));
+  if (movieIntent) {
+    await handleMovieQuery(ctx, movieIntent);
     return;
   }
 
