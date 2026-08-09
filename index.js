@@ -1940,7 +1940,7 @@ function krokodilDifficultyKeyboard() {
 
 function krokodilActiveKeyboard() {
   return new InlineKeyboard()
-    .text("👁 Показать слово", "krokodil:show")
+    .text("Показать слово", "krokodil:show")
     .text("🔄 Другое слово", "krokodil:reroll")
     .row()
     .text("🏳 Сдаюсь", "krokodil:giveup");
