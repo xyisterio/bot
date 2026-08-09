@@ -369,6 +369,28 @@ function stripNameTrigger(text) {
   return text.replace(nameTriggerRegex, "").trim();
 }
 
+// Как stripNameTrigger, но также срезает явное упоминание бота через
+// @username, если обратились именно так (а не по имени). Нужен для
+// intent-парсеров ниже (анекдоты/погода/фильмы/пересказ) — они анкорены к
+// началу строки, а stripNameTrigger сам по себе вырезает только "Женя, ...".
+// Без этой функции "@EVGEN1Y_VBOT фильм Аватар 2009" так и оставался бы с
+// тегом в начале строки, ни один из этих intent-регэкспов не совпадал бы,
+// и сообщение молча уходило в обычный LLM-чат вместо нужного обработчика.
+function stripBotAddressing(text, ctx) {
+  if (nameTriggerRegex.test(text)) return stripNameTrigger(text);
+
+  const mentionEntity = ctx.message.entities?.find(
+    (e) =>
+      e.type === "mention" &&
+      text.substring(e.offset, e.offset + e.length).toLowerCase() === `@${ctx.me.username?.toLowerCase()}`
+  );
+  if (mentionEntity) {
+    return (text.slice(0, mentionEntity.offset) + text.slice(mentionEntity.offset + mentionEntity.length)).trim();
+  }
+
+  return text.trim(); // не по имени и не по тегу (например, реплай на бота) — просто трим
+}
+
 // ==== Тег настоящего Жени в Telegram ====
 // Если кто-то в группе зовёт именно его через @username (а не бота по имени),
 // бот тоже реагирует — но не как на прямое обращение к себе, а "встревая"
@@ -4128,7 +4150,7 @@ bot.on("message:text", async (ctx) => {
   // пробуем свежий анекдот с внешнего источника, при неудаче/пустом
   // ответе тихо уходим на курируемую базу (см. getJoke/JOKES выше).
   // Модель на такую просьбу обычно выдумывает несмешную ерунду.
-  if (isJokeRequest(stripNameTrigger(rawText))) {
+  if (isJokeRequest(stripBotAddressing(rawText, ctx))) {
     await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
     await ctx.reply(await getJoke(chatId), { reply_parameters: { message_id: ctx.message.message_id } });
     return;
@@ -4138,7 +4160,7 @@ bot.on("message:text", async (ctx) => {
   // Проверяем ДО шахмат/шашек и обычного чата — сработавший запрос
   // погоды отвечает сразу через API, а не через LLM (даты/проценты
   // осадков модель может просто выдумать).
-  const weatherIntent = parseWeatherIntent(stripNameTrigger(rawText));
+  const weatherIntent = parseWeatherIntent(stripBotAddressing(rawText, ctx));
   if (weatherIntent) {
     await handleWeatherQuery(ctx, weatherIntent);
     return;
@@ -4148,7 +4170,7 @@ bot.on("message:text", async (ctx) => {
   // Проверяем в том же месте, что и погоду/анекдоты — до шахмат/шашек и
   // обычного чата, по той же причине (иначе может перехватиться как
   // попытка хода в незавершённой партии).
-  const movieIntent = parseMovieIntent(stripNameTrigger(rawText));
+  const movieIntent = parseMovieIntent(stripBotAddressing(rawText, ctx));
   if (movieIntent) {
     await handleMovieQuery(ctx, movieIntent);
     return;
@@ -4159,7 +4181,7 @@ bot.on("message:text", async (ctx) => {
   // личке пересказывать нечего (там и так вся история — это диалог с
   // самим ботом). Отвечает не через обычный askLLM/историю чата, а через
   // отдельный askRecapLLM на основе лога сообщений — см. handleRecapQuery.
-  if (isGroup && RECAP_INTENT_REGEX.test(stripNameTrigger(rawText))) {
+  if (isGroup && RECAP_INTENT_REGEX.test(stripBotAddressing(rawText, ctx))) {
     await handleRecapQuery(ctx, chatId, parseRecapCount(rawText));
     return;
   }
