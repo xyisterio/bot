@@ -3403,6 +3403,29 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;");
 }
 
+// ==== Кэш отправленных карточек фильмов/сериалов по message_id ====
+// Нужен для реплаев вида "как он тебе?" на карточку — см. блок "Ответ на
+// карточку фильма/сериала" в bot.on("message:text"). Карточки шлются в
+// обход askLLM, так что без этого кэша модель не знала бы, о каком именно
+// тайтле речь. Тот же паттерн, что и у photoCaptionsByMessage выше — живёт
+// только в памяти процесса, при рестарте бота просто начнёт заполняться
+// заново, ничего критичного.
+const MOVIE_CARD_CACHE_LIMIT = 500;
+const movieCardsByMessage = new Map(); // `${chatId}:${messageId}` -> { kindLabel, title, year, rating, genres, summary }
+
+function rememberMovieCard(chatId, messageId, card) {
+  const key = `${chatId}:${messageId}`;
+  movieCardsByMessage.set(key, card);
+  if (movieCardsByMessage.size > MOVIE_CARD_CACHE_LIMIT) {
+    const oldestKey = movieCardsByMessage.keys().next().value;
+    movieCardsByMessage.delete(oldestKey);
+  }
+}
+
+function getMovieCard(chatId, messageId) {
+  return movieCardsByMessage.get(`${chatId}:${messageId}`) || null;
+}
+
 // Собирает и отправляет карточку (постер + подпись) по id и kind TMDB.
 // threadId — id темы группового чата (проброс из исходного сообщения или
 // из callback_query, см. вызовы ниже), replyToMessageId — опционально, на
@@ -3441,12 +3464,29 @@ async function sendMovieCard(ctx, kind, id, { threadId, replyToMessageId } = {})
   const opts = { parse_mode: "HTML", message_thread_id: threadId };
   if (replyToMessageId) opts.reply_parameters = { message_id: replyToMessageId };
 
+  let sentMessage;
   if (item.posterPath) {
-    await ctx.replyWithPhoto(`${TMDB_IMAGE_BASE}${item.posterPath}`, { ...opts, caption });
+    sentMessage = await ctx.replyWithPhoto(`${TMDB_IMAGE_BASE}${item.posterPath}`, { ...opts, caption });
   } else {
     // Постера нет — шлём тем же форматированием обычным текстом.
-    await ctx.reply(caption, opts);
+    sentMessage = await ctx.reply(caption, opts);
   }
+
+  // Короткая сводка (без HTML-разметки) для будущего реплая — см.
+  // getMovieCard выше и блок "Ответ на карточку фильма/сериала" в
+  // bot.on("message:text"). Отдельно от caption, потому что там HTML и
+  // более длинный лимит на подпись к фото, а тут это просто кусок будущего
+  // промпта для LLM.
+  let summary = (item.overview || "").trim();
+  if (summary.length > 500) summary = `${summary.slice(0, 500)}…`;
+  rememberMovieCard(ctx.chat.id, sentMessage.message_id, {
+    kindLabel: kind === "tv" ? "сериал" : "фильм",
+    title: item.title,
+    year,
+    rating,
+    genres,
+    summary,
+  });
 }
 
 function kindNoun(kind, animated) {
@@ -4142,6 +4182,24 @@ bot.on("message:text", async (ctx) => {
         const photoCaption = (match && match[1]) || photoEntry.text.replace(/^\[фото\]\s*/, "");
         userText = `[в чате недавно было фото от ${photoEntry.name}: ${photoCaption}] ${userText}`;
       }
+    }
+  }
+
+  // ==== Ответ на карточку фильма/сериала ("как он тебе?" реплаем) ====
+  // Карточки из sendMovieCard отправляются напрямую (в обход askLLM), так
+  // что в обычную историю диалога не попадают — без этого блока модель на
+  // "как он тебе?" реплаем на карточку понятия не имела бы, о каком именно
+  // фильме речь. В отличие от repliedTag выше (только для группы и только
+  // для чужих сообщений) — этот работает и в группе, и в личке, потому что
+  // тут всегда реплай именно на СВОЁ (ботовское) сообщение.
+  if (ctx.message.reply_to_message?.from?.id === ctx.me.id) {
+    const movieCard = getMovieCard(chatId, ctx.message.reply_to_message.message_id);
+    if (movieCard) {
+      const parts = [`${movieCard.kindLabel} «${movieCard.title}»${movieCard.year ? ` (${movieCard.year})` : ""}`];
+      if (movieCard.rating) parts.push(`рейтинг ${movieCard.rating}/10 на TMDB`);
+      if (movieCard.genres) parts.push(`жанры: ${movieCard.genres}`);
+      if (movieCard.summary) parts.push(`описание: ${movieCard.summary}`);
+      userText = `[бот ранее прислал карточку — ${parts.join(", ")}] ${userText}`;
     }
   }
 
