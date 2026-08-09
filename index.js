@@ -3254,7 +3254,12 @@ async function handleWeatherQuery(ctx, intent) {
 // ремейки/сиквелы с тем же годом) — динамические кнопки в столбик, как в
 // крокодиле (см. krokodilIdleKeyboard/krokodilActiveKeyboard выше и
 // bot.on("callback_query:data") ниже для "movie:").
-const MOVIE_INTENT_REGEX = /^(?:фильм|кино)\b[:,]?\s*(.+)/i;
+// ВАЖНО: не \b — в JS \b завязан на \w, который не включает кириллицу,
+// поэтому \b после кириллической буквы никогда не срабатывает (та же
+// проблема разобрана в комментарии к nameTriggerRegex выше). Вместо этого
+// негативный lookahead: следующий символ не должен быть кириллической
+// буквой (чтобы "фильммания" не матчилось как триггер "фильм").
+const MOVIE_INTENT_REGEX = /^(?:фильм|кино)(?![а-яёА-ЯЁ])[:,]?\s*(.+)/i;
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500";
 
 function parseMovieIntent(text) {
