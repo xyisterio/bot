@@ -4455,9 +4455,11 @@ bot.on("message:text", async (ctx) => {
     // триггер-фразе. Более точечные вызовы replyWithChatAction("typing")
     // ниже по коду не мешают — Telegram просто продлевает уже показанный
     // статус ещё на ~5 секунд.
+    console.log(`[typing] fire isReplyToBot=${isReplyToBot} startsWithName=${startsWithName} isMentioned=${isMentioned}`);
     ctx
       .replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id })
-      .catch(() => {});
+      .then(() => console.log("[typing] ok"))
+      .catch((err) => console.error("[typing] FAILED:", err.description ?? err.message ?? err));
 
     if (startsWithName) {
       userText = stripNameTrigger(userText);
