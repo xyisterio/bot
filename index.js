@@ -4447,6 +4447,28 @@ bot.on("message:text", async (ctx) => {
   updateGenderGuess(chatId, ctx.from, ctx.message.text);
   const gender = getGender(chatId, ctx.from.id);
 
+  // ==== "Доброе утро" — реакция ❤️ + ответный текст, только для женского
+  // пола. Срабатывает на само приветствие в любом месте сообщения
+  // ("доброе утро", "доброго утра" и т.п.), без учёта регистра и буквы ё.
+  // Если пол мужской или ещё не определён — не срабатывает вообще (см.
+  // просьбу — мужикам ни лайков, ни ответа). Останавливаем обработку этим
+  // же сообщением дальше, чтобы не пришёл ещё и обычный LLM-ответ поверх.
+  {
+    const normalizedForMorning = userText.toLowerCase().replace(/ё/g, "е");
+    if (gender === "f" && /добр(ое|ого)\s+утр[оа]/.test(normalizedForMorning)) {
+      await ctx.api
+        .setMessageReaction(chatId, ctx.message.message_id, [{ type: "emoji", emoji: "❤" }])
+        .catch((err) => console.error("Не удалось поставить реакцию на 'доброе утро':", err));
+      await ctx
+        .reply("доброе утро", {
+          reply_parameters: { message_id: ctx.message.message_id },
+          message_thread_id: ctx.message.message_thread_id,
+        })
+        .catch((err) => console.error("Не удалось ответить на 'доброе утро':", err));
+      return;
+    }
+  }
+
   // Стёб по триггерным фразам — срабатывает независимо от того,
   // обращались ли к боту напрямую. Блок выбирается по полу отправителя:
   // мужчины -> MALE_BANTER_TRIGGERS/"banter_male", женщины ->
