@@ -423,9 +423,21 @@ function isOwner(ctx) {
 }
 
 // ==== Утилиты для отправки статуса "печатает..." ====
-// Возвращает ID темы (message_thread_id) с учётом fallback на реплай-сообщение
+// Возвращает ID темы (message_thread_id), если сообщение отправлено в топик форум-группы.
+// НЕ использует fallback на reply_to_message, так как в обычных чатах/дискуссиях
+// там может оказаться ID поста/сообщения, приводивший к ошибке Telegram API
+// "400 Bad Request: message thread not found" при вызове replyWithChatAction на реплаях.
 function getThreadId(ctx) {
-  return ctx.message?.message_thread_id ?? ctx.message?.reply_to_message?.message_thread_id;
+  return ctx.message?.message_thread_id;
+}
+
+// Проверяет, является ли сообщение реплаем на сообщение бота
+function isReplyToBot(ctx) {
+  const repliedFrom = ctx.message?.reply_to_message?.from;
+  if (!repliedFrom) return false;
+  if (ctx.me?.id && repliedFrom.id === ctx.me.id) return true;
+  if (repliedFrom.is_bot && ctx.me?.username && repliedFrom.username?.toLowerCase() === ctx.me.username.toLowerCase()) return true;
+  return false;
 }
 
 // Отправляет статус "печатает..." в нужный тред чата
@@ -4148,8 +4160,8 @@ async function captionPhoto(ctx, fileId) {
 bot.on(["message:audio", "message:voice"], async (ctx) => {
   const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
   if (isGroup) {
-    const isReplyToBot = ctx.message.reply_to_message?.from?.id === ctx.me.id;
-    if (!isReplyToBot) return;
+    const isReply = isReplyToBot(ctx);
+    if (!isReply) return;
   }
 
   const stickerId = pickSticker("music");
@@ -4212,7 +4224,7 @@ bot.on("message:photo", async (ctx) => {
   // для обычных текстовых сообщений (см. bot.on("message:text")), только
   // источник текста — caption, а не сам текст сообщения (у фото его нет).
   const captionText = ctx.message.caption || "";
-  const isReplyToBot = ctx.message.reply_to_message?.from?.id === ctx.me.id;
+  const isReply = isReplyToBot(ctx);
   const isMentioned =
     ctx.message.caption_entities?.some(
       (e) =>
@@ -4220,7 +4232,7 @@ bot.on("message:photo", async (ctx) => {
         captionText.substring(e.offset, e.offset + e.length).toLowerCase() ===
           `@${ctx.me.username?.toLowerCase()}`
     ) ?? false;
-  const toBot = nameTriggerRegex.test(captionText) || isReplyToBot || isMentioned || ownerMentionRegex.test(captionText);
+  const toBot = nameTriggerRegex.test(captionText) || isReply || isMentioned || ownerMentionRegex.test(captionText);
 
   // Пересланное фото (мем/новость из канала) — если оно НЕ адресовано боту
   // явно, вообще не гоняем его через vision-модель: это самый частый
@@ -4448,8 +4460,7 @@ bot.on("message:text", async (ctx) => {
     // 3) бота явно упомянули через @username
     // 4) кто-то позвал настоящего Женю через его тег в Telegram (@EVGEN1Y_V)
     const startsWithName = nameTriggerRegex.test(userText);
-    const isReplyToBot =
-      ctx.message.reply_to_message?.from?.id === ctx.me.id;
+    const isReply = isReplyToBot(ctx);
     const isMentioned =
       ctx.message.entities?.some(
         (e) =>
@@ -4459,7 +4470,7 @@ bot.on("message:text", async (ctx) => {
             .toLowerCase() === `@${ctx.me.username?.toLowerCase()}`
       ) ?? false;
     const isOwnerMentioned = ownerMentionRegex.test(userText);
-    const isAddressedToBot = startsWithName || isReplyToBot || isMentioned || isOwnerMentioned;
+    const isAddressedToBot = startsWithName || isReply || isMentioned || isOwnerMentioned;
 
     // Пишем сообщение в лог чата (см. pushChatLog) ДО фильтра "не наше
     // сообщение — молчим" ниже — иначе в лог попадали бы только реплики,
@@ -4484,7 +4495,7 @@ bot.on("message:text", async (ctx) => {
     // триггер-фразе. Более точечные вызовы replyWithChatAction("typing")
     // ниже по коду не мешают — Telegram просто продлевает уже показанный
     // статус ещё на ~5 секунд.
-    console.log(`[typing] fire isReplyToBot=${isReplyToBot} startsWithName=${startsWithName} isMentioned=${isMentioned}`);
+    console.log(`[typing] fire isReply=${isReply} startsWithName=${startsWithName} isMentioned=${isMentioned}`);
     sendTypingAction(ctx);
 
     if (startsWithName) {
@@ -4527,7 +4538,7 @@ bot.on("message:text", async (ctx) => {
 
     // Если позвали именно тег настоящего Жени (а не по имени/реплаем на
     // бота) — добавляем метку-подсказку, см. пояснение в SYSTEM_PROMPT.
-    if (isOwnerMentioned && !startsWithName && !isReplyToBot && !isMentioned) {
+    if (isOwnerMentioned && !startsWithName && !isReply && !isMentioned) {
       userText = `[позвали через тег настоящего Жени @${OWNER_USERNAME}] ${userText}`;
     }
 
@@ -4542,7 +4553,7 @@ bot.on("message:text", async (ctx) => {
     // лимит TPM на пачках пересланных мемов).
     const repliedTo = ctx.message.reply_to_message;
     let repliedTag = "";
-    if (repliedTo && repliedTo.from?.id !== ctx.me.id) {
+    if (repliedTo && !isReplyToBot(ctx)) {
       const repliedName = getDisplayName(chatId, repliedTo.from);
 
       if (repliedTo.photo) {
@@ -4721,7 +4732,7 @@ bot.on("message:text", async (ctx) => {
   // фильме речь. В отличие от repliedTag выше (только для группы и только
   // для чужих сообщений) — этот работает и в группе, и в личке, потому что
   // тут всегда реплай именно на СВОЁ (ботовское) сообщение.
-  if (ctx.message.reply_to_message?.from?.id === ctx.me.id) {
+  if (isReplyToBot(ctx)) {
     const movieCard = getMovieCard(chatId, ctx.message.reply_to_message.message_id);
     if (movieCard) {
       const parts = [`${movieCard.kindLabel} «${movieCard.title}»${movieCard.year ? ` (${movieCard.year})` : ""}`];
@@ -5212,15 +5223,13 @@ bot.on("message:text", async (ctx) => {
   }
 
   try {
-    sendTypingAction(ctx);
-
-    // Groq отвечает быстро, так что подтягиваем ответ параллельно с "печатает..."
-    const replyPromise = askLLM(chatId, userText);
-
-    const { text: reply, stickerKey } = await replyPromise;
-
-    // держим typing включенным нужное время, чтобы не было мгновенного ответа
-    await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
+    let reply, stickerKey;
+    await withTyping(ctx, async () => {
+      const res = await askLLM(chatId, userText);
+      reply = res.text;
+      stickerKey = res.stickerKey;
+      await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
+    });
 
     // Если явная фраза уже вызвала стикер по regex выше — не дублируем
     // ещё одним стикером от тега модели на то же сообщение.
