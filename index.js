@@ -33,6 +33,9 @@ const GEMINI_API_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_K
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан в переменных окружения");
 if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY не задан в переменных окружения");
 
+// ID бота, полученный напрямую из токена (гарантированно существует до выполнения любых запросов)
+const BOT_ID = Number(BOT_TOKEN.split(":")[0]) || null;
+
 // ==== Персистентность (Upstash Redis) ====
 // Без этого вся память (история переписки, алиасы, пол, индекс юзернеймов,
 // активная модель) хранится только в оперативной памяти процесса и
@@ -433,18 +436,34 @@ function getThreadId(ctx) {
 
 // Проверяет, является ли сообщение реплаем на сообщение бота
 function isReplyToBot(ctx) {
-  const repliedFrom = ctx.message?.reply_to_message?.from;
-  if (!repliedFrom) return false;
-  if (ctx.me?.id && repliedFrom.id === ctx.me.id) return true;
-  if (repliedFrom.is_bot && ctx.me?.username && repliedFrom.username?.toLowerCase() === ctx.me.username.toLowerCase()) return true;
+  const repliedTo = ctx.message?.reply_to_message;
+  if (!repliedTo) return false;
+
+  const repliedFrom = repliedTo.from;
+  if (repliedFrom) {
+    if (BOT_ID && repliedFrom.id === BOT_ID) return true;
+    if (ctx.me?.id && repliedFrom.id === ctx.me.id) return true;
+    if (repliedFrom.is_bot && ctx.me?.username && repliedFrom.username?.toLowerCase() === ctx.me.username.toLowerCase()) return true;
+    if (repliedFrom.is_bot && ctx.me?.first_name && repliedFrom.first_name === ctx.me.first_name) return true;
+  }
+
+  // Проверяем локальный кэш бота по message_id (ответы бота / карточки фильмов)
+  const chatId = ctx.chat?.id;
+  if (chatId && repliedTo.message_id) {
+    if (getBotReply(chatId, repliedTo.message_id) || getMovieCard(chatId, repliedTo.message_id)) {
+      return true;
+    }
+  }
+
   return false;
 }
 
 // Отправляет статус "печатает..." в нужный тред чата
 function sendTypingAction(ctx) {
+  if (!ctx.chat?.id) return Promise.resolve();
   const threadId = getThreadId(ctx);
   const opts = threadId ? { message_thread_id: threadId } : {};
-  return ctx.replyWithChatAction("typing", opts).catch((err) =>
+  return ctx.api.sendChatAction(ctx.chat.id, "typing", opts).catch((err) =>
     console.error("[typing] FAILED:", err.description ?? err.message ?? err)
   );
 }
@@ -4243,6 +4262,10 @@ bot.on("message:photo", async (ctx) => {
   const forwarded = isForwardedMessage(ctx.message);
   if (forwarded && !toBot) {
     return;
+  }
+
+  if (toBot) {
+    sendTypingAction(ctx);
   }
 
   let caption;
