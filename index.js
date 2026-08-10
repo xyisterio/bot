@@ -4400,6 +4400,16 @@ bot.on("message:text", async (ctx) => {
   // (в проверке RECAP_INTENT_REGEX).
   let repliedToHandled = false;
 
+  // В личке бот отвечает на вообще любое сообщение — показываем "печатает"
+  // сразу, не дожидаясь того, в какую конкретно ветку (шутка/погода/фильм/
+  // обычный чат) уйдёт обработка. Не await — это просто индикатор, ждать
+  // его не нужно, а ошибку (например нет прав в чате) тихо проглатываем.
+  if (!isGroup) {
+    ctx
+      .replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id })
+      .catch(() => {});
+  }
+
   if (isGroup) {
     rememberUsername(chatId, ctx.from);
 
@@ -4435,6 +4445,19 @@ bot.on("message:text", async (ctx) => {
     if (!isAddressedToBot) {
       return; // не наше сообщение — молчим
     }
+
+    // Показываем "печатает" сразу, как только поняли, что сообщение
+    // адресовано боту — неважно, обращением по имени, реплаем на бота,
+    // упоминанием через @username или тегом настоящего Жени. Раньше
+    // индикатор запускался только внутри конкретных веток обработки
+    // (шутка/погода/фильм/обычный LLM-чат) — на реплае без имени триггера
+    // это визуально выглядело так, будто "печатает" бывает только по
+    // триггер-фразе. Более точечные вызовы replyWithChatAction("typing")
+    // ниже по коду не мешают — Telegram просто продлевает уже показанный
+    // статус ещё на ~5 секунд.
+    ctx
+      .replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id })
+      .catch(() => {});
 
     if (startsWithName) {
       userText = stripNameTrigger(userText);
