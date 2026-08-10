@@ -350,6 +350,7 @@ const SYSTEM_PROMPT = `
 - Метка вида "[голосовое от Имя — речь не распознана, тишина или шум]", "[аудиофайл от Имя — текст не распознан...]" или "...расшифровать его не получилось из-за технической ошибки" — значит расшифровать нечего или не вышло технически. Для аудиофайла это часто просто означает, что трек инструментальный (без вокала) — если в метке есть исполнитель и название, можешь опираться хотя бы на них. Так и скажи по-своему (не разобрал речь / не смог расслушать), не выдумывай, что там могло быть сказано.
 - Перед сообщением иногда может стоять метка вида "[в чате недавно было фото от Имя: описание]" — это НЕ реплай: собеседник прямо спросил тебя про какое-то фото в чате словами (например "как тебе фото кота в чате?"), не отвечая на конкретное сообщение с ним, и ты нашёл в логе чата подходящее фото под описание. Отвечай по существу вопроса, опираясь на это описание, как будто ты сам это фото видел в чате. Если по тексту вопроса видно, что найденное фото явно не то, о котором спрашивают (не совпадает с тем, что человек описывает) — не притворяйся, что видел именно то, о котором он спрашивает, а честно скажи, что не помнишь такого. Саму метку никогда не комментируй и не упоминай вслух.
 - Перед сообщением иногда может стоять метка вида "[позвали через тег настоящего Жени @EVGEN1Y_V]" — значит человек в группе обращался не к тебе по имени, а тегнул именно настоящего Женю (реального человека), чтобы позвать его самого. В этом случае не отвечай так, будто обращение было прямо к тебе — сначала естественно дай понять, что настоящий Женя сейчас недоступен и ты вместо него ответишь. Делай это КОРОТКО и без конкретики — Женя вообще сдержанно говорит о себе и не любит рассказывать подробности того, чем занят. Не выдумывай, что именно он делает, где он и почему недоступен — максимум расплывчато: "занят", "не сейчас", "потом сам ответит", вариации этого своими словами, без деталей и без легенды. Дальше можешь ответить по сути вопроса в своей обычной манере, если есть что сказать. Саму метку никогда не комментируй и не упоминай вслух.
+- Перед сообщением иногда может стоять метка вида "[бот ранее прислал карточку — фильм «Название» (год), рейтинг X/10 на TMDB, жанры: ..., описание: ...]" — значит собеседник ответил (реплаем) именно на твою же ранее отправленную карточку фильма/сериала (постер с описанием), например коротким "ну такое", "как тебе?", "не смотрел", "стоит глянуть?". Это ГЛАВНЫЙ контекст для ответа — отвечай по существу именно про этот фильм/сериал (жанр, рейтинг, сюжет по описанию), а не про что-то из более раннего разговора в чате, даже если тема разговора недавно была другой. Если человек написал коротко и неоднозначно ("ну такое", "фу", "огонь") — трактуй это как оценку именно этого фильма/сериала и отреагируй на неё (согласись/поспорь/уточни, почему), а не уходи в отвлечённые рассуждения не по теме. Саму метку никогда не комментируй и не упоминай вслух.
 - Пиши только на русском.
 - Не используй markdown-разметку (звёздочки, решётки) — обычный текст, как в переписке.
 - Отвечай ОДНИМ финальным вариантом реплики. Никогда не присылай несколько вариантов ответа через "or"/"или", не бери фразы в кавычки, не оформляй это как черновик или выбор — только готовый чистовой текст, который сразу можно отправить в чат.
@@ -681,11 +682,32 @@ async function saveChatLog(chatId) {
 
 // toBot — было ли сообщение обращением к боту (по имени/реплаем/тегом) —
 // нужно, чтобы при пересказе отдельно отметить "общался(-ась) с ботом о...".
-function pushChatLog(chatId, name, text, toBot) {
+// event — необязательная пометка "join"/"leave" для служебных записей о
+// входе/выходе участников (см. pushChatLog ниже и bot.on(["message:new_chat_members", ...]))
+// — нужна, чтобы при сборке транскрипта для пересказа (handleRecapQuery)
+// отличать их от обычных реплик и форматировать отдельной строкой.
+function pushChatLog(chatId, name, text, toBot, event) {
   const log = getChatLog(chatId);
-  log.push({ name, text, ts: Date.now(), toBot: !!toBot });
+  const entry = { name, text, ts: Date.now(), toBot: !!toBot };
+  if (event) entry.event = event;
+  log.push(entry);
   while (log.length > CHAT_LOG_LIMIT) log.shift();
   saveChatLog(chatId);
+}
+
+// Формирует текст события входа/выхода с согласованием рода, если он
+// известен (см. getGender) — по тому же принципу, что и остальные
+// гендерно-согласованные фразы в боте (см. "угадал(а)" в крокодиле): если
+// пол неизвестен, используем нейтральную форму "(-ла)" как хедж.
+function joinLeaveText(name, gender, type) {
+  if (type === "join") {
+    if (gender === "f") return `${name} зашла в чат`;
+    if (gender === "m") return `${name} зашёл в чат`;
+    return `${name} зашёл(-ла) в чат`;
+  }
+  if (gender === "f") return `${name} вышла из чата`;
+  if (gender === "m") return `${name} вышел из чата`;
+  return `${name} вышел(-ла) из чата`;
 }
 
 // ==== Кэш описаний фото по message_id ====
@@ -712,6 +734,32 @@ function rememberPhotoCaption(chatId, messageId, name, caption) {
 
 function getPhotoCaption(chatId, messageId) {
   return photoCaptionsByMessage.get(`${chatId}:${messageId}`) || null;
+}
+
+// ==== Кэш собственных текстовых ответов бота по message_id ====
+// Нужен для реплаев на СТАРЫЙ ответ бота — например, человек 2 отвечает
+// репликой на сообщение, которым бот когда-то ответил человеку 1. Обычная
+// HISTORY (см. history:${chatId} в askLLM) хранит только последние 12 реплик
+// на весь чат без привязки к message_id, так что если между тем ответом и
+// текущим реплаем было много другого трёпа — бот физически не видит, что
+// сам написал, и отвечает вслепую. Тот же паттерн, что и у
+// photoCaptionsByMessage/movieCardsByMessage выше — живёт только в памяти
+// процесса, при рестарте начнёт заполняться заново, ничего критичного.
+const BOT_REPLY_CACHE_LIMIT = 500;
+const botRepliesByMessage = new Map(); // `${chatId}:${messageId}` -> { name, text }
+
+function rememberBotReply(chatId, messageId, name, text) {
+  if (!messageId || !text) return;
+  const key = `${chatId}:${messageId}`;
+  botRepliesByMessage.set(key, { name, text });
+  if (botRepliesByMessage.size > BOT_REPLY_CACHE_LIMIT) {
+    const oldestKey = botRepliesByMessage.keys().next().value;
+    botRepliesByMessage.delete(oldestKey);
+  }
+}
+
+function getBotReply(chatId, messageId) {
+  return botRepliesByMessage.get(`${chatId}:${messageId}`) || null;
 }
 
 // ==== Пересланные сообщения (мемы/новости из других каналов) ====
@@ -3662,7 +3710,9 @@ const RECAP_SYSTEM_PROMPT = `Тебе дана выгрузка последни
 - Если человек за это время в основном (или только) переписывался с ботом, а не с остальными — сделай по нему отдельный короткий пункт вида "Имя общался(-ась) с ботом о том-то", не пересказывая ответы бота подробно.
 - Мелкие технические реплики (одно слово, эмодзи, "+1" и т.п.) не заслуживают отдельного пункта — просто пропускай их.
 - Игры (крокодил, шахматы, шашки, игры через других ботов — их реплики в выгрузке не встретятся, они уже отфильтрованы) не разбирай подробно ход за ходом — это фоновая активность, а не тема разговора. Если в этих сообщениях по существу вообще больше ничего не было (только игра), так прямо и напиши одной короткой фразой, например "в основном играли в крокодил" — без списка на 5 пунктов из отдельных раундов. Если для игры отдельно дана таблица лидеров (см. ниже в промпте пользователя) — можешь коротко назвать, кто сейчас лидирует, только по этим цифрам, не по своим догадкам из текста.
-- Если по существу обсуждать нечего (болтовня ни о чём, спам) — так и скажи одной фразой, без списка.`;
+- Строки вида "→ Имя зашёл(-ла) в чат" или "→ Имя вышел(-ла) из чата" — это не реплики, а технические события входа/выхода участников. Если такие строки есть в выгрузке, обязательно упомяни их отдельным коротким пунктом (кто зашёл и/или вышел) — обычно в начале сводки, — а дальше пересказывай само общение как обычно. Если таких строк нет, про вход/выход вообще не упоминай.
+- Если по существу обсуждать нечего (болтовня ни о чём, спам), но были события входа/выхода — упомяни только их, без остального списка.
+- Если по существу обсуждать нечего вообще (ни событий, ни разговора) — так и скажи одной фразой, без списка.`;
 
 // Отдельный вызов LLM в обход основной истории диалога (askLLM/pushHistory) —
 // пересказ не должен засорять контекст обычного чата с ботом и не должен
@@ -3707,7 +3757,17 @@ async function askRecapLLM(userPrompt) {
 }
 
 async function handleRecapQuery(ctx, chatId, requestedCount) {
-  const log = getChatLog(chatId);
+  const fullLog = getChatLog(chatId);
+  // Сам текущий запрос ("Женя, что я пропустил?") уже попал в ChatLog —
+  // pushChatLog вызывается ДО этой проверки (см. bot.on("message:text")),
+  // так что это гарантированно последняя запись лога. Исключаем её, иначе
+  // сводка пересказывает сама себя как "последнее сообщение". Условие
+  // повторяет то, при котором pushChatLog реально вызывается для текущего
+  // сообщения (не бот, не форвард) — если оно не выполнялось, лог трогать
+  // не нужно.
+  const wasCurrentMessageLogged = !ctx.from.is_bot && !isForwardedMessage(ctx.message);
+  const log = wasCurrentMessageLogged ? fullLog.slice(0, -1) : fullLog;
+
   if (log.length === 0) {
     await ctx.reply("пока не набралось сообщений в этом чате, чтобы что-то пересказывать");
     return;
@@ -3717,7 +3777,7 @@ async function handleRecapQuery(ctx, chatId, requestedCount) {
   const slice = log.slice(-count);
 
   const transcript = slice
-    .map((m) => `${m.name}${m.toBot ? " (обращался к боту)" : ""}: ${m.text}`)
+    .map((m) => (m.event ? `→ ${m.text}` : `${m.name}${m.toBot ? " (обращался к боту)" : ""}: ${m.text}`))
     .join("\n");
 
   // Реальные раунды крокодила ("🎉 Имя угадал(а) слово...") бот шлёт от
@@ -4036,6 +4096,36 @@ bot.on(["message:audio", "message:voice"], async (ctx) => {
   });
 });
 
+// ==== Вход/выход участников группы ====
+// Служебные сообщения Telegram о добавлении/уходе участников — пишем их в
+// ChatLog (см. pushChatLog) как события, а не обычные реплики, чтобы они
+// попадали в пересказ ("Женя, что я пропустил?" — см. RECAP_INTENT_REGEX /
+// handleRecapQuery) в хронологическом порядке вместе с обычной перепиской.
+// Сам бот тут ничего не пишет в чат — это чисто фоновая запись в лог, как
+// и с фото (см. bot.on("message:photo") ниже). Себя и других ботов в лог
+// не пишем — не интересно для пересказа.
+bot.on(["message:new_chat_members", "message:left_chat_member"], async (ctx) => {
+  const chatId = ctx.chat.id;
+  const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+  if (!isGroup) return;
+
+  for (const member of ctx.message.new_chat_members ?? []) {
+    if (member.is_bot) continue;
+    rememberUsername(chatId, member);
+    const name = getDisplayName(chatId, member);
+    const gender = getGender(chatId, member.id);
+    pushChatLog(chatId, name, joinLeaveText(name, gender, "join"), false, "join");
+  }
+
+  const leftMember = ctx.message.left_chat_member;
+  if (leftMember && !leftMember.is_bot) {
+    rememberUsername(chatId, leftMember);
+    const name = getDisplayName(chatId, leftMember);
+    const gender = getGender(chatId, leftMember.id);
+    pushChatLog(chatId, name, joinLeaveText(name, gender, "leave"), false, "leave");
+  }
+});
+
 // ==== Фото в группе ====
 // Срабатывает на КАЖДОЕ фото в группе (не только адресованное боту) — см.
 // пояснение к captionPhoto выше. Если фото НЕ адресовано боту — чисто
@@ -4161,15 +4251,17 @@ bot.on("message:photo", async (ctx) => {
 
     const stickerId = stickerKey && pickSticker(stickerKey);
     if (stickerId) {
-      await ctx.replyWithSticker(stickerId, {
+      const sentMsg = await ctx.replyWithSticker(stickerId, {
         reply_parameters: { message_id: ctx.message.message_id },
         message_thread_id: ctx.message.message_thread_id,
       });
+      rememberBotReply(chatId, sentMsg.message_id, displayName, reply);
     } else {
-      await ctx.reply(reply, {
+      const sentMsg = await ctx.reply(reply, {
         reply_parameters: { message_id: ctx.message.message_id },
         message_thread_id: ctx.message.message_thread_id,
       });
+      rememberBotReply(chatId, sentMsg.message_id, displayName, reply);
     }
   } catch (err) {
     console.error(`Ошибка ответа на фото в чате ${chatId}:`, err.status ?? "-", err.body ?? err.message);
@@ -4548,6 +4640,18 @@ bot.on("message:text", async (ctx) => {
       if (movieCard.genres) parts.push(`жанры: ${movieCard.genres}`);
       if (movieCard.summary) parts.push(`описание: ${movieCard.summary}`);
       userText = `[бот ранее прислал карточку — ${parts.join(", ")}] ${userText}`;
+    } else {
+      // Реплай на обычный (не карточка) текстовый ответ бота — в том числе
+      // старый, уже выпавший из HISTORY_LIMIT, и/или адресованный не тому,
+      // кто сейчас отвечает (человек 2 реплаит ответ, который бот когда-то
+      // дал человеку 1). Подмешиваем, что именно бот тогда написал и кому —
+      // без этого модель отвечает вслепую, не понимая, к чему вопрос.
+      const botReply = getBotReply(chatId, ctx.message.reply_to_message.message_id);
+      if (botReply) {
+        const snippet =
+          botReply.text.length > 1000 ? `${botReply.text.slice(0, 1000)}…` : botReply.text;
+        userText = `[бот ранее ответил ${botReply.name}: "${snippet}"] ${userText}`;
+      }
     }
   }
 
@@ -5038,23 +5142,28 @@ bot.on("message:text", async (ctx) => {
     // ещё одним стикером от тега модели на то же сообщение.
     const stickerId = !regexStickerFired && stickerKey && pickSticker(stickerKey);
 
+    const senderDisplayName = getDisplayName(chatId, ctx.from);
+
     if (stickerId) {
       // Стикер реально есть чем отправить — шлём ТОЛЬКО его, без текста.
       // Текст модели в этом случае был просто реакцией ("спасибо" и т.п.),
       // дублировать её текстом не нужно. В историю (см. askLLM) уже
       // положен полный текст с вырезанным тегом — бот всё равно будет
       // помнить, что "ответил", даже если пользователю ушёл только стикер.
-      await ctx.replyWithSticker(stickerId, {
+      const sentMsg = await ctx.replyWithSticker(stickerId, {
         reply_parameters: isGroup ? { message_id: ctx.message.message_id } : undefined,
         message_thread_id: ctx.message.message_thread_id,
       });
+      rememberBotReply(chatId, sentMsg.message_id, senderDisplayName, reply);
     } else if (isGroup) {
-      await ctx.reply(reply, {
+      const sentMsg = await ctx.reply(reply, {
         reply_parameters: { message_id: ctx.message.message_id },
         message_thread_id: ctx.message.message_thread_id,
       });
+      rememberBotReply(chatId, sentMsg.message_id, senderDisplayName, reply);
     } else {
-      await ctx.reply(reply);
+      const sentMsg = await ctx.reply(reply);
+      rememberBotReply(chatId, sentMsg.message_id, senderDisplayName, reply);
     }
   } catch (err) {
     console.error("Ошибка обработки сообщения:", err);
