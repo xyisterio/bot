@@ -2450,8 +2450,10 @@ async function askLLM(chatId, userText) {
 
 // ==== Имитация "живой" задержки перед ответом ====
 function typingDelayMs(replyLength) {
-  // примерно 1.5–3.5 сек в зависимости от длины ответа, плюс небольшой рандом
-  const base = 1200 + Math.min(replyLength * 15, 2000);
+  // ВРЕМЕННО (диагностика "печатает" при реплае): база увеличена
+  // с 1200 до 6000, чтобы точно успеть увидеть индикатор в клиенте.
+  // Откатить обратно на 1200 после теста.
+  const base = 6000 + Math.min(replyLength * 15, 2000);
   const jitter = Math.random() * 500;
   return base + jitter;
 }
