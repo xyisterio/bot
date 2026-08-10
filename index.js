@@ -430,8 +430,14 @@ function isOwner(ctx) {
 // НЕ использует fallback на reply_to_message, так как в обычных чатах/дискуссиях
 // там может оказаться ID поста/сообщения, приводивший к ошибке Telegram API
 // "400 Bad Request: message thread not found" при вызове replyWithChatAction на реплаях.
+// Возвращает ID темы (message_thread_id) ТОЛЬКО для форум-групп (ctx.chat.is_forum === true).
+// В обычных супергруппах и дискуссионных группах каналов Telegram проставляет message_thread_id
+// в сообщении (как ID поста), но передача этого ID в sendChatAction блокирует показы статуса "печатает" в Telegram-клиенте!
 function getThreadId(ctx) {
-  return ctx.message?.message_thread_id;
+  if (ctx.chat?.is_forum && ctx.message?.message_thread_id) {
+    return ctx.message.message_thread_id;
+  }
+  return undefined;
 }
 
 // Проверяет, является ли сообщение реплаем на сообщение бота
@@ -465,7 +471,7 @@ function sendTypingAction(ctx) {
   if (!ctx.chat?.id) return Promise.resolve();
   const threadId = getThreadId(ctx);
   const opts = threadId ? { message_thread_id: threadId } : {};
-  console.log(`[typing] Sending action 'typing' to chat=${ctx.chat.id} threadId=${threadId}`);
+  console.log(`[typing] Sending action 'typing' to chat=${ctx.chat.id} (is_forum=${!!ctx.chat?.is_forum}) threadId=${threadId}`);
   return ctx.api.sendChatAction(ctx.chat.id, "typing", opts).catch((err) =>
     console.error("[typing] FAILED:", err.description ?? err.message ?? err)
   );
@@ -473,7 +479,7 @@ function sendTypingAction(ctx) {
 
 // Выполняет асинхронное действие, непрерывно продлевая статус "печатает..." каждые 4 секунды
 async function withTyping(ctx, actionFn) {
-  sendTypingAction(ctx);
+  await sendTypingAction(ctx);
   const interval = setInterval(() => {
     sendTypingAction(ctx);
   }, 4000);
