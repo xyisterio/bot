@@ -77,6 +77,15 @@ const GROQ_MODELS = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile,openai/g
 // Groq сняла с доступа в течение 2026 года — см. console.groq.com/docs/vision).
 const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
 
+// Отдельная модель для расшифровки голосовых/кружочков (см. блок
+// "Голосовые" и transcribeVoice ниже) — как и с vision, это узкоспециальная
+// модель, дёргаем её отдельным точечным вызовом в обход askLLM/TARGETS.
+// whisper-large-v3-turbo — быстрее и дешевле по TPM-квоте, чем обычный
+// whisper-large-v3, при почти той же точности на русском — подходит по
+// умолчанию именно для этого бота (короткие голосовые в переписке, а не
+// студийная транскрипция). Список актуальных моделей — console.groq.com/docs/speech-to-text.
+const GROQ_WHISPER_MODEL = process.env.GROQ_WHISPER_MODEL || "whisper-large-v3-turbo";
+
 const GEMINI_MODELS = (process.env.GEMINI_MODEL || "gemini-flash-latest,gemini-3.5-flash")
   .split(",")
   .map((m) => m.trim())
@@ -337,6 +346,8 @@ const SYSTEM_PROMPT = `
 - В групповых чатах перед текстом собеседника может стоять его имя в формате "Имя: текст" — это подсказка, кто пишет, а не часть сообщения. Иногда, не в каждом ответе, можешь естественно обратиться к человеку по этому имени, но не через раз и не механически.
 - Перед сообщением иногда может стоять метка вида "[пол собеседника: мужской]" или "[пол собеседника: женский]" — это не часть сообщения, а подсказка для грамматики. Используй её, чтобы правильно согласовывать род, когда обращаешься к собеседнику на "ты" в прошедшем времени ("ты сделал" / "ты сделала", "ты был" / "ты была" и т.п.). Саму метку никогда не комментируй и не упоминай вслух. Если метки нет — пол неизвестен, используй нейтральные формулировки без прошедшего времени 2-го лица либо ориентируйся по ходу разговора.
 - Перед сообщением иногда может стоять метка вида "[фото от Имя: описание]", "[сообщение от Имя: текст]" или "[переслано от Имя: текст]" — значит собеседник ответил (реплаем) на чужое сообщение и обращается по этому поводу к тебе: на фото (тогда "описание" — то, что реально видно на фото, распознано автоматически заранее), на обычное сообщение другого участника чата, или на пост/статью/мем, пересланные из канала. Если имя в метке отличается от имени в "Имя: текст" сразу после неё — учитывай это: ты комментируешь чужой контент по просьбе того, кто сейчас с тобой говорит, а не свой собственный. Опирайся только на то, что реально написано/видно в метке, не выдумывай подробностей сверх неё — если текст обрезан многоточием, значит там было больше, но тебе показан только кусок. Реагируй живо и по-своему, с реальным мнением/оценкой, а не просто пересказом. Саму метку никогда не комментируй и не упоминай вслух.
+- Перед сообщением иногда может стоять метка вида "[голосовое от Имя (мм:сс), расшифровка: текст]" — собеседник ответил (реплаем) на голосовое сообщение или кружочек, а не спросил дословный текст (тот случай обрабатывается отдельно, без тебя). Отвечай по существу вопроса, опираясь на расшифровку — если спросили "о чём тут вкратце"/"перескажи"/"что там по сути" и голосовое длинное, перескажи своими словами кратко и без воды, а не дословно и не на весь объём исходника. Если вопрос про что-то конкретное из сказанного — отвечай именно по нему. Если расшифровка обрывается многоточием — значит она была длиннее и обрезана технически, не делай вид, что знаешь продолжение. Саму метку никогда не комментируй и не упоминай вслух.
+- Метка вида "[голосовое от Имя — речь не распознана, тишина или шум]" или "...расшифровать его не получилось из-за технической ошибки" — значит расшифровать нечего или не вышло технически. Так и скажи по-своему (не разобрал речь / не смог расслушать), не выдумывай, что там могло быть сказано.
 - Перед сообщением иногда может стоять метка вида "[в чате недавно было фото от Имя: описание]" — это НЕ реплай: собеседник прямо спросил тебя про какое-то фото в чате словами (например "как тебе фото кота в чате?"), не отвечая на конкретное сообщение с ним, и ты нашёл в логе чата подходящее фото под описание. Отвечай по существу вопроса, опираясь на это описание, как будто ты сам это фото видел в чате. Если по тексту вопроса видно, что найденное фото явно не то, о котором спрашивают (не совпадает с тем, что человек описывает) — не притворяйся, что видел именно то, о котором он спрашивает, а честно скажи, что не помнишь такого. Саму метку никогда не комментируй и не упоминай вслух.
 - Перед сообщением иногда может стоять метка вида "[позвали через тег настоящего Жени @EVGEN1Y_V]" — значит человек в группе обращался не к тебе по имени, а тегнул именно настоящего Женю (реального человека), чтобы позвать его самого. В этом случае не отвечай так, будто обращение было прямо к тебе — сначала естественно дай понять, что настоящий Женя сейчас недоступен и ты вместо него ответишь. Делай это КОРОТКО и без конкретики — Женя вообще сдержанно говорит о себе и не любит рассказывать подробности того, чем занят. Не выдумывай, что именно он делает, где он и почему недоступен — максимум расплывчато: "занят", "не сейчас", "потом сам ответит", вариации этого своими словами, без деталей и без легенды. Дальше можешь ответить по сути вопроса в своей обычной манере, если есть что сказать. Саму метку никогда не комментируй и не упоминай вслух.
 - Пиши только на русском.
@@ -3777,18 +3788,173 @@ function extractPhotoReaction(text) {
   return { caption: clean || text.trim(), reactionKey: PHOTO_REACTION_EMOJI[key] ? key : null };
 }
 
-// Скачивает файл из Telegram (по file_id) и возвращает его как base64 —
-// именно скачиваем сами и шлём как data-URI, а не передаём модели прямую
-// ссылку вида api.telegram.org/file/bot<TOKEN>/... — иначе токен бота
-// улетел бы третьей стороне (серверам Groq, которые бы сами фетчили URL).
-async function fetchTelegramFileBase64(ctx, fileId) {
+// Скачивает файл из Telegram (по file_id) и возвращает сырые байты + путь.
+// Общий хелпер и для фото (fetchTelegramFileBase64), и для голосовых
+// (transcribeVoice) — раньше эта же логика (getFile + fetch по прямой
+// ссылке) была продублирована внутри fetchTelegramFileBase64 целиком.
+// Именно скачиваем сами, а не передаём модели прямую ссылку вида
+// api.telegram.org/file/bot<TOKEN>/... — иначе токен бота улетел бы
+// третьей стороне (серверам Groq, которые бы сами фетчили URL).
+async function downloadTelegramFile(ctx, fileId) {
   const file = await ctx.api.getFile(fileId);
   const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Не удалось скачать файл из Telegram: ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  const mime = file.file_path.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
-  return { base64: buf.toString("base64"), mime };
+  const buffer = Buffer.from(await res.arrayBuffer());
+  return { buffer, filePath: file.file_path };
+}
+
+async function fetchTelegramFileBase64(ctx, fileId) {
+  const { buffer, filePath } = await downloadTelegramFile(ctx, fileId);
+  const mime = filePath.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
+  return { base64: buffer.toString("base64"), mime };
+}
+
+// ==== Голосовые/кружочки — расшифровка через Groq Whisper ====
+// Отдельный эндпоинт (audio/transcriptions, multipart/form-data) — не тот,
+// что в callTarget (chat/completions, JSON) — поэтому свой запрос, без
+// переиспользования callTarget. Модель одна и без фолбэка по провайдерам:
+// расшифровку из всех подключённых сейчас провайдеров умеет делать только Groq.
+const GROQ_WHISPER_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions";
+// Голосовые в несколько минут транскрибируются дольше обычного chat-запроса —
+// отдельный, более щедрый таймаут, чем REQUEST_TIMEOUT_MS (тот рассчитан на
+// обычную LLM-переписку, 20с).
+const VOICE_TIMEOUT_MS = Number(process.env.VOICE_TIMEOUT_MS) || 60000;
+
+// Типичные "мусорные" фразы, которые Whisper иногда галлюцинирует на
+// тишине/фоновом шуме — наследие того, что модель тренировали в том числе
+// на ютуб-субтитрах. Без фильтра такое иногда улетает в чат как будто
+// человек это реально сказал.
+const WHISPER_HALLUCINATION_PHRASES = [
+  "Продолжение следует...",
+  "Продолжение следует…",
+  "Спасибо за просмотр!",
+  "Спасибо за просмотр.",
+  "Подписывайтесь на канал",
+  "Субтитры сделал DimaTorzok",
+  "Редактор субтитров",
+  "Корректор А.Егорова",
+];
+
+function stripWhisperHallucinations(text) {
+  let cleaned = text;
+  for (const phrase of WHISPER_HALLUCINATION_PHRASES) {
+    cleaned = cleaned.split(phrase).join("");
+  }
+  return cleaned.replace(/\s{2,}/g, " ").trim();
+}
+
+// Скачивает голосовое/кружочек и прогоняет через Groq Whisper. Один retry
+// на 5xx/сетевую ошибку — как в callTarget, но без общего cooldown-меха-
+// низма TARGETS: это разовый точечный вызов, а не часть общего фолбэка.
+async function transcribeVoice(ctx, fileId) {
+  const { buffer, filePath } = await downloadTelegramFile(ctx, fileId);
+  // Расширение берём из реального пути файла в Telegram (voice -> .oga,
+  // video_note -> .mp4) — так Groq видит правильный формат по имени файла,
+  // вместо того чтобы гадать по хардкоженному "voice.ogg" независимо от
+  // того, что реально скачали.
+  const ext = (filePath.split(".").pop() || "ogg").toLowerCase();
+
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const form = new FormData();
+    form.append("model", GROQ_WHISPER_MODEL);
+    form.append("response_format", "verbose_json");
+    form.append("temperature", "0");
+    form.append("file", new Blob([buffer]), `audio.${ext}`);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), VOICE_TIMEOUT_MS);
+
+    let res;
+    try {
+      res = await fetch(GROQ_WHISPER_ENDPOINT, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+        body: form,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timeoutId);
+      lastErr = err.name === "AbortError" ? new Error(`Whisper не ответил за ${VOICE_TIMEOUT_MS}мс — таймаут`) : err;
+      if (attempt === 0) continue;
+      throw lastErr;
+    }
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      if (res.status >= 500 && attempt === 0) {
+        lastErr = new Error(`Groq Whisper вернул ${res.status}`);
+        continue;
+      }
+      const errText = await res.text();
+      const err = new Error(`Groq Whisper вернул ${res.status}`);
+      err.status = res.status;
+      err.body = errText.slice(0, 200);
+      throw err;
+    }
+
+    const data = await res.json();
+    const segments = data.segments || [];
+    // Как и в референсном плагине для Hikka — сегменты с высоким
+    // no_speech_prob (тишина/шум) не считаем реальной речью и выкидываем,
+    // иначе Whisper на паузах иногда подставляет случайные слова.
+    let text = segments.length
+      ? segments
+          .filter((s) => (s.no_speech_prob ?? 0) < 0.6)
+          .map((s) => s.text.trim())
+          .join(" ")
+          .trim()
+      : (data.text || "").trim();
+
+    text = stripWhisperHallucinations(text);
+    return { text };
+  }
+
+  throw lastErr ?? new Error("Groq Whisper не ответил после повторной попытки");
+}
+
+// ==== Кэш расшифровок голосовых по message_id ====
+// Тот же паттерн, что и photoCaptionsByMessage выше — чтобы повторный
+// реплай на уже расшифрованное голосовое (например, сначала "текст", потом
+// кто-то ещё спросил "о чём там вкратце") не гонял аудио через Whisper
+// заново. Живёт только в памяти процесса, не в Redis — недолгоживущий кэш
+// для текущей сессии, ничего критичного при потере на рестарте.
+const VOICE_TRANSCRIPT_CACHE_LIMIT = 500;
+const voiceTranscriptsByMessage = new Map(); // `${chatId}:${messageId}` -> { name, text }
+
+function rememberVoiceTranscript(chatId, messageId, name, text) {
+  const key = `${chatId}:${messageId}`;
+  voiceTranscriptsByMessage.set(key, { name, text });
+  if (voiceTranscriptsByMessage.size > VOICE_TRANSCRIPT_CACHE_LIMIT) {
+    const oldestKey = voiceTranscriptsByMessage.keys().next().value;
+    voiceTranscriptsByMessage.delete(oldestKey);
+  }
+}
+
+function getVoiceTranscript(chatId, messageId) {
+  return voiceTranscriptsByMessage.get(`${chatId}:${messageId}`) || null;
+}
+
+// Реплай на ГС/кружок с просьбой именно дословного текста — "Женя, текст",
+// "Жень расшифруй", "распознай, что там", "что он сказал" и т.п. Отдельно
+// от обычных вопросов ("о чём тут вкратце?") — те НЕ должны совпадать с
+// этим регэкспом, чтобы уйти в обычный LLM-путь ниже (см. использование).
+const VOICE_TRANSCRIBE_INTENT_REGEX =
+  /^(текст|расшифр|транскрип|распознай|дословно|слово\s+в\s+слово)\b|^что\s+(он|она|там)?\s*(сказал|говорил)/i;
+
+// Сколько символов расшифровки максимум подмешиваем в промпт модели для
+// обычных вопросов по голосовому (не для литерального "текст" — там отдаём
+// расшифровку целиком без обрезки). Несколько тысяч символов — это уже
+// хватает на голосовое в 4-5 минут разговорной речи, дальше это, скорее
+// всего, что-то экстремально длинное, и урезаем, чтобы не раздувать промпт.
+const VOICE_TRANSCRIPT_PROMPT_LIMIT = 6000;
+
+function formatVoiceDuration(sec) {
+  if (sec == null || !Number.isFinite(sec)) return "";
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 // Отдельный точечный вызов vision-модели — в обход askLLM/TARGETS-фолбэка:
@@ -4129,6 +4295,11 @@ bot.on("message:text", async (ctx) => {
       }
     }
 
+    // Текст вопроса ДО добавления "Имя: " — нужен ниже для intent-проверки
+    // реплая на голосовое ("текст" vs обычный вопрос по содержанию), см.
+    // VOICE_TRANSCRIBE_INTENT_REGEX.
+    const strippedQuestion = userText;
+
     // Подсказываем модели, кто говорит — "Имя: текст"
     const displayName = getDisplayName(chatId, ctx.from);
     userText = `${displayName}: ${userText}`;
@@ -4180,6 +4351,71 @@ bot.on("message:text", async (ctx) => {
         const snippet = raw.length > 1000 ? `${raw.slice(0, 1000)}…` : raw;
         const kind = isForwardedMessage(repliedTo) ? "переслано" : "сообщение";
         repliedTag = `[${kind} от ${repliedName}: ${snippet}] `;
+      } else if (repliedTo.voice || repliedTo.video_note) {
+        // ==== Реплай на голосовое/кружочек ====
+        // Два разных сценария по тексту вопроса:
+        // 1) "Женя, текст" / "расшифруй" / "что он сказал" — литеральная
+        //    расшифровка. Отвечаем ПРЯМО НА САМО голосовое (а не на
+        //    сообщение с командой) — так расшифровка выглядит подписью под
+        //    голосовым, а не тонет в переписке с ботом.
+        // 2) Любой другой вопрос ("о чём тут вкратце?", "перескажи",
+        //    "переведи", "что думаешь") — расшифровку не показываем
+        //    отдельно, а подмешиваем её в промпт как repliedTag (см. фото
+        //    выше) и даём модели ответить по существу своими словами —
+        //    для длинного ГС это и есть пересказ без воды, без отдельного
+        //    хардкоженного summary-пайплайна.
+        const mediaObj = repliedTo.voice || repliedTo.video_note;
+        const durationLabel = formatVoiceDuration(mediaObj.duration);
+        const wantsLiteralText = VOICE_TRANSCRIBE_INTENT_REGEX.test(strippedQuestion);
+
+        let info = getVoiceTranscript(chatId, repliedTo.message_id);
+        let transcribeError = null;
+        if (!info) {
+          try {
+            const { text } = await transcribeVoice(ctx, mediaObj.file_id);
+            info = { name: repliedName, text };
+            rememberVoiceTranscript(chatId, repliedTo.message_id, repliedName, text);
+          } catch (err) {
+            transcribeError = err;
+            console.error(
+              `Не удалось расшифровать голосовое из реплая в чате ${chatId}:`,
+              err.status ?? "-",
+              err.body ?? err.message
+            );
+          }
+        }
+
+        if (wantsLiteralText) {
+          if (transcribeError) {
+            await ctx.reply("не смог расшифровать голосовое, попробуй ещё раз", {
+              reply_parameters: { message_id: ctx.message.message_id },
+              message_thread_id: ctx.message.message_thread_id,
+            });
+          } else if (!info.text) {
+            await ctx.reply("не разобрал речь в этом голосовом — тишина или шум", {
+              reply_parameters: { message_id: repliedTo.message_id },
+              message_thread_id: ctx.message.message_thread_id,
+            });
+          } else {
+            await ctx.reply(info.text, {
+              reply_parameters: { message_id: repliedTo.message_id },
+              message_thread_id: ctx.message.message_thread_id,
+            });
+          }
+          return; // сюда не идём в общий askLLM-путь — расшифровка уже отправлена
+        }
+
+        if (transcribeError) {
+          repliedTag = `[собеседник ответил на голосовое/кружочек от ${repliedName}, но расшифровать его не получилось из-за технической ошибки] `;
+        } else if (info.text) {
+          const transcriptForPrompt =
+            info.text.length > VOICE_TRANSCRIPT_PROMPT_LIMIT
+              ? `${info.text.slice(0, VOICE_TRANSCRIPT_PROMPT_LIMIT)}…`
+              : info.text;
+          repliedTag = `[голосовое от ${repliedName}${durationLabel ? ` (${durationLabel})` : ""}, расшифровка: ${transcriptForPrompt}] `;
+        } else {
+          repliedTag = `[голосовое от ${repliedName} — речь не распознана, тишина или шум] `;
+        }
       }
 
       if (repliedTag) userText = `${repliedTag}${userText}`;
