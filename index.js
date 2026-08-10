@@ -422,6 +422,34 @@ function isOwner(ctx) {
   return !!username && username.toLowerCase() === OWNER_USERNAME.toLowerCase();
 }
 
+// ==== Утилиты для отправки статуса "печатает..." ====
+// Возвращает ID темы (message_thread_id) с учётом fallback на реплай-сообщение
+function getThreadId(ctx) {
+  return ctx.message?.message_thread_id ?? ctx.message?.reply_to_message?.message_thread_id;
+}
+
+// Отправляет статус "печатает..." в нужный тред чата
+function sendTypingAction(ctx) {
+  const threadId = getThreadId(ctx);
+  const opts = threadId ? { message_thread_id: threadId } : {};
+  return ctx.replyWithChatAction("typing", opts).catch((err) =>
+    console.error("[typing] FAILED:", err.description ?? err.message ?? err)
+  );
+}
+
+// Выполняет асинхронное действие, непрерывно продлевая статус "печатает..." каждые 4 секунды
+async function withTyping(ctx, actionFn) {
+  sendTypingAction(ctx);
+  const interval = setInterval(() => {
+    sendTypingAction(ctx);
+  }, 4000);
+  try {
+    return await actionFn();
+  } finally {
+    clearInterval(interval);
+  }
+}
+
 // ==== Алиасы участников (по chatId -> userId -> заданное имя) ====
 // Живут в памяти как кэш, но зеркалятся в Redis (ключ aliases:{chatId}) —
 // см. loadPersistedState() при старте.
@@ -2450,10 +2478,7 @@ async function askLLM(chatId, userText) {
 
 // ==== Имитация "живой" задержки перед ответом ====
 function typingDelayMs(replyLength) {
-  // ВРЕМЕННО (диагностика "печатает" при реплае): база увеличена
-  // с 1200 до 6000, чтобы точно успеть увидеть индикатор в клиенте.
-  // Откатить обратно на 1200 после теста.
-  const base = 6000 + Math.min(replyLength * 15, 2000);
+  const base = 1200 + Math.min(replyLength * 15, 2000);
   const jitter = Math.random() * 500;
   return base + jitter;
 }
@@ -3340,7 +3365,7 @@ function formatShortDate(isoDate) {
 }
 
 async function handleWeatherQuery(ctx, intent) {
-  await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+  sendTypingAction(ctx);
   const place = await geocodeCity(intent.city);
   if (!place) {
     await ctx.reply(`не нашёл такой город — "${intent.city}". Проверь название и попробуй ещё раз`);
@@ -3624,7 +3649,7 @@ async function handleMovieQuery(ctx, intent) {
     return;
   }
 
-  await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+  sendTypingAction(ctx);
 
   let results;
   try {
@@ -3830,7 +3855,7 @@ async function handleRecapQuery(ctx, chatId, requestedCount) {
   const krokodilBlock =
     krokodilScoreMap.size > 0 ? `\n\nТекущий счёт в крокодиле (реальные данные):\n${formatKrokodilLeaderboard(chatId)}` : "";
 
-  await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+  sendTypingAction(ctx);
   try {
     const reply = await askRecapLLM(
       `Вот последние ${slice.length} сообщений чата:\n\n${transcript}${krokodilBlock}`
@@ -4275,8 +4300,6 @@ bot.on("message:photo", async (ctx) => {
   // шаблонным пересказом описания. Тег "[фото от Имя: описание]" разобран
   // в SYSTEM_PROMPT.
   try {
-    await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
-
     let question = captionText ? stripNameTrigger(captionText) : "";
     if (isMentioned && question) {
       question = question.replace(new RegExp(`@${ctx.me.username}`, "i"), "").trim();
@@ -4286,20 +4309,26 @@ bot.on("message:photo", async (ctx) => {
       `[фото от ${displayName}: ${caption}] ${displayName}: ` +
       (question || "гляну, что скажешь про фото?");
 
-    const { text: reply, stickerKey } = await askLLM(chatId, userText);
-    await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
+    let reply, stickerKey;
+    await withTyping(ctx, async () => {
+      const res = await askLLM(chatId, userText);
+      reply = res.text;
+      stickerKey = res.stickerKey;
+      await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
+    });
 
+    const threadId = getThreadId(ctx);
     const stickerId = stickerKey && pickSticker(stickerKey);
     if (stickerId) {
       const sentMsg = await ctx.replyWithSticker(stickerId, {
         reply_parameters: { message_id: ctx.message.message_id },
-        message_thread_id: ctx.message.message_thread_id,
+        message_thread_id: threadId,
       });
       rememberBotReply(chatId, sentMsg.message_id, displayName, reply);
     } else {
       const sentMsg = await ctx.reply(reply, {
         reply_parameters: { message_id: ctx.message.message_id },
-        message_thread_id: ctx.message.message_thread_id,
+        message_thread_id: threadId,
       });
       rememberBotReply(chatId, sentMsg.message_id, displayName, reply);
     }
@@ -4407,9 +4436,7 @@ bot.on("message:text", async (ctx) => {
   // обычный чат) уйдёт обработка. Не await — это просто индикатор, ждать
   // его не нужно, а ошибку (например нет прав в чате) тихо проглатываем.
   if (!isGroup) {
-    ctx
-      .replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id })
-      .catch(() => {});
+    sendTypingAction(ctx);
   }
 
   if (isGroup) {
@@ -4458,10 +4485,7 @@ bot.on("message:text", async (ctx) => {
     // ниже по коду не мешают — Telegram просто продлевает уже показанный
     // статус ещё на ~5 секунд.
     console.log(`[typing] fire isReplyToBot=${isReplyToBot} startsWithName=${startsWithName} isMentioned=${isMentioned}`);
-    ctx
-      .replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id })
-      .then(() => console.log("[typing] ok"))
-      .catch((err) => console.error("[typing] FAILED:", err.description ?? err.message ?? err));
+    sendTypingAction(ctx);
 
     if (startsWithName) {
       userText = stripNameTrigger(userText);
@@ -4726,7 +4750,7 @@ bot.on("message:text", async (ctx) => {
   // ответе тихо уходим на курируемую базу (см. getJoke/JOKES выше).
   // Модель на такую просьбу обычно выдумывает несмешную ерунду.
   if (isJokeRequest(stripBotAddressing(rawText, ctx))) {
-    await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+    sendTypingAction(ctx);
     await ctx.reply(await getJoke(chatId), { reply_parameters: { message_id: ctx.message.message_id } });
     return;
   }
@@ -5188,12 +5212,7 @@ bot.on("message:text", async (ctx) => {
   }
 
   try {
-    // Явно прокидываем message_thread_id (для групп с темами/топиками) —
-    // без этого "печатает" иногда не показывается в конкретной теме,
-    // даже если сам запрос уходит в общий чат.
-    await ctx.replyWithChatAction("typing", {
-      message_thread_id: ctx.message.message_thread_id,
-    });
+    sendTypingAction(ctx);
 
     // Groq отвечает быстро, так что подтягиваем ответ параллельно с "печатает..."
     const replyPromise = askLLM(chatId, userText);
