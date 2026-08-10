@@ -3779,6 +3779,52 @@ const RECAP_INTENT_REGEX =
   /(о\s*чём|о\s*чем)\s+(тут|здесь|в\s+чате)?\s*(речь|говорил|шла\s+речь)|что\s+(тут|здесь)?\s*(обсужда|происходи|писали|было|творил)|перескаж|пересказ|что\s+я\s+пропустил|краткое\s+содержан|саммари\s+чата|сумму\s+чата|сводк/i;
 const DEFAULT_RECAP_COUNT = 50;
 
+// ==== Прямой вопрос "кто зашёл/вышел из чата" ====
+// Отдельно от общего пересказа (RECAP_INTENT_REGEX/handleRecapQuery): такой
+// вопрос — точечный, и на него не нужен пересказ-выжимка от LLM (риск, что
+// модель упомянет событие вскользь среди других тем или вовсе упустит его
+// в общем списке из 3-7 пунктов). Вместо этого просто фильтруем ChatLog по
+// entry.event ("join"/"leave") и отдаём готовые строки как есть — без
+// похода в LLM: данные и так точные (сами формируем текст в
+// joinLeaveText), гадать тут нечему.
+const LEAVE_WORDS_REGEX = /ушел|ушёл|ушла|ушли|вышел|вышла|вышли|покинул|покинула|покинули/i;
+const JOIN_WORDS_REGEX = /зашел|зашёл|зашла|зашли|пришел|пришёл|пришла|пришли|вступил|вступила|вступили|подключ/i;
+const JOIN_LEAVE_INTENT_REGEX = /кто\s+(ушел|ушёл|ушла|ушли|вышел|вышла|вышли|покинул|покинула|покинули|зашел|зашёл|зашла|зашли|пришел|пришёл|пришла|пришли|вступил|вступила|вступили|подключился|подключилась)/i;
+
+// Возвращает "leave" / "join" / "both" в зависимости от того, какие слова
+// встретились в тексте (если упомянуты и уход, и приход — отдаём оба).
+function determineJoinLeaveType(text) {
+  const hasLeave = LEAVE_WORDS_REGEX.test(text);
+  const hasJoin = JOIN_WORDS_REGEX.test(text);
+  if (hasLeave && hasJoin) return "both";
+  if (hasLeave) return "leave";
+  if (hasJoin) return "join";
+  return null;
+}
+
+async function handleJoinLeaveQuery(ctx, chatId, type) {
+  const fullLog = getChatLog(chatId);
+  // Та же логика исключения текущего сообщения из выборки, что и в
+  // handleRecapQuery — см. комментарий там.
+  const wasCurrentMessageLogged = !ctx.from.is_bot && !isForwardedMessage(ctx.message);
+  const log = wasCurrentMessageLogged ? fullLog.slice(0, -1) : fullLog;
+
+  const matches = log.filter((m) => m.event && (type === "both" || m.event === type));
+
+  const replyOptions = {
+    reply_parameters: { message_id: ctx.message.message_id },
+    message_thread_id: ctx.message.message_thread_id,
+  };
+
+  if (matches.length === 0) {
+    const label = type === "join" ? "заходил" : type === "leave" ? "выходил" : "заходил или выходил";
+    await ctx.reply(`за то время, что я помню, никто не ${label}`, replyOptions);
+    return;
+  }
+
+  await ctx.reply(matches.map((m) => m.text).join("\n"), replyOptions);
+}
+
 // Прямой текстовый вопрос про фото/картинку в чате (не реплай на неё) —
 // см. использование в bot.on("message:text") ниже, блок про repliedTag.
 // Специально пошире (не только "фото", но и "картин(ка)", "снимок",
@@ -4828,6 +4874,23 @@ bot.on("message:text", async (ctx) => {
   // ЭТО сообщение, а не просьбу пересказать весь чат — repliedTag уже
   // подмешан в userText выше, и туда должен пойти обычный askLLM, а не
   // отдельный recap-пайплайн по логу чата.
+  // ==== "Кто зашёл/вышел из чата" (точечный вопрос, без похода в LLM) ====
+  // Проверяем РАНЬШЕ общего пересказа: если оставить эту проверку после
+  // RECAP_INTENT_REGEX, коллизии тут не случится (в нём нет слов
+  // "ушёл"/"зашёл"), но порядок всё равно важен принципиально — это более
+  // узкий и точный интент, и он не должен зависеть от того, что происходит
+  // ниже по цепочке проверок.
+  if (isGroup && !repliedToHandled) {
+    const strippedForJoinLeave = stripBotAddressing(rawText, ctx);
+    if (JOIN_LEAVE_INTENT_REGEX.test(strippedForJoinLeave)) {
+      const joinLeaveType = determineJoinLeaveType(strippedForJoinLeave);
+      if (joinLeaveType) {
+        await handleJoinLeaveQuery(ctx, chatId, joinLeaveType);
+        return;
+      }
+    }
+  }
+
   if (isGroup && !repliedToHandled && RECAP_INTENT_REGEX.test(stripBotAddressing(rawText, ctx))) {
     await handleRecapQuery(ctx, chatId, parseRecapCount(stripBotAddressing(rawText, ctx)));
     return;
