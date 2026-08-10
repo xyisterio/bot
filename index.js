@@ -3849,11 +3849,15 @@ function stripWhisperHallucinations(text) {
 // низма TARGETS: это разовый точечный вызов, а не часть общего фолбэка.
 async function transcribeVoice(ctx, fileId) {
   const { buffer, filePath } = await downloadTelegramFile(ctx, fileId);
-  // Расширение берём из реального пути файла в Telegram (voice -> .oga,
-  // video_note -> .mp4) — так Groq видит правильный формат по имени файла,
-  // вместо того чтобы гадать по хардкоженному "voice.ogg" независимо от
-  // того, что реально скачали.
-  const ext = (filePath.split(".").pop() || "ogg").toLowerCase();
+  // Telegram отдаёт голосовые с расширением .oga (хотя по факту это тот же
+  // контейнер OGG/Opus) — Groq же принимает строго определённый список
+  // расширений [flac mp3 mp4 mpeg mpga m4a ogg opus wav webm], где "oga"
+  // отсутствует, и на нём падает с 400 invalid_request_error. Поэтому
+  // маппим известные "чужие" расширения на то, что реально примет API,
+  // вместо того чтобы слепо брать то, что прислал Telegram.
+  const rawExt = (filePath.split(".").pop() || "ogg").toLowerCase();
+  const EXT_ALIASES = { oga: "ogg" };
+  const ext = EXT_ALIASES[rawExt] || rawExt;
 
   let lastErr;
   for (let attempt = 0; attempt < 2; attempt++) {
