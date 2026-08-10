@@ -33,6 +33,9 @@ const GEMINI_API_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_K
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан в переменных окружения");
 if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY не задан в переменных окружения");
 
+// ID бота, полученный напрямую из токена (гарантированно существует до выполнения любых запросов)
+const BOT_ID = Number(BOT_TOKEN.split(":")[0]) || null;
+
 // ==== Персистентность (Upstash Redis) ====
 // Без этого вся память (история переписки, алиасы, пол, индекс юзернеймов,
 // активная модель) хранится только в оперативной памяти процесса и
@@ -420,6 +423,71 @@ const ownerMentionRegex = new RegExp(
 function isOwner(ctx) {
   const username = ctx.from?.username;
   return !!username && username.toLowerCase() === OWNER_USERNAME.toLowerCase();
+}
+
+// ==== Утилиты для отправки статуса "печатает..." ====
+// Возвращает ID темы (message_thread_id), если сообщение отправлено в топик форум-группы.
+// НЕ использует fallback на reply_to_message, так как в обычных чатах/дискуссиях
+// там может оказаться ID поста/сообщения, приводивший к ошибке Telegram API
+// "400 Bad Request: message thread not found" при вызове replyWithChatAction на реплаях.
+// Возвращает ID темы (message_thread_id) ТОЛЬКО для форум-групп (ctx.chat.is_forum === true).
+// В обычных супергруппах и дискуссионных группах каналов Telegram проставляет message_thread_id
+// в сообщении (как ID поста), но передача этого ID в sendChatAction блокирует показы статуса "печатает" в Telegram-клиенте!
+function getThreadId(ctx) {
+  if (ctx.chat?.is_forum && ctx.message?.message_thread_id) {
+    return ctx.message.message_thread_id;
+  }
+  return undefined;
+}
+
+// Проверяет, является ли сообщение реплаем на сообщение бота
+function isReplyToBot(ctx) {
+  const repliedTo = ctx.message?.reply_to_message;
+  if (!repliedTo) return false;
+
+  const repliedFrom = repliedTo.from;
+  if (repliedFrom) {
+    if (BOT_ID && repliedFrom.id === BOT_ID) return true;
+    if (ctx.me?.id && repliedFrom.id === ctx.me.id) return true;
+    if (repliedFrom.is_bot && ctx.me?.username && repliedFrom.username?.toLowerCase() === ctx.me.username.toLowerCase()) return true;
+    if (repliedFrom.is_bot && ctx.me?.first_name && repliedFrom.first_name === ctx.me.first_name) return true;
+    // Любой реплай на бота (is_bot: true) считаем адресованным боту
+    if (repliedFrom.is_bot) return true;
+  }
+
+  // Проверяем локальный кэш бота по message_id (ответы бота / карточки фильмов)
+  const chatId = ctx.chat?.id;
+  if (chatId && repliedTo.message_id) {
+    if (getBotReply(chatId, repliedTo.message_id) || getMovieCard(chatId, repliedTo.message_id)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Отправляет статус "печатает..." в нужный тред чата
+function sendTypingAction(ctx) {
+  if (!ctx.chat?.id) return Promise.resolve();
+  const threadId = getThreadId(ctx);
+  const opts = threadId ? { message_thread_id: threadId } : {};
+  console.log(`[typing] Sending action 'typing' to chat=${ctx.chat.id} (is_forum=${!!ctx.chat?.is_forum}) threadId=${threadId}`);
+  return ctx.api.sendChatAction(ctx.chat.id, "typing", opts).catch((err) =>
+    console.error("[typing] FAILED:", err.description ?? err.message ?? err)
+  );
+}
+
+// Выполняет асинхронное действие, непрерывно продлевая статус "печатает..." каждые 4 секунды
+async function withTyping(ctx, actionFn) {
+  await sendTypingAction(ctx);
+  const interval = setInterval(() => {
+    sendTypingAction(ctx);
+  }, 4000);
+  try {
+    return await actionFn();
+  } finally {
+    clearInterval(interval);
+  }
 }
 
 // ==== Алиасы участников (по chatId -> userId -> заданное имя) ====
@@ -2450,10 +2518,7 @@ async function askLLM(chatId, userText) {
 
 // ==== Имитация "живой" задержки перед ответом ====
 function typingDelayMs(replyLength) {
-  // ВРЕМЕННО (диагностика "печатает" при реплае): база увеличена
-  // с 1200 до 6000, чтобы точно успеть увидеть индикатор в клиенте.
-  // Откатить обратно на 1200 после теста.
-  const base = 6000 + Math.min(replyLength * 15, 2000);
+  const base = 1200 + Math.min(replyLength * 15, 2000);
   const jitter = Math.random() * 500;
   return base + jitter;
 }
@@ -3340,7 +3405,7 @@ function formatShortDate(isoDate) {
 }
 
 async function handleWeatherQuery(ctx, intent) {
-  await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+  sendTypingAction(ctx);
   const place = await geocodeCity(intent.city);
   if (!place) {
     await ctx.reply(`не нашёл такой город — "${intent.city}". Проверь название и попробуй ещё раз`);
@@ -3624,7 +3689,7 @@ async function handleMovieQuery(ctx, intent) {
     return;
   }
 
-  await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+  sendTypingAction(ctx);
 
   let results;
   try {
@@ -3711,7 +3776,7 @@ bot.on("callback_query:data", async (ctx, next) => {
 // вообще (см. фильтр ctx.from.is_bot в bot.on("message:text")), так что
 // отдельно фильтровать их тут не нужно.
 const RECAP_INTENT_REGEX =
-  /(о\s*чём|о\s*чем)\s+(тут|здесь|в\s+чате)?\s*(речь|говорил|шла\s+речь)|что\s+(тут|здесь)?\s*(обсужда|происходи|писали|было|творил)|перескаж|пересказ|что\s+я\s+пропустил|краткое\s+содержан|саммари\s+чата|сумму\s+чата/i;
+  /(о\s*чём|о\s*чем)\s+(тут|здесь|в\s+чате)?\s*(речь|говорил|шла\s+речь)|что\s+(тут|здесь)?\s*(обсужда|происходи|писали|было|творил)|перескаж|пересказ|что\s+я\s+пропустил|краткое\s+содержан|саммари\s+чата|сумму\s+чата|сводк/i;
 const DEFAULT_RECAP_COUNT = 50;
 
 // Прямой текстовый вопрос про фото/картинку в чате (не реплай на неё) —
@@ -3830,7 +3895,7 @@ async function handleRecapQuery(ctx, chatId, requestedCount) {
   const krokodilBlock =
     krokodilScoreMap.size > 0 ? `\n\nТекущий счёт в крокодиле (реальные данные):\n${formatKrokodilLeaderboard(chatId)}` : "";
 
-  await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+  sendTypingAction(ctx);
   try {
     const reply = await askRecapLLM(
       `Вот последние ${slice.length} сообщений чата:\n\n${transcript}${krokodilBlock}`
@@ -4123,8 +4188,8 @@ async function captionPhoto(ctx, fileId) {
 bot.on(["message:audio", "message:voice"], async (ctx) => {
   const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
   if (isGroup) {
-    const isReplyToBot = ctx.message.reply_to_message?.from?.id === ctx.me.id;
-    if (!isReplyToBot) return;
+    const isReply = isReplyToBot(ctx);
+    if (!isReply) return;
   }
 
   const stickerId = pickSticker("music");
@@ -4187,7 +4252,7 @@ bot.on("message:photo", async (ctx) => {
   // для обычных текстовых сообщений (см. bot.on("message:text")), только
   // источник текста — caption, а не сам текст сообщения (у фото его нет).
   const captionText = ctx.message.caption || "";
-  const isReplyToBot = ctx.message.reply_to_message?.from?.id === ctx.me.id;
+  const isReply = isReplyToBot(ctx);
   const isMentioned =
     ctx.message.caption_entities?.some(
       (e) =>
@@ -4195,7 +4260,7 @@ bot.on("message:photo", async (ctx) => {
         captionText.substring(e.offset, e.offset + e.length).toLowerCase() ===
           `@${ctx.me.username?.toLowerCase()}`
     ) ?? false;
-  const toBot = nameTriggerRegex.test(captionText) || isReplyToBot || isMentioned || ownerMentionRegex.test(captionText);
+  const toBot = nameTriggerRegex.test(captionText) || isReply || isMentioned || ownerMentionRegex.test(captionText);
 
   // Пересланное фото (мем/новость из канала) — если оно НЕ адресовано боту
   // явно, вообще не гоняем его через vision-модель: это самый частый
@@ -4206,6 +4271,10 @@ bot.on("message:photo", async (ctx) => {
   const forwarded = isForwardedMessage(ctx.message);
   if (forwarded && !toBot) {
     return;
+  }
+
+  if (toBot) {
+    sendTypingAction(ctx);
   }
 
   let caption;
@@ -4275,8 +4344,6 @@ bot.on("message:photo", async (ctx) => {
   // шаблонным пересказом описания. Тег "[фото от Имя: описание]" разобран
   // в SYSTEM_PROMPT.
   try {
-    await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
-
     let question = captionText ? stripNameTrigger(captionText) : "";
     if (isMentioned && question) {
       question = question.replace(new RegExp(`@${ctx.me.username}`, "i"), "").trim();
@@ -4286,20 +4353,26 @@ bot.on("message:photo", async (ctx) => {
       `[фото от ${displayName}: ${caption}] ${displayName}: ` +
       (question || "гляну, что скажешь про фото?");
 
-    const { text: reply, stickerKey } = await askLLM(chatId, userText);
-    await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
+    let reply, stickerKey;
+    await withTyping(ctx, async () => {
+      const res = await askLLM(chatId, userText);
+      reply = res.text;
+      stickerKey = res.stickerKey;
+      await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
+    });
 
+    const threadId = getThreadId(ctx);
     const stickerId = stickerKey && pickSticker(stickerKey);
     if (stickerId) {
       const sentMsg = await ctx.replyWithSticker(stickerId, {
         reply_parameters: { message_id: ctx.message.message_id },
-        message_thread_id: ctx.message.message_thread_id,
+        message_thread_id: threadId,
       });
       rememberBotReply(chatId, sentMsg.message_id, displayName, reply);
     } else {
       const sentMsg = await ctx.reply(reply, {
         reply_parameters: { message_id: ctx.message.message_id },
-        message_thread_id: ctx.message.message_thread_id,
+        message_thread_id: threadId,
       });
       rememberBotReply(chatId, sentMsg.message_id, displayName, reply);
     }
@@ -4407,9 +4480,7 @@ bot.on("message:text", async (ctx) => {
   // обычный чат) уйдёт обработка. Не await — это просто индикатор, ждать
   // его не нужно, а ошибку (например нет прав в чате) тихо проглатываем.
   if (!isGroup) {
-    ctx
-      .replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id })
-      .catch(() => {});
+    sendTypingAction(ctx);
   }
 
   if (isGroup) {
@@ -4421,8 +4492,7 @@ bot.on("message:text", async (ctx) => {
     // 3) бота явно упомянули через @username
     // 4) кто-то позвал настоящего Женю через его тег в Telegram (@EVGEN1Y_V)
     const startsWithName = nameTriggerRegex.test(userText);
-    const isReplyToBot =
-      ctx.message.reply_to_message?.from?.id === ctx.me.id;
+    const isReply = isReplyToBot(ctx);
     const isMentioned =
       ctx.message.entities?.some(
         (e) =>
@@ -4432,7 +4502,7 @@ bot.on("message:text", async (ctx) => {
             .toLowerCase() === `@${ctx.me.username?.toLowerCase()}`
       ) ?? false;
     const isOwnerMentioned = ownerMentionRegex.test(userText);
-    const isAddressedToBot = startsWithName || isReplyToBot || isMentioned || isOwnerMentioned;
+    const isAddressedToBot = startsWithName || isReply || isMentioned || isOwnerMentioned;
 
     // Пишем сообщение в лог чата (см. pushChatLog) ДО фильтра "не наше
     // сообщение — молчим" ниже — иначе в лог попадали бы только реплики,
@@ -4457,11 +4527,8 @@ bot.on("message:text", async (ctx) => {
     // триггер-фразе. Более точечные вызовы replyWithChatAction("typing")
     // ниже по коду не мешают — Telegram просто продлевает уже показанный
     // статус ещё на ~5 секунд.
-    console.log(`[typing] fire isReplyToBot=${isReplyToBot} startsWithName=${startsWithName} isMentioned=${isMentioned}`);
-    ctx
-      .replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id })
-      .then(() => console.log("[typing] ok"))
-      .catch((err) => console.error("[typing] FAILED:", err.description ?? err.message ?? err));
+    console.log(`[typing] fire isReply=${isReply} startsWithName=${startsWithName} isMentioned=${isMentioned}`);
+    sendTypingAction(ctx);
 
     if (startsWithName) {
       userText = stripNameTrigger(userText);
@@ -4503,7 +4570,7 @@ bot.on("message:text", async (ctx) => {
 
     // Если позвали именно тег настоящего Жени (а не по имени/реплаем на
     // бота) — добавляем метку-подсказку, см. пояснение в SYSTEM_PROMPT.
-    if (isOwnerMentioned && !startsWithName && !isReplyToBot && !isMentioned) {
+    if (isOwnerMentioned && !startsWithName && !isReply && !isMentioned) {
       userText = `[позвали через тег настоящего Жени @${OWNER_USERNAME}] ${userText}`;
     }
 
@@ -4518,7 +4585,7 @@ bot.on("message:text", async (ctx) => {
     // лимит TPM на пачках пересланных мемов).
     const repliedTo = ctx.message.reply_to_message;
     let repliedTag = "";
-    if (repliedTo && repliedTo.from?.id !== ctx.me.id) {
+    if (repliedTo && !isReplyToBot(ctx)) {
       const repliedName = getDisplayName(chatId, repliedTo.from);
 
       if (repliedTo.photo) {
@@ -4697,7 +4764,7 @@ bot.on("message:text", async (ctx) => {
   // фильме речь. В отличие от repliedTag выше (только для группы и только
   // для чужих сообщений) — этот работает и в группе, и в личке, потому что
   // тут всегда реплай именно на СВОЁ (ботовское) сообщение.
-  if (ctx.message.reply_to_message?.from?.id === ctx.me.id) {
+  if (isReplyToBot(ctx)) {
     const movieCard = getMovieCard(chatId, ctx.message.reply_to_message.message_id);
     if (movieCard) {
       const parts = [`${movieCard.kindLabel} «${movieCard.title}»${movieCard.year ? ` (${movieCard.year})` : ""}`];
@@ -4726,7 +4793,7 @@ bot.on("message:text", async (ctx) => {
   // ответе тихо уходим на курируемую базу (см. getJoke/JOKES выше).
   // Модель на такую просьбу обычно выдумывает несмешную ерунду.
   if (isJokeRequest(stripBotAddressing(rawText, ctx))) {
-    await ctx.replyWithChatAction("typing", { message_thread_id: ctx.message.message_thread_id });
+    sendTypingAction(ctx);
     await ctx.reply(await getJoke(chatId), { reply_parameters: { message_id: ctx.message.message_id } });
     return;
   }
@@ -4762,7 +4829,7 @@ bot.on("message:text", async (ctx) => {
   // подмешан в userText выше, и туда должен пойти обычный askLLM, а не
   // отдельный recap-пайплайн по логу чата.
   if (isGroup && !repliedToHandled && RECAP_INTENT_REGEX.test(stripBotAddressing(rawText, ctx))) {
-    await handleRecapQuery(ctx, chatId, parseRecapCount(rawText));
+    await handleRecapQuery(ctx, chatId, parseRecapCount(stripBotAddressing(rawText, ctx)));
     return;
   }
 
@@ -5188,20 +5255,13 @@ bot.on("message:text", async (ctx) => {
   }
 
   try {
-    // Явно прокидываем message_thread_id (для групп с темами/топиками) —
-    // без этого "печатает" иногда не показывается в конкретной теме,
-    // даже если сам запрос уходит в общий чат.
-    await ctx.replyWithChatAction("typing", {
-      message_thread_id: ctx.message.message_thread_id,
+    let reply, stickerKey;
+    await withTyping(ctx, async () => {
+      const res = await askLLM(chatId, userText);
+      reply = res.text;
+      stickerKey = res.stickerKey;
+      await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
     });
-
-    // Groq отвечает быстро, так что подтягиваем ответ параллельно с "печатает..."
-    const replyPromise = askLLM(chatId, userText);
-
-    const { text: reply, stickerKey } = await replyPromise;
-
-    // держим typing включенным нужное время, чтобы не было мгновенного ответа
-    await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
 
     // Если явная фраза уже вызвала стикер по regex выше — не дублируем
     // ещё одним стикером от тега модели на то же сообщение.
