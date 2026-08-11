@@ -4685,19 +4685,41 @@ async function getDeezerCdnUrl(trackId, format = "MP3_320") {
 }
 
 async function getDeezerAudioBuffer(trackId, format = "MP3_320") {
-  // Primary: fetch via proxy /stream — it handles Blowfish decryption server-side.
-  const streamUrl = getDeezerStreamUrl(trackId, format);
-  let res = await fetch(streamUrl);
-
-  // Fallback: if proxy fails (e.g. no ARL → 503), try CDN + local decrypt
-  if (!res.ok) {
-    const cdnUrl = await getDeezerCdnUrl(trackId, format);
-    res = await fetch(cdnUrl);
-    if (!res.ok) throw new Error(`Failed to fetch audio stream: ${res.status}`);
-    const rawBuf = await res.arrayBuffer();
-    return decryptDeezerBufferIfNeeded(trackId, rawBuf);
+  // Step 1: get CDN URL via /stream_info which returns real quality + signed URL in log field
+  try {
+    const infoUrl = new URL(`${DEEZER_SPACE_URL}/stream_info`);
+    infoUrl.searchParams.set("id", String(trackId));
+    infoUrl.searchParams.set("format", format);
+    if (DEEZER_ARL) infoUrl.searchParams.set("arl", DEEZER_ARL);
+    const infoRes = await fetch(infoUrl.toString());
+    if (infoRes.ok) {
+      const info = await infoRes.json();
+      // CDN URL is embedded in info.log as a JSON string starting with "{"
+      let cdnUrl = null;
+      try {
+        const logStart = (info.log || "").indexOf("{");
+        if (logStart !== -1) {
+          const mediaJson = JSON.parse(info.log.slice(logStart));
+          cdnUrl = mediaJson?.data?.[0]?.media?.[0]?.sources?.[0]?.url || null;
+        }
+      } catch (_) {}
+      if (cdnUrl) {
+        const res = await fetch(cdnUrl);
+        if (res.ok) {
+          const rawBuf = await res.arrayBuffer();
+          // trackId for key derivation should be the real ID from stream_info
+          return decryptDeezerBufferIfNeeded(info.id || trackId, rawBuf);
+        }
+      }
+    }
+  } catch (e) {
+    console.error("stream_info failed:", e.message);
   }
 
+  // Fallback: proxy /stream (decrypts server-side, quality depends on ARL)
+  const streamUrl = getDeezerStreamUrl(trackId, format);
+  const res = await fetch(streamUrl);
+  if (!res.ok) throw new Error(`Failed to fetch audio stream: ${res.status}`);
   const buf = await res.arrayBuffer();
   return Buffer.from(buf);
 }
@@ -4716,9 +4738,11 @@ async function handleDeezerQuery(ctx, query) {
     const format = userId
       ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
       : DEFAULT_DEEZER_QUALITY;
-    const audioBuffer = await getDeezerAudioBuffer(bestTrack.id, format);
 
-    await ctx.replyWithAudio(new InputFile(audioBuffer, `${bestTrack.artist?.name || "Track"} - ${bestTrack.title}.mp3`), {
+    // Отправляем URL напрямую — Telegram сам качает с HuggingFace, Render не трогает аудио
+    const streamUrl = getDeezerStreamUrl(bestTrack.id, format);
+
+    await ctx.replyWithAudio(streamUrl, {
       title: bestTrack.title,
       performer: bestTrack.artist?.name || "",
       duration: bestTrack.duration,
@@ -4812,11 +4836,30 @@ bot.on("message:text", async (ctx) => {
   // которые парсит не LLM, а chess.js.
   const rawText = ctx.message.text;
 
-  // ==== Музыка / Deezer ("скинь песню Название") ====
+  // ==== Музыка / Deezer ====
+  // 1. Прямой intent-запрос ("скинь песню X", "найди трек X")
   const deezerQuery = parseDeezerIntent(stripBotAddressing(rawText, ctx));
   if (deezerQuery) {
     await handleDeezerQuery(ctx, deezerQuery);
     return;
+  }
+
+  // 2. Reply на сообщение бота с intent-запросом или просто названием трека
+  const replyMsg = ctx.message.reply_to_message;
+  if (replyMsg && replyMsg.from?.is_bot) {
+    // Пользователь ответил на сообщение бота — проверяем intent
+    const replyIntent = parseDeezerIntent(rawText);
+    if (replyIntent) {
+      await handleDeezerQuery(ctx, replyIntent);
+      return;
+    }
+    // Если бот спрашивал о музыке (его сообщение содержит "Загружаю" или "не найдено" или "Deezer")
+    const botMsgText = replyMsg.text || replyMsg.caption || "";
+    const isBotMusicMsg = /Загружаю|найден|Deezer|🎵|🎚/i.test(botMsgText);
+    if (isBotMusicMsg && rawText.length > 1 && rawText.length < 200) {
+      await handleDeezerQuery(ctx, rawText.trim());
+      return;
+    }
   }
 
   // Определяем пол пораньше (до проверки триггеров), чтобы выбрать нужный
