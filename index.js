@@ -2,6 +2,7 @@ import { Bot, InlineKeyboard } from "grammy";
 import express from "express";
 import { Redis } from "@upstash/redis";
 import { Chess } from "chess.js";
+import crypto from "node:crypto";
 
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
