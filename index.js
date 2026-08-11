@@ -2702,9 +2702,15 @@ function decryptStripeNative(block2048, keyBuffer) {
 
 function looksMp3OrFlac(u8) {
   if (!u8 || u8.length < 4) return false;
-  if (u8[0] === 0x49 && u8[1] === 0x44 && u8[2] === 0x33) return true; // ID3
-  if (u8[0] === 0x66 && u8[1] === 0x4c && u8[2] === 0x61 && u8[3] === 0x43) return true; // fLaC
-  if (u8[0] === 0xff && (u8[1] & 0xe0) === 0xe0) return true; // frame sync
+  if (u8[0] === 0x49 && u8[1] === 0x44 && u8[2] === 0x33) return true; // ID3 tag
+  if (u8[0] === 0x66 && u8[1] === 0x4c && u8[2] === 0x61 && u8[3] === 0x43) return true; // FLAC tag
+
+  const limit = Math.min(4096, u8.length - 1);
+  for (let i = 0; i < limit; i++) {
+    if (u8[i] === 0xff && (u8[i + 1] & 0xe0) === 0xe0) {
+      return true;
+    }
+  }
   return false;
 }
 
