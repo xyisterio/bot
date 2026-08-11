@@ -5864,6 +5864,7 @@ app.listen(PORT, () => console.log(`HTTP ping-сервер запущен на �
 async function registerCommands() {
   await bot.api.setMyCommands([
     { command: "song", description: "найти и прислать песню с Deezer" },
+    { command: "quality", description: "выбрать качество Deezer (128 / 320 / FLAC)" },
     { command: "start", description: "начать (сброс памяти)" },
     { command: "reset", description: "очистить историю переписки" },
     { command: "alias", description: "задать имя человеку вместо ника" },
