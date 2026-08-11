@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard } from "grammy";
+import { Bot, InlineKeyboard, InputFile } from "grammy";
 import express from "express";
 import { Redis } from "@upstash/redis";
 import { Chess } from "chess.js";
@@ -3928,6 +3928,68 @@ function getDeezerStreamUrl(trackId, format = "MP3_320") {
   return url;
 }
 
+async function getDeezerCdnUrl(trackId, format = "MP3_320") {
+  try {
+    const res = await fetch(`${DEEZER_SPACE_URL}/get_url`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids: [trackId], formats: [format, "MP3_128"] }),
+    });
+    if (res.ok) {
+      const json = await res.json();
+      const cdnUrl = json.data?.[0]?.media?.[0]?.sources?.[0]?.url;
+      if (cdnUrl) return cdnUrl;
+    }
+  } catch (err) {
+    console.warn("Inline get_url error:", err.message);
+  }
+  return getDeezerStreamUrl(trackId, format);
+}
+
+async function getDeezerAudioBuffer(trackId, format = "MP3_320") {
+  // 1. Пробуем получить прямой поток через /stream (если задан ARL или не требуется)
+  try {
+    const streamUrl = getDeezerStreamUrl(trackId, format);
+    const res = await fetch(streamUrl);
+    if (res.ok) {
+      const arrayBuf = await res.arrayBuffer();
+      if (arrayBuf.byteLength > 1000) {
+        return Buffer.from(arrayBuf);
+      }
+    }
+  } catch (err) {
+    console.warn("Не удалось получить поток через /stream:", err.message);
+  }
+
+  // 2. Резервный источник: получаем прямой CDN-URL со спейса через /get_url
+  const getUrlRes = await fetch(`${DEEZER_SPACE_URL}/get_url`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: [trackId], formats: [format, "MP3_128"] }),
+  });
+
+  if (!getUrlRes.ok) {
+    throw new Error(`HF Space status ${getUrlRes.status}`);
+  }
+
+  const json = await getUrlRes.json();
+  const mediaList = json.data?.[0]?.media || [];
+  const media = mediaList.find((m) => m.format === format) || mediaList[0];
+  const cdnUrl = media?.sources?.[0]?.url;
+
+  if (!cdnUrl) {
+    throw new Error("Не удалось получить CDN ссылку на аудио со спейса");
+  }
+
+  const cdnRes = await fetch(cdnUrl);
+  if (!cdnRes.ok) {
+    throw new Error(`CDN status ${cdnRes.status}`);
+  }
+
+  const arrayBuf = await cdnRes.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
 async function handleDeezerQuery(ctx, query) {
   sendTypingAction(ctx);
   try {
@@ -3941,13 +4003,15 @@ async function handleDeezerQuery(ctx, query) {
     }
 
     const bestTrack = tracks[0];
-    const streamUrl = getDeezerStreamUrl(bestTrack.id, "MP3_320");
     const title = bestTrack.title || "Песня";
     const performer = bestTrack.artist?.name || "Исполнитель";
     const duration = bestTrack.duration || 0;
     const coverUrl = bestTrack.album?.cover_medium || bestTrack.album?.cover_big;
 
-    await ctx.replyWithAudio(streamUrl, {
+    // Скачиваем аудиобуфер через спейс и передаём напрямую как InputFile
+    const audioBuffer = await getDeezerAudioBuffer(bestTrack.id, "MP3_320");
+
+    await ctx.replyWithAudio(new InputFile(audioBuffer, `${performer} - ${title}.mp3`), {
       title,
       performer,
       duration,
@@ -3956,8 +4020,8 @@ async function handleDeezerQuery(ctx, query) {
       message_thread_id: ctx.message.message_thread_id,
     });
   } catch (err) {
-    console.error("Ошибка при получении трека Deezer:", err.message);
-    await ctx.reply("не удалось загрузить трек, попробуй ещё раз", {
+    console.error("Ошибка при получении трека Deezer:", err.message || err);
+    await ctx.reply(`не удалось загрузить трек: ${err.message || err}`, {
       reply_parameters: { message_id: ctx.message.message_id },
       message_thread_id: ctx.message.message_thread_id,
     });
@@ -3973,24 +4037,26 @@ bot.on("inline_query", async (ctx) => {
   }
 
   try {
-    const tracks = await searchDeezerTracks(query, 20);
-    const results = tracks.map((track) => {
-      const streamUrl = getDeezerStreamUrl(track.id, "MP3_320");
-      const performer = track.artist?.name || "Исполнитель";
-      const title = track.title || "Песня";
-      const coverUrl = track.album?.cover_medium || track.album?.cover_big;
+    const tracks = await searchDeezerTracks(query, 10);
+    const results = await Promise.all(
+      tracks.map(async (track) => {
+        const audioUrl = await getDeezerCdnUrl(track.id, "MP3_320");
+        const performer = track.artist?.name || "Исполнитель";
+        const title = track.title || "Песня";
+        const coverUrl = track.album?.cover_medium || track.album?.cover_big;
 
-      return {
-        type: "audio",
-        id: String(track.id),
-        audio_url: streamUrl,
-        title,
-        performer,
-        audio_duration: track.duration || 0,
-        caption: `🎵 ${performer} — ${title}`,
-        thumbnail_url: coverUrl,
-      };
-    });
+        return {
+          type: "audio",
+          id: String(track.id),
+          audio_url: audioUrl,
+          title,
+          performer,
+          audio_duration: track.duration || 0,
+          caption: `🎵 ${performer} — ${title}`,
+          thumbnail_url: coverUrl,
+        };
+      })
+    );
 
     await ctx.answerInlineQuery(results, { cache_time: 300 });
   } catch (err) {
