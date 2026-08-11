@@ -2681,6 +2681,8 @@ async function loadPersistedState() {
 const DEEZER_SPACE_URL = process.env.DEEZER_SPACE_URL || "https://recycleactor-deezer.hf.space";
 const DEEZER_ARL = process.env.DEEZER_ARL || "";
 const DEFAULT_DEEZER_QUALITY = process.env.DEEZER_QUALITY || "MP3_320";
+// CF Worker URL — если задан, Telegram скачивает через него (обход блокировки HF)
+const DEEZER_PROXY_URL = process.env.DEEZER_PROXY_URL || "";
 
 const SECRET = "g4el58wc0zvf9na1";
 
@@ -4644,8 +4646,11 @@ async function searchDeezerTracks(query, limit = 10) {
   return data.data || [];
 }
 
-function getDeezerStreamUrl(trackId, format = "MP3_320") {
-  let url = `${DEEZER_SPACE_URL}/stream?id=${encodeURIComponent(trackId)}&format=${encodeURIComponent(format)}`;
+function getDeezerStreamUrl(trackId, format = "MP3_320", useProxy = false) {
+  // useProxy=true — строим URL через CF Worker (для Telegram sendAudio)
+  // useProxy=false — прямой HuggingFace URL (для HF-запросов с Render)
+  const base = (useProxy && DEEZER_PROXY_URL) ? DEEZER_PROXY_URL : DEEZER_SPACE_URL;
+  let url = `${base}/stream?id=${encodeURIComponent(trackId)}&format=${encodeURIComponent(format)}`;
   if (DEEZER_ARL) {
     url += `&arl=${encodeURIComponent(DEEZER_ARL)}`;
   }
@@ -4739,36 +4744,39 @@ async function handleDeezerQuery(ctx, query) {
       ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
       : DEFAULT_DEEZER_QUALITY;
 
-    // Проверяем кэш file_id в Redis (каждый трек скачивается только один раз)
-    const cacheKey = `deezer_fid:${bestTrack.id}:${format}`;
-    const cachedFileId = await redis.get(cacheKey);
-
-    let sentMsg;
-    if (cachedFileId) {
-      sentMsg = await ctx.replyWithAudio(cachedFileId, {
+    if (DEEZER_PROXY_URL) {
+      // CF Worker задан — Telegram качает через него, Render не трогает аудио
+      const proxyUrl = getDeezerStreamUrl(bestTrack.id, format, true);
+      await ctx.replyWithAudio(proxyUrl, {
         title: bestTrack.title,
         performer: bestTrack.artist?.name || "",
         duration: bestTrack.duration,
       });
     } else {
-      // Стримим с HuggingFace через Render напрямую в Telegram (не буферизуем)
-      const streamUrl = getDeezerStreamUrl(bestTrack.id, format);
-      const res = await fetch(streamUrl);
-      if (!res.ok) throw new Error(`Stream error ${res.status}: ${await res.text()}`);
+      // Fallback: Render стримит с HuggingFace и кэширует file_id
+      const cacheKey = `deezer_fid:${bestTrack.id}:${format}`;
+      const cachedFileId = await redis.get(cacheKey);
 
-      const ext = format === "FLAC" ? "flac" : "mp3";
-      const fileName = `${bestTrack.artist?.name || "Track"} - ${bestTrack.title}.${ext}`;
-
-      sentMsg = await ctx.replyWithAudio(new InputFile(res.body, fileName), {
-        title: bestTrack.title,
-        performer: bestTrack.artist?.name || "",
-        duration: bestTrack.duration,
-      });
-
-      // Кэшируем Telegram file_id на 30 дней
-      const fileId = sentMsg?.audio?.file_id;
-      if (fileId) {
-        await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
+      let sentMsg;
+      if (cachedFileId) {
+        sentMsg = await ctx.replyWithAudio(cachedFileId, {
+          title: bestTrack.title,
+          performer: bestTrack.artist?.name || "",
+          duration: bestTrack.duration,
+        });
+      } else {
+        const streamUrl = getDeezerStreamUrl(bestTrack.id, format);
+        const res = await fetch(streamUrl);
+        if (!res.ok) throw new Error(`Stream error ${res.status}: ${await res.text()}`);
+        const ext = format === "FLAC" ? "flac" : "mp3";
+        const fileName = `${bestTrack.artist?.name || "Track"} - ${bestTrack.title}.${ext}`;
+        sentMsg = await ctx.replyWithAudio(new InputFile(res.body, fileName), {
+          title: bestTrack.title,
+          performer: bestTrack.artist?.name || "",
+          duration: bestTrack.duration,
+        });
+        const fileId = sentMsg?.audio?.file_id;
+        if (fileId) await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
       }
     }
 
@@ -4834,7 +4842,7 @@ bot.on("inline_query", async (ctx) => {
       : DEFAULT_DEEZER_QUALITY;
     const tracks = await searchDeezerTracks(query, 10);
     const results = tracks.map((track) => {
-      const audioUrl = getDeezerStreamUrl(track.id, format);
+      const audioUrl = getDeezerStreamUrl(track.id, format, true); // useProxy=true для инлайна
       return {
         type: "audio",
         id: String(track.id),
