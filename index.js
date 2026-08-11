@@ -4739,14 +4739,38 @@ async function handleDeezerQuery(ctx, query) {
       ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
       : DEFAULT_DEEZER_QUALITY;
 
-    // Отправляем URL напрямую — Telegram качает с HuggingFace, Render не трогает аудио
-    const streamUrl = getDeezerStreamUrl(bestTrack.id, format);
+    // Проверяем кэш file_id в Redis (каждый трек скачивается только один раз)
+    const cacheKey = `deezer_fid:${bestTrack.id}:${format}`;
+    const cachedFileId = await redis.get(cacheKey);
 
-    await ctx.replyWithAudio(streamUrl, {
-      title: bestTrack.title,
-      performer: bestTrack.artist?.name || "",
-      duration: bestTrack.duration,
-    });
+    let sentMsg;
+    if (cachedFileId) {
+      sentMsg = await ctx.replyWithAudio(cachedFileId, {
+        title: bestTrack.title,
+        performer: bestTrack.artist?.name || "",
+        duration: bestTrack.duration,
+      });
+    } else {
+      // Стримим с HuggingFace через Render напрямую в Telegram (не буферизуем)
+      const streamUrl = getDeezerStreamUrl(bestTrack.id, format);
+      const res = await fetch(streamUrl);
+      if (!res.ok) throw new Error(`Stream error ${res.status}: ${await res.text()}`);
+
+      const ext = format === "FLAC" ? "flac" : "mp3";
+      const fileName = `${bestTrack.artist?.name || "Track"} - ${bestTrack.title}.${ext}`;
+
+      sentMsg = await ctx.replyWithAudio(new InputFile(res.body, fileName), {
+        title: bestTrack.title,
+        performer: bestTrack.artist?.name || "",
+        duration: bestTrack.duration,
+      });
+
+      // Кэшируем Telegram file_id на 30 дней
+      const fileId = sentMsg?.audio?.file_id;
+      if (fileId) {
+        await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
+      }
+    }
 
     try {
       await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
