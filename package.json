@@ -5,7 +5,7 @@
   "description": "Разговорный Telegram-бот на grammy + Groq API",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node --openssl-legacy-provider index.js"
   },
   "dependencies": {
     "grammy": "^1.30.0",
