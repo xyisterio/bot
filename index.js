@@ -4657,6 +4657,16 @@ function getDeezerStreamUrl(trackId, format = "MP3_320", useProxy = false) {
   return url;
 }
 
+// /download — полный файл с Content-Length (для sendAudio по URL)
+function getDeezerDownloadUrl(trackId, format = "MP3_320", useProxy = false) {
+  const base = (useProxy && DEEZER_PROXY_URL) ? DEEZER_PROXY_URL : DEEZER_SPACE_URL;
+  let url = `${base}/download?id=${encodeURIComponent(trackId)}&format=${encodeURIComponent(format)}`;
+  if (DEEZER_ARL) {
+    url += `&arl=${encodeURIComponent(DEEZER_ARL)}`;
+  }
+  return url;
+}
+
 async function getDeezerCdnUrl(trackId, format = "MP3_320") {
   try {
     const payload = {
@@ -4745,9 +4755,9 @@ async function handleDeezerQuery(ctx, query) {
       : DEFAULT_DEEZER_QUALITY;
 
     if (DEEZER_PROXY_URL) {
-      // CF Worker задан — Telegram качает через него, Render не трогает аудио
-      const proxyUrl = getDeezerStreamUrl(bestTrack.id, format, true);
-      await ctx.replyWithAudio(proxyUrl, {
+      // CF Worker задан — Telegram качает через /download (полный файл + Content-Length)
+      const downloadUrl = getDeezerDownloadUrl(bestTrack.id, format, true);
+      await ctx.replyWithAudio(downloadUrl, {
         title: bestTrack.title,
         performer: bestTrack.artist?.name || "",
         duration: bestTrack.duration,
