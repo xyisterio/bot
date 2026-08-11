@@ -4685,15 +4685,21 @@ async function getDeezerCdnUrl(trackId, format = "MP3_320") {
 }
 
 async function getDeezerAudioBuffer(trackId, format = "MP3_320") {
-  const cdnUrl = await getDeezerCdnUrl(trackId, format);
-  let res = await fetch(cdnUrl);
-  if (!res.ok && DEEZER_ARL) {
-    const streamUrl = getDeezerStreamUrl(trackId, format);
-    res = await fetch(streamUrl);
+  // Primary: fetch via proxy /stream — it handles Blowfish decryption server-side.
+  const streamUrl = getDeezerStreamUrl(trackId, format);
+  let res = await fetch(streamUrl);
+
+  // Fallback: if proxy fails (e.g. no ARL → 503), try CDN + local decrypt
+  if (!res.ok) {
+    const cdnUrl = await getDeezerCdnUrl(trackId, format);
+    res = await fetch(cdnUrl);
+    if (!res.ok) throw new Error(`Failed to fetch audio stream: ${res.status}`);
+    const rawBuf = await res.arrayBuffer();
+    return decryptDeezerBufferIfNeeded(trackId, rawBuf);
   }
-  if (!res.ok) throw new Error(`Failed to fetch audio stream: ${res.status}`);
-  const rawBuf = await res.arrayBuffer();
-  return decryptDeezerBufferIfNeeded(trackId, rawBuf);
+
+  const buf = await res.arrayBuffer();
+  return Buffer.from(buf);
 }
 
 async function handleDeezerQuery(ctx, query) {
