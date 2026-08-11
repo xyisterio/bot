@@ -4754,14 +4754,42 @@ async function handleDeezerQuery(ctx, query) {
       ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
       : DEFAULT_DEEZER_QUALITY;
 
-    // Прямой /download с HuggingFace — отдаёт полный файл с Content-Length
-    const downloadUrl = getDeezerDownloadUrl(bestTrack.id, format);
-    await ctx.replyWithAudio(downloadUrl, {
-      title: bestTrack.title,
-      performer: bestTrack.artist?.name || "",
-      duration: bestTrack.duration,
-    });
+    // Проверяем кэш Redis — если уже отправляли этот трек, повторно скачивать не надо
+    const cacheKey = `deezer_fid:${bestTrack.id}:${format}`;
+    const cachedFileId = await redis.get(cacheKey);
 
+    if (cachedFileId) {
+      // Отправляем по Telegram file_id — ни Render ни HF не качают ничего
+      await ctx.replyWithAudio(cachedFileId, {
+        title: bestTrack.title,
+        performer: bestTrack.artist?.name || "",
+        duration: bestTrack.duration,
+      });
+    } else {
+      // HuggingFace сам качает трек и загружает его в Telegram через multipart
+      const chatId = ctx.chat.id;
+      const params = new URLSearchParams({
+        id: String(bestTrack.id),
+        format,
+        chat_id: String(chatId),
+        title: bestTrack.title || "",
+        performer: bestTrack.artist?.name || "",
+        duration: String(bestTrack.duration || 0),
+      });
+      if (DEEZER_ARL) params.set("arl", DEEZER_ARL);
+
+      const hfRes = await fetch(`${DEEZER_SPACE_URL}/send_audio?${params}`);
+      const hfJson = await hfRes.json();
+
+      if (!hfJson.ok) throw new Error(`HF send_audio: ${hfJson.error || hfRes.status}`);
+
+      // Кэшируем file_id на 30 дней
+      if (hfJson.file_id) {
+        await redis.set(cacheKey, hfJson.file_id, { ex: 60 * 60 * 24 * 30 });
+      }
+
+      // HF уже отправил аудио в чат — удаляем только статус-сообщение
+    }
 
 
     try {
