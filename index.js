@@ -3633,6 +3633,29 @@ async function fetchTmdbTrailerInfo(kind, id) {
 // обновлялась и может сломаться, если YouTube поменяет вёрстку —
 // поэтому вся функция обёрнута так, чтобы в этом случае просто вернуть
 // null, а не уронить бота.
+// Убирает пунктуацию/лишние пробелы и приводит к нижнему регистру — нужно
+// для сравнения названия фильма с заголовком видео из выдачи YouTube.
+function normalizeForMatch(s) {
+  return (s || "")
+    .toLowerCase()
+    .replace(/[«»"'.,:;!?()\-–—]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Настоящий фильм/сериал сначала на YouTube ищем свободно, но БЕЗ проверки
+// релевантности выдача может подсунуть совершенно левое видео — YouTube
+// иногда ранжирует общие "трейлерные" каналы выше, чем конкретный тайтл
+// (так однажды словили "Киностудия — Русский трейлер" вместо "Кабул").
+// Поэтому обязательно требуем, чтобы нормализованное название фильма
+// целиком входило в заголовок видео — это отсекает случайные совпадения
+// по одному только слову "трейлер".
+function titleMatchesVideo(videoTitle, movieTitle) {
+  const normVideo = normalizeForMatch(videoTitle);
+  const normMovie = normalizeForMatch(movieTitle);
+  return normMovie.length > 0 && normVideo.includes(normMovie);
+}
+
 async function searchYoutubeTrailerRu(title, year) {
   let yts;
   try {
@@ -3642,16 +3665,20 @@ async function searchYoutubeTrailerRu(title, year) {
     return null;
   }
 
-  const queries = [
-    `${title} ${year || ""} русский трейлер`.trim(),
-    `${title} ${year || ""} трейлер`.trim(),
-  ];
+  // Короткий запрос без "русский"/года — по наблюдению именно такой
+  // формулировкой YouTube отдаёт релевантные ролики первыми (см. ручную
+  // проверку "кабул трейлер"). Год пробуем вторым заходом — иногда
+  // отсекает совсем старые ролики-однофамильцы, но может и увести
+  // ранжирование не туда, поэтому он вторичный, а не основной.
+  const queries = [`${title} трейлер`, `${title} ${year || ""} трейлер`.trim()];
 
   for (const q of queries) {
     try {
       const r = await yts(q);
       const candidates = (r.videos || []).filter((v) => v.seconds && v.seconds >= 20 && v.seconds <= 420);
-      const pick = candidates.find((v) => /трейлер|trailer/i.test(v.title)) || candidates[0];
+      const pick = candidates.find(
+        (v) => titleMatchesVideo(v.title, title) && /трейлер|trailer/i.test(v.title),
+      );
       if (pick) return pick.videoId ? `https://www.youtube.com/watch?v=${pick.videoId}` : pick.url || null;
     } catch (err) {
       console.error(`Ошибка yt-search по запросу "${q}":`, err.message);
