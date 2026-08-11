@@ -4754,42 +4754,36 @@ async function handleDeezerQuery(ctx, query) {
       ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
       : DEFAULT_DEEZER_QUALITY;
 
-    // Проверяем кэш Redis — если уже отправляли этот трек, повторно скачивать не надо
+    // Кэш file_id — трек скачивается через Render только один раз
     const cacheKey = `deezer_fid:${bestTrack.id}:${format}`;
     const cachedFileId = await redis.get(cacheKey);
 
     if (cachedFileId) {
-      // Отправляем по Telegram file_id — ни Render ни HF не качают ничего
       await ctx.replyWithAudio(cachedFileId, {
         title: bestTrack.title,
         performer: bestTrack.artist?.name || "",
         duration: bestTrack.duration,
       });
     } else {
-      // HuggingFace сам качает трек и загружает его в Telegram через multipart
-      const chatId = ctx.chat.id;
-      const params = new URLSearchParams({
-        id: String(bestTrack.id),
-        format,
-        chat_id: String(chatId),
-        title: bestTrack.title || "",
+      // Шаг 1: прогреваем CDN URL кэш на HuggingFace (делает Deezer API запросы заранее)
+      const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
+      if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
+      await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
+
+      // Шаг 2: Telegram качает /stream напрямую с HF — кэш уже горячий, первый байт мгновенно
+      const streamUrl = getDeezerStreamUrl(bestTrack.id, format);
+      const sentMsg = await ctx.replyWithAudio(streamUrl, {
+        title: bestTrack.title,
         performer: bestTrack.artist?.name || "",
-        duration: String(bestTrack.duration || 0),
+        duration: bestTrack.duration,
       });
-      if (DEEZER_ARL) params.set("arl", DEEZER_ARL);
 
-      const hfRes = await fetch(`${DEEZER_SPACE_URL}/send_audio?${params}`);
-      const hfJson = await hfRes.json();
-
-      if (!hfJson.ok) throw new Error(`HF send_audio: ${hfJson.error || hfRes.status}`);
-
-      // Кэшируем file_id на 30 дней
-      if (hfJson.file_id) {
-        await redis.set(cacheKey, hfJson.file_id, { ex: 60 * 60 * 24 * 30 });
-      }
-
-      // HF уже отправил аудио в чат — удаляем только статус-сообщение
+      // Кэшируем Telegram file_id на 30 дней
+      const fileId = sentMsg?.audio?.file_id;
+      if (fileId) await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
     }
+
+
 
 
     try {
