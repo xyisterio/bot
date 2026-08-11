@@ -3572,6 +3572,11 @@ async function fetchTmdbDetails(kind, id) {
   const data = await res.json();
   return {
     title: kind === "tv" ? data.name : data.title,
+    // Оригинальное (не переведённое) название — нужно, чтобы сверять с
+    // ним заголовки видео из TMDB/videos: у иностранных тайтлов
+    // локализованные трейлеры на английском обычно называются как раз
+    // оригинальным именем, а не русским.
+    originalTitle: kind === "tv" ? data.original_name : data.original_title,
     date: kind === "tv" ? data.first_air_date : data.release_date,
     voteAverage: data.vote_average,
     genres: data.genres || [],
@@ -3591,7 +3596,13 @@ async function fetchTmdbDetails(kind, id) {
 // оригинальное/английское) и помечаем isRu: false, чтобы вызывающий код
 // знал, что это не русский трейлер и мог ещё попробовать YouTube-поиск.
 // Возвращает null, если видео нет вовсе.
-async function fetchTmdbTrailerInfo(kind, id) {
+//
+// TMDB — краудсорс-база, и у видео иногда встречается кривая привязка не
+// к тому тайтлу (перепутали с одноимённым/похожим фильмом). Поэтому
+// доверяем не всем видео подряд, а только тем, чьё название (поле
+// "name" у видео) реально пересекается с названием тайтла — русским или
+// оригинальным (см. titleMatchesVideo/normalizeForMatch ниже).
+async function fetchTmdbTrailerInfo(kind, id, movieTitle, originalTitle) {
   const endpoint = kind === "tv" ? "tv" : "movie";
 
   async function fetchVideos(lang) {
@@ -3606,6 +3617,9 @@ async function fetchTmdbTrailerInfo(kind, id) {
   const merged = new Map();
   [...ruSet, ...defaultSet].forEach((v) => merged.set(v.key, v));
   const youtube = [...merged.values()].filter((v) => v.site === "YouTube");
+  const relevant = youtube.filter(
+    (v) => titleMatchesVideo(v.name, movieTitle) || titleMatchesVideo(v.name, originalTitle),
+  );
 
   function pickBest(list) {
     return (
@@ -3616,10 +3630,10 @@ async function fetchTmdbTrailerInfo(kind, id) {
     );
   }
 
-  const ruPick = pickBest(youtube.filter((v) => v.iso_639_1 === "ru"));
+  const ruPick = pickBest(relevant.filter((v) => v.iso_639_1 === "ru"));
   if (ruPick) return { url: `https://www.youtube.com/watch?v=${ruPick.key}`, isRu: true };
 
-  const anyPick = pickBest(youtube);
+  const anyPick = pickBest(relevant);
   return anyPick ? { url: `https://www.youtube.com/watch?v=${anyPick.key}`, isRu: false } : null;
 }
 
@@ -3779,6 +3793,7 @@ async function sendMovieCard(ctx, kind, id, { threadId, replyToMessageId } = {})
     id,
     kindLabel: kind === "tv" ? "сериал" : "фильм",
     title: item.title,
+    originalTitle: item.originalTitle,
     year,
     rating,
     genres,
@@ -4953,7 +4968,12 @@ bot.on("message:text", async (ctx) => {
         // видео тайтла). Если русского там нет — идём в YouTube-поиск,
         // и только если совсем ничего не нашлось нигде — отдаём
         // оригинальный TMDB-трейлер как крайний случай, с пометкой.
-        const tmdbTrailer = await fetchTmdbTrailerInfo(movieCard.kind, movieCard.id);
+        const tmdbTrailer = await fetchTmdbTrailerInfo(
+          movieCard.kind,
+          movieCard.id,
+          movieCard.title,
+          movieCard.originalTitle,
+        );
         let trailerUrl = tmdbTrailer && tmdbTrailer.isRu ? tmdbTrailer.url : null;
         let note = "";
 
