@@ -451,8 +451,6 @@ function isReplyToBot(ctx) {
     if (ctx.me?.id && repliedFrom.id === ctx.me.id) return true;
     if (repliedFrom.is_bot && ctx.me?.username && repliedFrom.username?.toLowerCase() === ctx.me.username.toLowerCase()) return true;
     if (repliedFrom.is_bot && ctx.me?.first_name && repliedFrom.first_name === ctx.me.first_name) return true;
-    // Любой реплай на бота (is_bot: true) считаем адресованным боту
-    if (repliedFrom.is_bot) return true;
   }
 
   // Проверяем локальный кэш бота по message_id (ответы бота / карточки фильмов)
