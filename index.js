@@ -3888,6 +3888,117 @@ bot.on("callback_query:data", async (ctx, next) => {
   await sendMovieCard(ctx, kind, id, { threadId });
 });
 
+// ==== Поиск и отправка музыки с Deezer ====
+const DEEZER_SPACE_URL = process.env.DEEZER_SPACE_URL || "https://recycleactor-deezer.hf.space";
+const DEEZER_ARL = process.env.DEEZER_ARL || "";
+
+const DEEZER_INTENT_REGEX = /^(?:скинь|найди|включи|поставь|отправь|пришли)?\s*(?:песню|трек|музыку|мелодию|композицию)\s+["«]?(.*?)["»]?$/i;
+const DEEZER_COMMAND_REGEX = /^\/(?:song|deezer|music|track)(?:@\w+)?\s+(.+)$/i;
+
+function parseDeezerIntent(rawText) {
+  if (!rawText) return null;
+  const text = rawText.trim();
+
+  const cmdMatch = text.match(DEEZER_COMMAND_REGEX);
+  if (cmdMatch && cmdMatch[1].trim()) {
+    return cmdMatch[1].trim();
+  }
+
+  const intentMatch = text.match(DEEZER_INTENT_REGEX);
+  if (intentMatch && intentMatch[1].trim()) {
+    return intentMatch[1].trim();
+  }
+
+  return null;
+}
+
+async function searchDeezerTracks(query, limit = 10) {
+  const url = `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Deezer API status: ${res.status}`);
+  const data = await res.json();
+  return data.data || [];
+}
+
+function getDeezerStreamUrl(trackId, format = "MP3_320") {
+  let url = `${DEEZER_SPACE_URL}/stream?id=${encodeURIComponent(trackId)}&format=${encodeURIComponent(format)}`;
+  if (DEEZER_ARL) {
+    url += `&arl=${encodeURIComponent(DEEZER_ARL)}`;
+  }
+  return url;
+}
+
+async function handleDeezerQuery(ctx, query) {
+  sendTypingAction(ctx);
+  try {
+    const tracks = await searchDeezerTracks(query, 5);
+    if (!tracks || tracks.length === 0) {
+      await ctx.reply(`не нашёл песню по запросу «${query}»`, {
+        reply_parameters: { message_id: ctx.message.message_id },
+        message_thread_id: ctx.message.message_thread_id,
+      });
+      return;
+    }
+
+    const bestTrack = tracks[0];
+    const streamUrl = getDeezerStreamUrl(bestTrack.id, "MP3_320");
+    const title = bestTrack.title || "Песня";
+    const performer = bestTrack.artist?.name || "Исполнитель";
+    const duration = bestTrack.duration || 0;
+    const coverUrl = bestTrack.album?.cover_medium || bestTrack.album?.cover_big;
+
+    await ctx.replyWithAudio(streamUrl, {
+      title,
+      performer,
+      duration,
+      thumbnail: coverUrl,
+      reply_parameters: { message_id: ctx.message.message_id },
+      message_thread_id: ctx.message.message_thread_id,
+    });
+  } catch (err) {
+    console.error("Ошибка при получении трека Deezer:", err.message);
+    await ctx.reply("не удалось загрузить трек, попробуй ещё раз", {
+      reply_parameters: { message_id: ctx.message.message_id },
+      message_thread_id: ctx.message.message_thread_id,
+    });
+  }
+}
+
+// ==== Inline-поиск музыки Deezer через @botname ====
+bot.on("inline_query", async (ctx) => {
+  const query = ctx.inlineQuery.query.trim();
+  if (!query) {
+    await ctx.answerInlineQuery([], { cache_time: 300 });
+    return;
+  }
+
+  try {
+    const tracks = await searchDeezerTracks(query, 20);
+    const results = tracks.map((track) => {
+      const streamUrl = getDeezerStreamUrl(track.id, "MP3_320");
+      const performer = track.artist?.name || "Исполнитель";
+      const title = track.title || "Песня";
+      const coverUrl = track.album?.cover_medium || track.album?.cover_big;
+
+      return {
+        type: "audio",
+        id: String(track.id),
+        audio_url: streamUrl,
+        title,
+        performer,
+        audio_duration: track.duration || 0,
+        caption: `🎵 ${performer} — ${title}`,
+        thumbnail_url: coverUrl,
+      };
+    });
+
+    await ctx.answerInlineQuery(results, { cache_time: 300 });
+  } catch (err) {
+    console.error("Ошибка inline-поиска Deezer:", err.message);
+    await ctx.answerInlineQuery([], { cache_time: 10 });
+  }
+});
+
 // ==== Пересказ чата ("о чём тут речь?") ====
 // Отдельная механика поверх ChatLog (см. pushChatLog выше): пользователь
 // просит вкратце пересказать последние N сообщений в группе — например
@@ -5057,6 +5168,13 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
+  // ==== Музыка / Deezer ("скинь песню Название") ====
+  const deezerQuery = parseDeezerIntent(stripBotAddressing(rawText, ctx));
+  if (deezerQuery) {
+    await handleDeezerQuery(ctx, deezerQuery);
+    return;
+  }
+
   // ==== Пересказ чата ("Женя, о чём тут речь? 100") ====
   // Только в группах — лог (ChatLog) заполняется исключительно там, в
   // личке пересказывать нечего (там и так вся история — это диалог с
@@ -5573,6 +5691,7 @@ async function registerCommands() {
     { command: "model", description: "выбрать модель / посмотреть текущую" },
     { command: "krokodil", description: "сыграть в крокодил (объясни слово)" },
     { command: "krokodil_reset", description: "сбросить зависший раунд крокодила" },
+    { command: "song", description: "найти и прислать песню с Deezer" },
   ]);
   console.log("Команды зарегистрированы в Telegram");
 }
