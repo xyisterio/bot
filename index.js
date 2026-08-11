@@ -1937,25 +1937,6 @@ async function loadKrokodilDictionary() {
       throw new Error(`подозрительно мало слов после фильтрации: ${filtered.length}`);
     }
 
-    // Границы подобраны вручную по выгрузке реального пересечения (полный
-    // частотный список x существительные, ~21 тыс. слов на 2018/ru_full).
-    // Порог "сложных" стоит на 6000, а не на 4000: слова из зоны 4000-6000
-    // (например "десант", "тайга", "испуг") просто реже мелькают в
-    // субтитрах, но по сути остаются совершенно обычными — жалоб на них
-    // и позвало сдвинуть границу выше. Реальная сложность/специфичность
-    // начинается ближе к 6000-й позиции ("лоботомия", "экзорцист",
-    // "антисемитизм", "марксизм", "катарсис"). Зона 5000-6000 — буфер,
-    // её сознательно пропускаем как промежуточную по качеству.
-    // Размеры уровней держим примерно сопоставимыми (не в разы друг от
-    // друга, как было изначально при 600/3400/10000):
-    //  - 0..2000: топовая бытовая лексика ("день", "человек", "деньги");
-    //  - 2000..5000: узнаваемые, но не самые частые слова ("десант",
-    //    "тайга", "испуг", "миллиардер", "интерфейс");
-    //  - 6000..8500: собственно редкая/книжная/специальная лексика
-    //    ("холокост"(рядом), "лоботомия", "экзорцист", "скарлатина",
-    //    "марксизм"). Дальше по списку (после ~9000-14000) в исходных
-    //    данных начинаются диалектизмы и полумусорные словоформы (типа
-    //    "гуммигут", "кинкажу"), непригодные для игры — не берём.
     krokodilDictionary = {
       easy: filtered.slice(0, 2000),
       medium: filtered.slice(2000, 5000),
@@ -4165,12 +4146,25 @@ async function handleDeezerQuery(ctx, query) {
     // Скачиваем аудиобуфер, расшифровываем и передаём напрямую как InputFile
     const audioBuffer = await getDeezerAudioBuffer(bestTrack.id, format);
 
+    let thumbnailInput = undefined;
+    if (coverUrl) {
+      try {
+        const imgRes = await fetch(coverUrl);
+        if (imgRes.ok) {
+          const imgBuf = Buffer.from(await imgRes.arrayBuffer());
+          thumbnailInput = new InputFile(imgBuf, "cover.jpg");
+        }
+      } catch (e) {
+        console.warn("Не удалось загрузить картинку обложки:", e.message);
+      }
+    }
+
     const ext = format === "FLAC" ? "flac" : "mp3";
     await ctx.replyWithAudio(new InputFile(audioBuffer, `${performer} - ${title}.${ext}`), {
       title,
       performer,
       duration,
-      thumbnail: coverUrl,
+      thumbnail: thumbnailInput,
       reply_parameters: { message_id: ctx.message.message_id },
       message_thread_id: ctx.message.message_thread_id,
     });
@@ -4230,7 +4224,7 @@ bot.on("inline_query", async (ctx) => {
         const audioUrl = await getDeezerCdnUrl(track.id, "MP3_320");
         const performer = track.artist?.name || "Исполнитель";
         const title = track.title || "Песня";
-        const coverUrl = track.album?.cover_medium || track.album?.cover_big;
+        const coverUrl = track.album?.cover_medium || track.album?.cover_big || track.album?.cover;
 
         return {
           type: "audio",
@@ -4241,6 +4235,7 @@ bot.on("inline_query", async (ctx) => {
           audio_duration: track.duration || 0,
           caption: `🎵 ${performer} — ${title}`,
           thumbnail_url: coverUrl,
+          thumb_url: coverUrl,
         };
       })
     );
