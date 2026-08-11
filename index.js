@@ -4754,41 +4754,15 @@ async function handleDeezerQuery(ctx, query) {
       ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
       : DEFAULT_DEEZER_QUALITY;
 
-    if (DEEZER_PROXY_URL) {
-      // CF Worker задан — Telegram качает через /download (полный файл + Content-Length)
-      const downloadUrl = getDeezerDownloadUrl(bestTrack.id, format, true);
-      await ctx.replyWithAudio(downloadUrl, {
-        title: bestTrack.title,
-        performer: bestTrack.artist?.name || "",
-        duration: bestTrack.duration,
-      });
-    } else {
-      // Fallback: Render стримит с HuggingFace и кэширует file_id
-      const cacheKey = `deezer_fid:${bestTrack.id}:${format}`;
-      const cachedFileId = await redis.get(cacheKey);
+    // Прямой /download с HuggingFace — отдаёт полный файл с Content-Length
+    const downloadUrl = getDeezerDownloadUrl(bestTrack.id, format);
+    await ctx.replyWithAudio(downloadUrl, {
+      title: bestTrack.title,
+      performer: bestTrack.artist?.name || "",
+      duration: bestTrack.duration,
+    });
 
-      let sentMsg;
-      if (cachedFileId) {
-        sentMsg = await ctx.replyWithAudio(cachedFileId, {
-          title: bestTrack.title,
-          performer: bestTrack.artist?.name || "",
-          duration: bestTrack.duration,
-        });
-      } else {
-        const streamUrl = getDeezerStreamUrl(bestTrack.id, format);
-        const res = await fetch(streamUrl);
-        if (!res.ok) throw new Error(`Stream error ${res.status}: ${await res.text()}`);
-        const ext = format === "FLAC" ? "flac" : "mp3";
-        const fileName = `${bestTrack.artist?.name || "Track"} - ${bestTrack.title}.${ext}`;
-        sentMsg = await ctx.replyWithAudio(new InputFile(res.body, fileName), {
-          title: bestTrack.title,
-          performer: bestTrack.artist?.name || "",
-          duration: bestTrack.duration,
-        });
-        const fileId = sentMsg?.audio?.file_id;
-        if (fileId) await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
-      }
-    }
+
 
     try {
       await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
