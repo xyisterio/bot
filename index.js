@@ -4647,36 +4647,42 @@ function getDeezerStreamUrl(trackId, format = "MP3_320") {
 
 async function getDeezerCdnUrl(trackId, format = "MP3_320") {
   try {
+    const payload = {
+      formats: [format, "MP3_128"],
+      ids: [parseInt(trackId, 10)],
+    };
+    if (DEEZER_ARL) payload.arl = DEEZER_ARL;
+
     const res = await fetch(`${DEEZER_SPACE_URL}/get_url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ track_id: String(trackId), format, arl: DEEZER_ARL }),
+      body: JSON.stringify(payload),
     });
     if (res.ok) {
-      const data = await res.json();
-      if (data && data.url) return data.url;
+      const json = await res.json();
+      const mediaList = json?.data?.[0]?.media;
+      if (mediaList && mediaList.length) {
+        for (const m of mediaList) {
+          if (m?.sources && m.sources.length) {
+            for (const s of m.sources) {
+              if (s?.url) return s.url;
+            }
+          }
+        }
+      }
     }
   } catch (e) {
-    // fallback
+    console.error("Ошибка запроса CDN URL Deezer:", e.message);
   }
   return getDeezerStreamUrl(trackId, format);
 }
 
 async function getDeezerAudioBuffer(trackId, format = "MP3_320") {
-  const streamUrl = getDeezerStreamUrl(trackId, format);
-  let res = await fetch(streamUrl);
-  if (!res.ok) {
-    const getUrlRes = await fetch(`${DEEZER_SPACE_URL}/get_url`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ track_id: String(trackId), format, arl: DEEZER_ARL }),
-    });
-    if (getUrlRes.ok) {
-      const data = await getUrlRes.json();
-      if (data && data.url) {
-        res = await fetch(data.url);
-      }
-    }
+  const cdnUrl = await getDeezerCdnUrl(trackId, format);
+  let res = await fetch(cdnUrl);
+  if (!res.ok && DEEZER_ARL) {
+    const streamUrl = getDeezerStreamUrl(trackId, format);
+    res = await fetch(streamUrl);
   }
   if (!res.ok) throw new Error(`Failed to fetch audio stream: ${res.status}`);
   const rawBuf = await res.arrayBuffer();
