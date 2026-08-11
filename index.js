@@ -4706,7 +4706,10 @@ async function handleDeezerQuery(ctx, query) {
     const bestTrack = tracks[0];
     const statusMsg = await ctx.reply(`🎵 Загружаю «${bestTrack.artist?.name || ""} — ${bestTrack.title}»...`);
 
-    const format = DEFAULT_DEEZER_QUALITY;
+    const userId = ctx.from?.id;
+    const format = userId
+      ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
+      : DEFAULT_DEEZER_QUALITY;
     const audioBuffer = await getDeezerAudioBuffer(bestTrack.id, format);
 
     await ctx.replyWithAudio(new InputFile(audioBuffer, `${bestTrack.artist?.name || "Track"} - ${bestTrack.title}.mp3`), {
@@ -4733,13 +4736,51 @@ bot.command(["song", "deezer", "music", "track"], async (ctx) => {
   await handleDeezerQuery(ctx, match[1].trim());
 });
 
+bot.command("quality", async (ctx) => {
+  const userId = ctx.from?.id;
+  const current = userId
+    ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
+    : DEFAULT_DEEZER_QUALITY;
+  const labels = { MP3_128: "128 kbps", MP3_320: "320 kbps", FLAC: "FLAC (lossless)" };
+  const keyboard = new InlineKeyboard()
+    .text((current === "MP3_128" ? "✅ " : "") + "128 kbps", "dq:MP3_128")
+    .text((current === "MP3_320" ? "✅ " : "") + "320 kbps", "dq:MP3_320")
+    .text((current === "FLAC" ? "✅ " : "") + "FLAC", "dq:FLAC");
+  await ctx.reply(
+    `🎚️ Качество скачивания Deezer\n\nТекущее: **${labels[current] || current}**\n\nВыбери формат:`,
+    { parse_mode: "Markdown", reply_markup: keyboard }
+  );
+});
+
+bot.callbackQuery(/^dq:(MP3_128|MP3_320|FLAC)$/, async (ctx) => {
+  const format = ctx.match[1];
+  const userId = ctx.from?.id;
+  if (userId) {
+    await redis.set(`deezer_quality:${userId}`, format, { ex: 60 * 60 * 24 * 365 });
+  }
+  const labels = { MP3_128: "128 kbps", MP3_320: "320 kbps", FLAC: "FLAC (lossless)" };
+  const keyboard = new InlineKeyboard()
+    .text((format === "MP3_128" ? "✅ " : "") + "128 kbps", "dq:MP3_128")
+    .text((format === "MP3_320" ? "✅ " : "") + "320 kbps", "dq:MP3_320")
+    .text((format === "FLAC" ? "✅ " : "") + "FLAC", "dq:FLAC");
+  await ctx.editMessageText(
+    `🎚️ Качество скачивания Deezer\n\nТекущее: **${labels[format]}**\n\nВыбери формат:`,
+    { parse_mode: "Markdown", reply_markup: keyboard }
+  );
+  await ctx.answerCallbackQuery(`✅ Качество изменено на ${labels[format]}`);
+});
+
 bot.on("inline_query", async (ctx) => {
   const query = ctx.inlineQuery.query.trim();
   if (!query) return;
   try {
+    const userId = ctx.from?.id;
+    const format = userId
+      ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
+      : DEFAULT_DEEZER_QUALITY;
     const tracks = await searchDeezerTracks(query, 10);
     const results = tracks.map((track) => {
-      const audioUrl = getDeezerStreamUrl(track.id, "MP3_128");
+      const audioUrl = getDeezerStreamUrl(track.id, format);
       return {
         type: "audio",
         id: String(track.id),
@@ -4749,7 +4790,7 @@ bot.on("inline_query", async (ctx) => {
         audio_duration: track.duration,
       };
     });
-    await ctx.answerInlineQuery(results, { cache_time: 300 });
+    await ctx.answerInlineQuery(results, { cache_time: 60 });
   } catch (err) {
     console.error("Ошибка inline-поиска Deezer:", err.message);
     await ctx.answerInlineQuery([], { cache_time: 10 });
