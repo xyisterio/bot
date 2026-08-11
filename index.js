@@ -3581,6 +3581,35 @@ async function fetchTmdbDetails(kind, id) {
   };
 }
 
+// Достаёт ссылку на трейлер с TMDB (эндпоинт /videos) — сначала пробуем
+// ru-RU (иногда там свои дубляжные трейлеры), если пусто — без language
+// (обычно тогда отдаёт оригинальные/английские). Из результатов берём
+// только YouTube и приоритет: официальный Trailer -> любой Trailer ->
+// Teaser -> вообще первое видео. Возвращает null, если видео нет вовсе.
+async function fetchTmdbTrailerUrl(kind, id) {
+  const endpoint = kind === "tv" ? "tv" : "movie";
+
+  async function fetchVideos(lang) {
+    const url = `https://api.themoviedb.org/3/${endpoint}/${id}/videos?api_key=${TMDB_API_KEY}${lang ? `&language=${lang}` : ""}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`tmdb videos ${endpoint}: ${res.status}`);
+    const data = await res.json();
+    return data.results || [];
+  }
+
+  let videos = await fetchVideos("ru-RU");
+  if (!videos.length) videos = await fetchVideos(null);
+
+  const youtube = videos.filter((v) => v.site === "YouTube");
+  const pick =
+    youtube.find((v) => v.type === "Trailer" && v.official) ||
+    youtube.find((v) => v.type === "Trailer") ||
+    youtube.find((v) => v.type === "Teaser") ||
+    youtube[0];
+
+  return pick ? `https://www.youtube.com/watch?v=${pick.key}` : null;
+}
+
 // Экранирование под parse_mode: "HTML" — набор спецсимволов у Telegram тут
 // значительно меньше, чем у Markdown (только &, <, >), поэтому безопаснее
 // для произвольного текста описания с TMDB, чем ручное экранирование
@@ -3669,6 +3698,8 @@ async function sendMovieCard(ctx, kind, id, { threadId, replyToMessageId } = {})
   let summary = (item.overview || "").trim();
   if (summary.length > 500) summary = `${summary.slice(0, 500)}…`;
   rememberMovieCard(ctx.chat.id, sentMessage.message_id, {
+    kind,
+    id,
     kindLabel: kind === "tv" ? "сериал" : "фильм",
     title: item.title,
     year,
@@ -4822,6 +4853,35 @@ bot.on("message:text", async (ctx) => {
         const photoCaption = (match && match[1]) || photoEntry.text.replace(/^\[фото\]\s*/, "");
         userText = `[в чате недавно было фото от ${photoEntry.name}: ${photoCaption}] ${userText}`;
       }
+    }
+  }
+
+  // ==== "Трейлер" реплаем на карточку фильма/сериала ====
+  // Отдельно от блока ниже ("как он тебе?"), потому что тут нужен не
+  // текст для LLM, а прямое действие в обход модели — сходить на TMDB за
+  // /videos и прислать ссылку на YouTube. Если реплай не на карточку (или
+  // в кэше почему-то нет kind/id — например, старая карточка, отправленная
+  // до этого изменения) — просто идём дальше обычным путём.
+  if (isReplyToBot(ctx) && /трейлер/i.test(rawText)) {
+    const movieCard = getMovieCard(chatId, ctx.message.reply_to_message.message_id);
+    if (movieCard && movieCard.kind && movieCard.id) {
+      sendTypingAction(ctx);
+      const replyOpts = {
+        reply_parameters: { message_id: ctx.message.message_id },
+        message_thread_id: ctx.message.message_thread_id,
+      };
+      try {
+        const trailerUrl = await fetchTmdbTrailerUrl(movieCard.kind, movieCard.id);
+        if (trailerUrl) {
+          await ctx.reply(trailerUrl, replyOpts);
+        } else {
+          await ctx.reply("трейлер для этого не нашёлся на TMDB", replyOpts);
+        }
+      } catch (err) {
+        console.error("Ошибка получения трейлера TMDB:", err.message);
+        await ctx.reply("не получилось получить трейлер, TMDB сейчас недоступен — попробуй позже", replyOpts);
+      }
+      return;
     }
   }
 
