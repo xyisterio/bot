@@ -3581,12 +3581,17 @@ async function fetchTmdbDetails(kind, id) {
   };
 }
 
-// Достаёт ссылку на трейлер с TMDB (эндпоинт /videos) — сначала пробуем
-// ru-RU (иногда там свои дубляжные трейлеры), если пусто — без language
-// (обычно тогда отдаёт оригинальные/английские). Из результатов берём
-// только YouTube и приоритет: официальный Trailer -> любой Trailer ->
-// Teaser -> вообще первое видео. Возвращает null, если видео нет вовсе.
-async function fetchTmdbTrailerUrl(kind, id) {
+// Достаёт трейлер с TMDB (эндпоинт /videos). Запрашиваем ОБА варианта —
+// с language=ru-RU и без language — и объединяем: язык конкретного видео
+// определяется его полем iso_639_1, а не тем, какой language стоял в
+// запросе (это просто влияет на то, какой набор видео TMDB вообще
+// отдаёт), так что смотрим на оба набора сразу. Дальше отдельно ищем
+// среди YouTube-видео русское (iso_639_1 === "ru") — если такое есть,
+// возвращаем его с isRu: true. Если нет — берём любое (обычно
+// оригинальное/английское) и помечаем isRu: false, чтобы вызывающий код
+// знал, что это не русский трейлер и мог ещё попробовать YouTube-поиск.
+// Возвращает null, если видео нет вовсе.
+async function fetchTmdbTrailerInfo(kind, id) {
   const endpoint = kind === "tv" ? "tv" : "movie";
 
   async function fetchVideos(lang) {
@@ -3597,17 +3602,62 @@ async function fetchTmdbTrailerUrl(kind, id) {
     return data.results || [];
   }
 
-  let videos = await fetchVideos("ru-RU");
-  if (!videos.length) videos = await fetchVideos(null);
+  const [ruSet, defaultSet] = await Promise.all([fetchVideos("ru-RU"), fetchVideos(null)]);
+  const merged = new Map();
+  [...ruSet, ...defaultSet].forEach((v) => merged.set(v.key, v));
+  const youtube = [...merged.values()].filter((v) => v.site === "YouTube");
 
-  const youtube = videos.filter((v) => v.site === "YouTube");
-  const pick =
-    youtube.find((v) => v.type === "Trailer" && v.official) ||
-    youtube.find((v) => v.type === "Trailer") ||
-    youtube.find((v) => v.type === "Teaser") ||
-    youtube[0];
+  function pickBest(list) {
+    return (
+      list.find((v) => v.type === "Trailer" && v.official) ||
+      list.find((v) => v.type === "Trailer") ||
+      list.find((v) => v.type === "Teaser") ||
+      list[0]
+    );
+  }
 
-  return pick ? `https://www.youtube.com/watch?v=${pick.key}` : null;
+  const ruPick = pickBest(youtube.filter((v) => v.iso_639_1 === "ru"));
+  if (ruPick) return { url: `https://www.youtube.com/watch?v=${ruPick.key}`, isRu: true };
+
+  const anyPick = pickBest(youtube);
+  return anyPick ? { url: `https://www.youtube.com/watch?v=${anyPick.key}`, isRu: false } : null;
+}
+
+// Фолбэк, когда на TMDB нет русского трейлера (или вообще никакого) —
+// ищем сами на YouTube через yt-search (скрейпинг страницы поиска,
+// официального API/ключа не требует). Пробуем сперва запрос с явным
+// "русский трейлер" (так чаще всплывают ролики от дубляжных каналов),
+// потом просто "трейлер". Из результатов отсеиваем то, что явно не
+// трейлер по длительности (полнометражка/эпизод), и предпочитаем видео,
+// где слово "трейлер" реально есть в заголовке. Библиотека давно не
+// обновлялась и может сломаться, если YouTube поменяет вёрстку —
+// поэтому вся функция обёрнута так, чтобы в этом случае просто вернуть
+// null, а не уронить бота.
+async function searchYoutubeTrailerRu(title, year) {
+  let yts;
+  try {
+    ({ default: yts } = await import("yt-search"));
+  } catch (err) {
+    console.error("yt-search не установлен или не загрузился:", err.message);
+    return null;
+  }
+
+  const queries = [
+    `${title} ${year || ""} русский трейлер`.trim(),
+    `${title} ${year || ""} трейлер`.trim(),
+  ];
+
+  for (const q of queries) {
+    try {
+      const r = await yts(q);
+      const candidates = (r.videos || []).filter((v) => v.seconds && v.seconds >= 20 && v.seconds <= 420);
+      const pick = candidates.find((v) => /трейлер|trailer/i.test(v.title)) || candidates[0];
+      if (pick) return pick.videoId ? `https://www.youtube.com/watch?v=${pick.videoId}` : pick.url || null;
+    } catch (err) {
+      console.error(`Ошибка yt-search по запросу "${q}":`, err.message);
+    }
+  }
+  return null;
 }
 
 // Экранирование под parse_mode: "HTML" — набор спецсимволов у Telegram тут
@@ -4871,15 +4921,31 @@ bot.on("message:text", async (ctx) => {
         message_thread_id: ctx.message.message_thread_id,
       };
       try {
-        const trailerUrl = await fetchTmdbTrailerUrl(movieCard.kind, movieCard.id);
+        // Сначала TMDB — там же уже отдаёт русское видео, если оно есть
+        // (fetchTmdbTrailerInfo сама ищет iso_639_1 === "ru" среди всех
+        // видео тайтла). Если русского там нет — идём в YouTube-поиск,
+        // и только если совсем ничего не нашлось нигде — отдаём
+        // оригинальный TMDB-трейлер как крайний случай, с пометкой.
+        const tmdbTrailer = await fetchTmdbTrailerInfo(movieCard.kind, movieCard.id);
+        let trailerUrl = tmdbTrailer && tmdbTrailer.isRu ? tmdbTrailer.url : null;
+        let note = "";
+
+        if (!trailerUrl) {
+          trailerUrl = await searchYoutubeTrailerRu(movieCard.title, movieCard.year);
+        }
+        if (!trailerUrl && tmdbTrailer) {
+          trailerUrl = tmdbTrailer.url;
+          note = "\n(русского не нашёл, это оригинальный трейлер)";
+        }
+
         if (trailerUrl) {
-          await ctx.reply(trailerUrl, replyOpts);
+          await ctx.reply(`${trailerUrl}${note}`, replyOpts);
         } else {
-          await ctx.reply("трейлер для этого не нашёлся на TMDB", replyOpts);
+          await ctx.reply("трейлер для этого не нашёлся ни на TMDB, ни на YouTube", replyOpts);
         }
       } catch (err) {
-        console.error("Ошибка получения трейлера TMDB:", err.message);
-        await ctx.reply("не получилось получить трейлер, TMDB сейчас недоступен — попробуй позже", replyOpts);
+        console.error("Ошибка получения трейлера:", err.message);
+        await ctx.reply("не получилось получить трейлер — попробуй позже", replyOpts);
       }
       return;
     }
