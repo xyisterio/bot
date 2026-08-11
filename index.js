@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard } from "grammy";
+import { Bot, InlineKeyboard, InputFile } from "grammy";
 import express from "express";
 import { Redis } from "@upstash/redis";
 import { Chess } from "chess.js";
@@ -4738,19 +4738,17 @@ bot.on("inline_query", async (ctx) => {
   if (!query) return;
   try {
     const tracks = await searchDeezerTracks(query, 10);
-    const results = await Promise.all(
-      tracks.map(async (track) => {
-        const audioUrl = await getDeezerCdnUrl(track.id, "MP3_320");
-        return {
-          type: "audio",
-          id: String(track.id),
-          audio_url: audioUrl,
-          title: track.title,
-          performer: track.artist?.name || "Deezer",
-          audio_duration: track.duration,
-        };
-      })
-    );
+    const results = tracks.map((track) => {
+      const audioUrl = getDeezerStreamUrl(track.id, "MP3_128");
+      return {
+        type: "audio",
+        id: String(track.id),
+        audio_url: audioUrl,
+        title: track.title,
+        performer: track.artist?.name || "Deezer",
+        audio_duration: track.duration,
+      };
+    });
     await ctx.answerInlineQuery(results, { cache_time: 300 });
   } catch (err) {
     console.error("Ошибка inline-поиска Deezer:", err.message);
