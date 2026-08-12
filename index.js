@@ -4804,27 +4804,31 @@ async function handleDeezerQuery(ctx, query) {
     } else {
       let fileId = null;
 
-      // Раньше для FLAC грузили файл вручную через /send_audio — но это требовало,
-      // чтобы HF-сервис сам открывал соединение к Telegram (а не наоборот), и на части
-      // хостингов это соединение попросту не устанавливается (таймауты коннекта).
-      // sendDocument, как и sendAudio, тоже умеет принимать обычный HTTP URL и просит
-      // Telegram скачать файл самостоятельно — тем же путём, что уже работает для MP3.
-      // Плеера с обложкой не будет (FLAC не поддерживается sendAudio), но файл долетит.
+      // FLAC грузим через HF-сервис (/send_audio, main.rs), который теперь
+      // достаёт файл, расшифровывает и сам заливает в Telegram — но не
+      // напрямую, а через Cloudflare Worker-прокси перед api.telegram.org
+      // (см. deezer-proxy.xyisterio.workers.dev), т.к. прямой доступ с HF
+      // к Telegram заблокирован на сетевом уровне. Это разгружает наш
+      // собственный (Render, лимит 5GB/мес) egress — файл больше не идёт
+      // через Node дважды (HF->Node->Telegram), а сразу HF->Telegram.
       if (format === "FLAC") {
         try {
-          const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
-          if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
-          await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
-        } catch (_) {}
-
-        const docUrl = getDeezerDownloadUrl(bestTrack.id, format, trackMeta);
-        const caption = [trackMeta.performer, trackMeta.title].filter(Boolean).join(" — ") || undefined;
-
-        try {
-          const sentMsg = await ctx.replyWithDocument(docUrl, caption ? { caption } : {});
-          fileId = sentMsg?.document?.file_id || null;
+          const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, trackMeta);
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), DEEZER_SEND_AUDIO_TIMEOUT_MS);
+          const res = await fetch(sendAudioUrl, { signal: controller.signal }).finally(() => clearTimeout(timeoutId));
+          if (res.ok) {
+            const json = await res.json();
+            if (json?.ok && json?.file_id) {
+              fileId = json.file_id;
+            } else {
+              throw new Error(json?.error || json?.description || "HF send_audio returned no file_id");
+            }
+          } else {
+            throw new Error(`HF send_audio status ${res.status}`);
+          }
         } catch (e) {
-          console.error("Ошибка отправки FLAC URL в Telegram:", docUrl, e.message || e);
+          console.error("Ошибка серверной отправки FLAC в Telegram:", e.message || e);
           throw e;
         }
       } else {
