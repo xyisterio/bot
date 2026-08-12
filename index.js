@@ -2678,11 +2678,17 @@ async function loadPersistedState() {
 
 
 // ==== Поиск и отправка музыки с Deezer ====
-const DEEZER_SPACE_URL = process.env.DEEZER_SPACE_URL || "https://recycleactor-deezer.hf.space";
+// Основной сервер (SnapDeploy): сам качает трек, расшифровывает и грузит в Telegram
+// через Bot API (send_audio) — работает для любых форматов, включая FLAC.
+const DEEZER_SPACE_URL = process.env.DEEZER_SPACE_URL || "https://deezer-ae701.containers.snapdeploy.app";
+// Фолбэк-сервер (Hugging Face): используется только если основной недоступен.
+// У HF ограничение на аплоад через API, поэтому туда просто ходим за прямой
+// ссылкой на MP3 320kbps и отдаём её Telegram — тот качает файл сам (FLAC так не работает).
+// Задаётся только через env, без дефолта — если не задан, фолбэк просто пропускается.
+const DEEZER_SPACE_URL_FALLBACK = process.env.DEEZER_SPACE_URL_FALLBACK || "";
 const DEEZER_ARL = process.env.DEEZER_ARL || "";
 const DEFAULT_DEEZER_QUALITY = process.env.DEEZER_QUALITY || "MP3_320";
 const DEEZER_SEND_AUDIO_TIMEOUT_MS = Number(process.env.DEEZER_SEND_AUDIO_TIMEOUT_MS || 60000);
-// CF Worker URL — если задан, Telegram скачивает через него (обход блокировки HF)
 
 const SECRET = "g4el58wc0zvf9na1";
 
@@ -4675,14 +4681,14 @@ function getDeezerTrackMeta(track = {}) {
   };
 }
 
-function getDeezerDownloadUrl(trackId, format = "MP3_320", meta = {}) {
+function getDeezerDownloadUrl(trackId, format = "MP3_320", meta = {}, baseUrl = DEEZER_SPACE_URL) {
   const params = new URLSearchParams({
     id: String(trackId),
     format: String(format || "MP3_320"),
   });
   if (DEEZER_ARL) params.set("arl", DEEZER_ARL);
   appendDeezerMetaParams(params, meta);
-  return `${DEEZER_SPACE_URL}/download?${params.toString()}`;
+  return `${baseUrl}/download?${params.toString()}`;
 }
 
 function getDeezerSendAudioUrl(trackId, format, chatId, meta = {}) {
@@ -4798,13 +4804,11 @@ async function handleDeezerQuery(ctx, query) {
       });
     } else {
       let fileId = null;
+      let usedFallback = false;
 
-      // Всегда используем send_audio (multipart upload через сервер) — SnapDeploy сам
-      // скачивает, расшифровывает, зашивает метаданные и грузит трек в Telegram через
-      // Bot API. Раньше для MP3 бот отдавал Telegram голый URL на /download и Telegram
-      // сам его забирал — из-за этого при просадках/холодном старте SnapDeploy трек
-      // либо приходил без метаданных, либо не приходил вовсе. Теперь путь одинаковый
-      // для MP3 и FLAC, и сервер, а не Telegram, отвечает за скачивание.
+      // Основной путь: SnapDeploy сам скачивает, расшифровывает, зашивает метаданные
+      // и грузит трек в Telegram через Bot API (send_audio). Работает для любых
+      // форматов, включая FLAC.
       try {
         const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, trackMeta);
         const controller = new AbortController();
@@ -4822,12 +4826,36 @@ async function handleDeezerQuery(ctx, query) {
           throw new Error(`send_audio status ${res.status}: ${text.slice(0, 200)}`);
         }
       } catch (e) {
-        console.error("Ошибка серверной отправки трека в Telegram:", e.message || e);
-        throw e;
+        console.error("Ошибка серверной отправки трека в Telegram (основной сервер):", e.message || e);
+
+        // Фолбэк: основной сервер лёг — берём у HF прямую ссылку на MP3 320kbps
+        // и отдаём её Telegram, чтобы тот сам скачал файл. FLAC через HF не отдаём —
+        // там ограничение на аплоад через API, поэтому фолбэк всегда только MP3.
+        // Если DEEZER_SPACE_URL_FALLBACK не задан — фолбэка нет, пробрасываем исходную ошибку.
+        if (!DEEZER_SPACE_URL_FALLBACK) {
+          throw e;
+        }
+        try {
+          const fallbackFormat = "MP3_320";
+          const fallbackUrl = getDeezerDownloadUrl(bestTrack.id, fallbackFormat, trackMeta, DEEZER_SPACE_URL_FALLBACK);
+          const sentMsg = await ctx.replyWithAudio(fallbackUrl, {
+            title: trackMeta.title,
+            performer: trackMeta.performer,
+            duration: trackMeta.duration,
+          });
+          fileId = sentMsg?.audio?.file_id || null;
+          usedFallback = true;
+        } catch (fallbackErr) {
+          console.error("Ошибка фолбэк-отправки трека через HF:", fallbackErr.message || fallbackErr);
+          throw fallbackErr;
+        }
       }
 
       if (fileId) {
-        await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
+        // Фолбэк всегда MP3_320, независимо от запрошенного качества — кэшируем
+        // под своим ключом, чтобы не подсунуть MP3 вместо запрошенного FLAC в другой раз.
+        const cacheKeyToUse = usedFallback ? `deezer_fid:${bestTrack.id}:MP3_320` : cacheKey;
+        await redis.set(cacheKeyToUse, fileId, { ex: 60 * 60 * 24 * 30 });
       }
     }
 
