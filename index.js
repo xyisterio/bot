@@ -4658,13 +4658,35 @@ function getDeezerStreamUrl(trackId, format = "MP3_320", useProxy = false) {
 }
 
 // /download — полный файл с Content-Length (для sendAudio по URL)
-function getDeezerDownloadUrl(trackId, format = "MP3_320", useProxy = false) {
+function appendDeezerMetaParams(params, meta = {}) {
+  if (meta.title) params.set("title", meta.title);
+  if (meta.performer) params.set("performer", meta.performer);
+  if (meta.duration) params.set("duration", String(meta.duration));
+  if (meta.album) params.set("album", meta.album);
+  if (meta.cover_url) params.set("cover_url", meta.cover_url);
+  return params;
+}
+
+function getDeezerTrackMeta(track = {}) {
+  const album = track.album || {};
+  return {
+    title: track.title || "",
+    performer: track.artist?.name || "",
+    duration: track.duration || 0,
+    album: album.title || "",
+    cover_url: album.cover_xl || album.cover_big || album.cover_medium || album.cover || "",
+  };
+}
+
+function getDeezerDownloadUrl(trackId, format = "MP3_320", useProxy = false, meta = {}) {
   const base = (useProxy && DEEZER_PROXY_URL) ? DEEZER_PROXY_URL : DEEZER_SPACE_URL;
-  let url = `${base}/download?id=${encodeURIComponent(trackId)}&format=${encodeURIComponent(format)}`;
-  if (DEEZER_ARL) {
-    url += `&arl=${encodeURIComponent(DEEZER_ARL)}`;
-  }
-  return url;
+  const params = new URLSearchParams({
+    id: String(trackId),
+    format: String(format || "MP3_320"),
+  });
+  if (DEEZER_ARL) params.set("arl", DEEZER_ARL);
+  appendDeezerMetaParams(params, meta);
+  return `${base}/download?${params.toString()}`;
 }
 
 function getDeezerSendAudioUrl(trackId, format, chatId, meta = {}) {
@@ -4675,9 +4697,7 @@ function getDeezerSendAudioUrl(trackId, format, chatId, meta = {}) {
   });
 
   if (DEEZER_ARL) params.set("arl", DEEZER_ARL);
-  if (meta.title) params.set("title", meta.title);
-  if (meta.performer) params.set("performer", meta.performer);
-  if (meta.duration) params.set("duration", String(meta.duration));
+  appendDeezerMetaParams(params, meta);
 
   return `${DEEZER_SPACE_URL}/send_audio?${params.toString()}`;
 }
@@ -4762,6 +4782,7 @@ async function handleDeezerQuery(ctx, query) {
       return;
     }
     const bestTrack = tracks[0];
+    const trackMeta = getDeezerTrackMeta(bestTrack);
     const statusMsg = await ctx.reply(`🎵 Загружаю «${bestTrack.artist?.name || ""} — ${bestTrack.title}»...`);
 
     const userId = ctx.from?.id;
@@ -4775,49 +4796,70 @@ async function handleDeezerQuery(ctx, query) {
 
     if (cachedFileId) {
       await ctx.replyWithAudio(cachedFileId, {
-        title: bestTrack.title,
-        performer: bestTrack.artist?.name || "",
-        duration: bestTrack.duration,
+        title: trackMeta.title,
+        performer: trackMeta.performer,
+        duration: trackMeta.duration,
       });
     } else {
-      // /download отдаёт уже готовый файл с Content-Length.
-      // Telegram забирает аудио напрямую по URL, не гоняя трафик через сам бот.
+      let fileId = null;
+      let serverSendErr = null;
+
       try {
-        const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
-        if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
-        await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
-      } catch (_) {}
-
-      const downloadUrls = [
-        getDeezerDownloadUrl(bestTrack.id, format, false),
-      ];
-      if (DEEZER_PROXY_URL) {
-        downloadUrls.push(getDeezerDownloadUrl(bestTrack.id, format, true));
-      }
-
-      let sentMsg = null;
-      let lastSendErr = null;
-      for (const audioUrl of downloadUrls) {
-        try {
-          sentMsg = await ctx.replyWithAudio(audioUrl, {
-            title: bestTrack.title,
-            performer: bestTrack.artist?.name || "",
-            duration: bestTrack.duration,
-          });
-          if (sentMsg) break;
-        } catch (e) {
-          lastSendErr = e;
-          console.error("Ошибка отправки Deezer URL в Telegram:", audioUrl, e.message || e);
+        const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, trackMeta);
+        const res = await fetch(sendAudioUrl);
+        if (!res.ok) {
+          throw new Error(`HF send_audio status ${res.status}`);
         }
+        const json = await res.json();
+        if (!json?.ok || !json?.file_id) {
+          throw new Error(json?.error || json?.description || "HF send_audio returned no file_id");
+        }
+        fileId = json.file_id;
+      } catch (e) {
+        serverSendErr = e;
+        console.error("Ошибка серверной отправки Deezer в Telegram:", e.message || e);
       }
 
-      if (!sentMsg) {
-        throw lastSendErr || new Error("Telegram did not accept Deezer download URL");
+      if (!fileId) {
+        try {
+          const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
+          if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
+          await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
+        } catch (_) {}
+
+        const downloadUrls = [
+          getDeezerDownloadUrl(bestTrack.id, format, false, trackMeta),
+        ];
+        if (DEEZER_PROXY_URL) {
+          downloadUrls.push(getDeezerDownloadUrl(bestTrack.id, format, true, trackMeta));
+        }
+
+        let sentMsg = null;
+        let lastSendErr = null;
+        for (const audioUrl of downloadUrls) {
+          try {
+            sentMsg = await ctx.replyWithAudio(audioUrl, {
+              title: trackMeta.title,
+              performer: trackMeta.performer,
+              duration: trackMeta.duration,
+            });
+            if (sentMsg) break;
+          } catch (e) {
+            lastSendErr = e;
+            console.error("Ошибка отправки Deezer URL в Telegram:", audioUrl, e.message || e);
+          }
+        }
+
+        if (!sentMsg) {
+          throw lastSendErr || serverSendErr || new Error("Telegram did not accept Deezer audio");
+        }
+
+        fileId = sentMsg?.audio?.file_id || null;
       }
 
-      // Кэшируем Telegram file_id на 30 дней
-      const fileId = sentMsg?.audio?.file_id;
-      if (fileId) await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
+      if (fileId) {
+        await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
+      }
     }
 
 
@@ -4885,7 +4927,8 @@ bot.on("inline_query", async (ctx) => {
       : DEFAULT_DEEZER_QUALITY;
     const tracks = await searchDeezerTracks(query, 10);
     const results = tracks.map((track) => {
-      const audioUrl = getDeezerStreamUrl(track.id, format, true); // useProxy=true для инлайна
+      const inlineFormat = format === "FLAC" ? "MP3_320" : format;
+      const audioUrl = getDeezerDownloadUrl(track.id, inlineFormat, true, getDeezerTrackMeta(track));
       return {
         type: "audio",
         id: String(track.id),
