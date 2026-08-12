@@ -4797,61 +4797,29 @@ async function handleDeezerQuery(ctx, query) {
         duration: trackMeta.duration,
       });
     } else {
-      let fileId = null;
-      let serverSendErr = null;
-
+      // Сначала прогреваем кэш на HF, чтобы CDN URL был готов
       try {
-        const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, trackMeta);
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), DEEZER_SEND_AUDIO_TIMEOUT_MS);
-        const res = await fetch(sendAudioUrl, { signal: controller.signal }).finally(() => clearTimeout(timeoutId));
-        if (!res.ok) {
-          throw new Error(`HF send_audio status ${res.status}`);
-        }
-        const json = await res.json();
-        if (!json?.ok || !json?.file_id) {
-          throw new Error(json?.error || json?.description || "HF send_audio returned no file_id");
-        }
-        fileId = json.file_id;
+        const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
+        if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
+        await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
+      } catch (_) {}
+
+      // Отправляем по URL напрямую (как в inline режиме) - это быстрее и надёжнее
+      const audioUrl = getDeezerDownloadUrl(bestTrack.id, format, trackMeta);
+      let sentMsg = null;
+      
+      try {
+        sentMsg = await ctx.replyWithAudio(audioUrl, {
+          title: trackMeta.title,
+          performer: trackMeta.performer,
+          duration: trackMeta.duration,
+        });
       } catch (e) {
-        serverSendErr = e;
-        console.error("Ошибка серверной отправки Deezer в Telegram:", e.message || e);
+        console.error("Ошибка отправки Deezer URL в Telegram:", audioUrl, e.message || e);
+        throw e;
       }
 
-      if (!fileId) {
-        try {
-          const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
-          if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
-          await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
-        } catch (_) {}
-
-        const downloadUrls = [
-          getDeezerDownloadUrl(bestTrack.id, format, trackMeta),
-        ];
-
-        let sentMsg = null;
-        let lastSendErr = null;
-        for (const audioUrl of downloadUrls) {
-          try {
-            sentMsg = await ctx.replyWithAudio(audioUrl, {
-              title: trackMeta.title,
-              performer: trackMeta.performer,
-              duration: trackMeta.duration,
-            });
-            if (sentMsg) break;
-          } catch (e) {
-            lastSendErr = e;
-            console.error("Ошибка отправки Deezer URL в Telegram:", audioUrl, e.message || e);
-          }
-        }
-
-        if (!sentMsg) {
-          throw lastSendErr || serverSendErr || new Error("Telegram did not accept Deezer audio");
-        }
-
-        fileId = sentMsg?.audio?.file_id || null;
-      }
-
+      const fileId = sentMsg?.audio?.file_id || null;
       if (fileId) {
         await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
       }
@@ -4922,20 +4890,19 @@ bot.on("inline_query", async (ctx) => {
       : DEFAULT_DEEZER_QUALITY;
     const tracks = await searchDeezerTracks(query, 10);
     const results = (await Promise.all(tracks.map(async (track) => {
-      const inlineFormat = format === "FLAC" ? "MP3_320" : format;
       const trackMeta = getDeezerTrackMeta(track);
-      const cacheKey = `deezer_fid:${track.id}:${inlineFormat}`;
+      const cacheKey = `deezer_fid:${track.id}:${format}`;
       const cachedFileId = await redis.get(cacheKey);
       if (cachedFileId) {
         return {
           type: "audio",
-          id: `cached:${track.id}:${inlineFormat}`,
+          id: `cached:${track.id}:${format}`,
           audio_file_id: cachedFileId,
           caption: `${trackMeta.performer} - ${trackMeta.title}`,
         };
       }
 
-      const audioUrl = getDeezerDownloadUrl(track.id, inlineFormat, trackMeta);
+      const audioUrl = getDeezerDownloadUrl(track.id, format, trackMeta);
       return {
         type: "audio",
         id: String(track.id),
