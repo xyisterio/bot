@@ -4780,24 +4780,43 @@ async function handleDeezerQuery(ctx, query) {
         duration: bestTrack.duration,
       });
     } else {
-      // HF сам скачивает, расшифровывает и загружает трек в Telegram через multipart.
-      // Так аудиотрафик не идёт через сам бот и не упирается в лимит Render.
-      const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, {
-        title: bestTrack.title,
-        performer: bestTrack.artist?.name || "",
-        duration: bestTrack.duration,
-      });
-      const hfRes = await fetch(sendAudioUrl);
-      let hfJson = null;
+      // /download отдаёт уже готовый файл с Content-Length.
+      // Telegram забирает аудио напрямую по URL, не гоняя трафик через сам бот.
       try {
-        hfJson = await hfRes.json();
+        const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
+        if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
+        await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
       } catch (_) {}
-      if (!hfRes.ok || !hfJson?.ok) {
-        throw new Error(hfJson?.error || `HF send_audio status ${hfRes.status}`);
+
+      const downloadUrls = [
+        getDeezerDownloadUrl(bestTrack.id, format, false),
+      ];
+      if (DEEZER_PROXY_URL) {
+        downloadUrls.push(getDeezerDownloadUrl(bestTrack.id, format, true));
+      }
+
+      let sentMsg = null;
+      let lastSendErr = null;
+      for (const audioUrl of downloadUrls) {
+        try {
+          sentMsg = await ctx.replyWithAudio(audioUrl, {
+            title: bestTrack.title,
+            performer: bestTrack.artist?.name || "",
+            duration: bestTrack.duration,
+          });
+          if (sentMsg) break;
+        } catch (e) {
+          lastSendErr = e;
+          console.error("Ошибка отправки Deezer URL в Telegram:", audioUrl, e.message || e);
+        }
+      }
+
+      if (!sentMsg) {
+        throw lastSendErr || new Error("Telegram did not accept Deezer download URL");
       }
 
       // Кэшируем Telegram file_id на 30 дней
-      const fileId = hfJson.file_id;
+      const fileId = sentMsg?.audio?.file_id;
       if (fileId) await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
     }
 
