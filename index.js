@@ -4667,6 +4667,21 @@ function getDeezerDownloadUrl(trackId, format = "MP3_320", useProxy = false) {
   return url;
 }
 
+function getDeezerSendAudioUrl(trackId, format, chatId, meta = {}) {
+  const params = new URLSearchParams({
+    id: String(trackId),
+    format: String(format || "MP3_320"),
+    chat_id: String(chatId),
+  });
+
+  if (DEEZER_ARL) params.set("arl", DEEZER_ARL);
+  if (meta.title) params.set("title", meta.title);
+  if (meta.performer) params.set("performer", meta.performer);
+  if (meta.duration) params.set("duration", String(meta.duration));
+
+  return `${DEEZER_SPACE_URL}/send_audio?${params.toString()}`;
+}
+
 async function getDeezerCdnUrl(trackId, format = "MP3_320") {
   try {
     const payload = {
@@ -4754,7 +4769,7 @@ async function handleDeezerQuery(ctx, query) {
       ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
       : DEFAULT_DEEZER_QUALITY;
 
-    // Кэш file_id — трек скачивается через Render только один раз
+    // Кэш file_id — полный аплоад в Telegram нужен только один раз
     const cacheKey = `deezer_fid:${bestTrack.id}:${format}`;
     const cachedFileId = await redis.get(cacheKey);
 
@@ -4765,21 +4780,24 @@ async function handleDeezerQuery(ctx, query) {
         duration: bestTrack.duration,
       });
     } else {
-      // Шаг 1: прогреваем CDN URL кэш на HuggingFace (делает Deezer API запросы заранее)
-      const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
-      if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
-      await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
-
-      // Шаг 2: Telegram качает /stream напрямую с HF — кэш уже горячий, первый байт мгновенно
-      const streamUrl = getDeezerStreamUrl(bestTrack.id, format);
-      const sentMsg = await ctx.replyWithAudio(streamUrl, {
+      // HF сам скачивает, расшифровывает и загружает трек в Telegram через multipart.
+      // Так аудиотрафик не идёт через сам бот и не упирается в лимит Render.
+      const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, {
         title: bestTrack.title,
         performer: bestTrack.artist?.name || "",
         duration: bestTrack.duration,
       });
+      const hfRes = await fetch(sendAudioUrl);
+      let hfJson = null;
+      try {
+        hfJson = await hfRes.json();
+      } catch (_) {}
+      if (!hfRes.ok || !hfJson?.ok) {
+        throw new Error(hfJson?.error || `HF send_audio status ${hfRes.status}`);
+      }
 
       // Кэшируем Telegram file_id на 30 дней
-      const fileId = sentMsg?.audio?.file_id;
+      const fileId = hfJson.file_id;
       if (fileId) await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
     }
 
