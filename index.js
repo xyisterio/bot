@@ -4797,45 +4797,63 @@ async function handleDeezerQuery(ctx, query) {
         duration: trackMeta.duration,
       });
     } else {
-      // Сначала прогреваем кэш на HF, чтобы CDN URL был готов
-      try {
-        const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
-        if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
-        await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
-      } catch (_) {}
+      let fileId = null;
 
-      // Отправляем по URL напрямую (как в inline режиме) - это быстрее и надёжнее
-      const audioUrl = getDeezerDownloadUrl(bestTrack.id, format, trackMeta);
-      let sentMsg = null;
-      
-      try {
-        sentMsg = await ctx.replyWithAudio(audioUrl, {
-          title: trackMeta.title,
-          performer: trackMeta.performer,
-          duration: trackMeta.duration,
-        });
-      } catch (e) {
-        console.error("Ошибка отправки Deezer URL в Telegram:", audioUrl, e.message || e);
-        throw e;
+      // Для FLAC используем send_audio (multipart upload через сервер),
+      // так как Telegram Bot API не может скачивать FLAC по URL
+      if (format === "FLAC") {
+        try {
+          const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, trackMeta);
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), DEEZER_SEND_AUDIO_TIMEOUT_MS);
+          const res = await fetch(sendAudioUrl, { signal: controller.signal }).finally(() => clearTimeout(timeoutId));
+          if (res.ok) {
+            const json = await res.json();
+            if (json?.ok && json?.file_id) {
+              fileId = json.file_id;
+            } else {
+              throw new Error(json?.error || json?.description || "HF send_audio returned no file_id");
+            }
+          } else {
+            throw new Error(`HF send_audio status ${res.status}`);
+          }
+        } catch (e) {
+          console.error("Ошибка серверной отправки FLAC в Telegram:", e.message || e);
+          // Для FLAC нет fallback на URL, так что просто выбрасываем ошибку
+          throw e;
+        }
+      } else {
+        // Для MP3 используем быстрый метод - отправка по URL
+        try {
+          const warmParams = new URLSearchParams({ id: String(bestTrack.id), format });
+          if (DEEZER_ARL) warmParams.set("arl", DEEZER_ARL);
+          await fetch(`${DEEZER_SPACE_URL}/warm?${warmParams}`);
+        } catch (_) {}
+
+        const audioUrl = getDeezerDownloadUrl(bestTrack.id, format, trackMeta);
+        
+        try {
+          const sentMsg = await ctx.replyWithAudio(audioUrl, {
+            title: trackMeta.title,
+            performer: trackMeta.performer,
+            duration: trackMeta.duration,
+          });
+          fileId = sentMsg?.audio?.file_id || null;
+        } catch (e) {
+          console.error("Ошибка отправки Deezer URL в Telegram:", audioUrl, e.message || e);
+          throw e;
+        }
       }
 
-      const fileId = sentMsg?.audio?.file_id || null;
       if (fileId) {
         await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
       }
     }
 
     try {
-      await ctx.api.editMessageText(
-        ctx.chat.id, 
-        statusMsg.message_id, 
-        `🎵 Трек «${bestTrack.artist?.name || ""} — ${bestTrack.title}»`
-      );
+      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
     } catch (e) {
-      // Если не удалось отредактировать (например, сообщение слишком старое), просто удаляем
-      try {
-        await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
-      } catch (_) {}
+      // Игнорируем ошибку если сообщение уже удалено или слишком старое
     }
   } catch (err) {
     console.error("Ошибка при получении трека Deezer:", err.message || err);
@@ -4894,21 +4912,26 @@ bot.on("inline_query", async (ctx) => {
     const format = userId
       ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
       : DEFAULT_DEEZER_QUALITY;
+    
+    // В inline режиме Telegram не может скачивать FLAC по URL,
+    // поэтому для FLAC используем MP3_320
+    const inlineFormat = format === "FLAC" ? "MP3_320" : format;
+    
     const tracks = await searchDeezerTracks(query, 10);
     const results = (await Promise.all(tracks.map(async (track) => {
       const trackMeta = getDeezerTrackMeta(track);
-      const cacheKey = `deezer_fid:${track.id}:${format}`;
+      const cacheKey = `deezer_fid:${track.id}:${inlineFormat}`;
       const cachedFileId = await redis.get(cacheKey);
       if (cachedFileId) {
         return {
           type: "audio",
-          id: `cached:${track.id}:${format}`,
+          id: `cached:${track.id}:${inlineFormat}`,
           audio_file_id: cachedFileId,
           caption: `${trackMeta.performer} - ${trackMeta.title}`,
         };
       }
 
-      const audioUrl = getDeezerDownloadUrl(track.id, format, trackMeta);
+      const audioUrl = getDeezerDownloadUrl(track.id, inlineFormat, trackMeta);
       return {
         type: "audio",
         id: String(track.id),
