@@ -4825,12 +4825,18 @@ async function handleDeezerQuery(ctx, query) {
       }
     }
 
-
-
-
     try {
-      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
-    } catch (e) {}
+      await ctx.api.editMessageText(
+        ctx.chat.id, 
+        statusMsg.message_id, 
+        `🎵 Трек «${bestTrack.artist?.name || ""} — ${bestTrack.title}»`
+      );
+    } catch (e) {
+      // Если не удалось отредактировать (например, сообщение слишком старое), просто удаляем
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
+      } catch (_) {}
+    }
   } catch (err) {
     console.error("Ошибка при получении трека Deezer:", err.message || err);
     await ctx.reply("⚠️ Не удалось загрузить трек с Deezer. Попробуй позже.");
