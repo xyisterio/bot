@@ -2681,7 +2681,7 @@ async function loadPersistedState() {
 const DEEZER_SPACE_URL = process.env.DEEZER_SPACE_URL || "https://recycleactor-deezer.hf.space";
 const DEEZER_ARL = process.env.DEEZER_ARL || "";
 const DEFAULT_DEEZER_QUALITY = process.env.DEEZER_QUALITY || "MP3_320";
-const DEEZER_SEND_AUDIO_TIMEOUT_MS = Number(process.env.DEEZER_SEND_AUDIO_TIMEOUT_MS || 25000);
+const DEEZER_SEND_AUDIO_TIMEOUT_MS = Number(process.env.DEEZER_SEND_AUDIO_TIMEOUT_MS || 60000);
 // CF Worker URL — если задан, Telegram скачивает через него (обход блокировки HF)
 
 const SECRET = "g4el58wc0zvf9na1";
@@ -4787,7 +4787,7 @@ async function handleDeezerQuery(ctx, query) {
       : DEFAULT_DEEZER_QUALITY;
 
     // Кэш file_id — полный аплоад в Telegram нужен только один раз
-    const cacheKey = `deezer_fid:${bestTrack.id}:${format}`;
+    const cacheKey = `deezer_fid:v2:${bestTrack.id}:${format}`;
     const cachedFileId = await redis.get(cacheKey);
 
     if (cachedFileId) {
@@ -4920,7 +4920,7 @@ bot.on("inline_query", async (ctx) => {
     const tracks = await searchDeezerTracks(query, 10);
     const results = (await Promise.all(tracks.map(async (track) => {
       const trackMeta = getDeezerTrackMeta(track);
-      const cacheKey = `deezer_fid:${track.id}:${inlineFormat}`;
+      const cacheKey = `deezer_fid:v2:${track.id}:${inlineFormat}`;
       const cachedFileId = await redis.get(cacheKey);
       if (cachedFileId) {
         return {
