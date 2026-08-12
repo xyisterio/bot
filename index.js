@@ -2681,8 +2681,8 @@ async function loadPersistedState() {
 const DEEZER_SPACE_URL = process.env.DEEZER_SPACE_URL || "https://recycleactor-deezer.hf.space";
 const DEEZER_ARL = process.env.DEEZER_ARL || "";
 const DEFAULT_DEEZER_QUALITY = process.env.DEEZER_QUALITY || "MP3_320";
+const DEEZER_SEND_AUDIO_TIMEOUT_MS = Number(process.env.DEEZER_SEND_AUDIO_TIMEOUT_MS || 25000);
 // CF Worker URL — если задан, Telegram скачивает через него (обход блокировки HF)
-const DEEZER_PROXY_URL = process.env.DEEZER_PROXY_URL || "";
 
 const SECRET = "g4el58wc0zvf9na1";
 
@@ -4646,11 +4646,8 @@ async function searchDeezerTracks(query, limit = 10) {
   return data.data || [];
 }
 
-function getDeezerStreamUrl(trackId, format = "MP3_320", useProxy = false) {
-  // useProxy=true — строим URL через CF Worker (для Telegram sendAudio)
-  // useProxy=false — прямой HuggingFace URL (для HF-запросов с Render)
-  const base = (useProxy && DEEZER_PROXY_URL) ? DEEZER_PROXY_URL : DEEZER_SPACE_URL;
-  let url = `${base}/stream?id=${encodeURIComponent(trackId)}&format=${encodeURIComponent(format)}`;
+function getDeezerStreamUrl(trackId, format = "MP3_320") {
+  let url = `${DEEZER_SPACE_URL}/stream?id=${encodeURIComponent(trackId)}&format=${encodeURIComponent(format)}`;
   if (DEEZER_ARL) {
     url += `&arl=${encodeURIComponent(DEEZER_ARL)}`;
   }
@@ -4678,15 +4675,14 @@ function getDeezerTrackMeta(track = {}) {
   };
 }
 
-function getDeezerDownloadUrl(trackId, format = "MP3_320", useProxy = false, meta = {}) {
-  const base = (useProxy && DEEZER_PROXY_URL) ? DEEZER_PROXY_URL : DEEZER_SPACE_URL;
+function getDeezerDownloadUrl(trackId, format = "MP3_320", meta = {}) {
   const params = new URLSearchParams({
     id: String(trackId),
     format: String(format || "MP3_320"),
   });
   if (DEEZER_ARL) params.set("arl", DEEZER_ARL);
   appendDeezerMetaParams(params, meta);
-  return `${base}/download?${params.toString()}`;
+  return `${DEEZER_SPACE_URL}/download?${params.toString()}`;
 }
 
 function getDeezerSendAudioUrl(trackId, format, chatId, meta = {}) {
@@ -4806,7 +4802,9 @@ async function handleDeezerQuery(ctx, query) {
 
       try {
         const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, trackMeta);
-        const res = await fetch(sendAudioUrl);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), DEEZER_SEND_AUDIO_TIMEOUT_MS);
+        const res = await fetch(sendAudioUrl, { signal: controller.signal }).finally(() => clearTimeout(timeoutId));
         if (!res.ok) {
           throw new Error(`HF send_audio status ${res.status}`);
         }
@@ -4828,11 +4826,8 @@ async function handleDeezerQuery(ctx, query) {
         } catch (_) {}
 
         const downloadUrls = [
-          getDeezerDownloadUrl(bestTrack.id, format, false, trackMeta),
+          getDeezerDownloadUrl(bestTrack.id, format, trackMeta),
         ];
-        if (DEEZER_PROXY_URL) {
-          downloadUrls.push(getDeezerDownloadUrl(bestTrack.id, format, true, trackMeta));
-        }
 
         let sentMsg = null;
         let lastSendErr = null;
@@ -4926,9 +4921,21 @@ bot.on("inline_query", async (ctx) => {
       ? ((await redis.get(`deezer_quality:${userId}`)) || DEFAULT_DEEZER_QUALITY)
       : DEFAULT_DEEZER_QUALITY;
     const tracks = await searchDeezerTracks(query, 10);
-    const results = tracks.map((track) => {
+    const results = (await Promise.all(tracks.map(async (track) => {
       const inlineFormat = format === "FLAC" ? "MP3_320" : format;
-      const audioUrl = getDeezerDownloadUrl(track.id, inlineFormat, true, getDeezerTrackMeta(track));
+      const trackMeta = getDeezerTrackMeta(track);
+      const cacheKey = `deezer_fid:${track.id}:${inlineFormat}`;
+      const cachedFileId = await redis.get(cacheKey);
+      if (cachedFileId) {
+        return {
+          type: "audio",
+          id: `cached:${track.id}:${inlineFormat}`,
+          audio_file_id: cachedFileId,
+          caption: `${trackMeta.performer} - ${trackMeta.title}`,
+        };
+      }
+
+      const audioUrl = getDeezerDownloadUrl(track.id, inlineFormat, trackMeta);
       return {
         type: "audio",
         id: String(track.id),
@@ -4937,7 +4944,7 @@ bot.on("inline_query", async (ctx) => {
         performer: track.artist?.name || "Deezer",
         audio_duration: track.duration,
       };
-    });
+    }))).filter(Boolean);
     await ctx.answerInlineQuery(results, { cache_time: 60 });
   } catch (err) {
     console.error("Ошибка inline-поиска Deezer:", err.message);
