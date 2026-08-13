@@ -4865,6 +4865,27 @@ async function getDeezerAudioBuffer(trackId, format = "MP3_320") {
   return Buffer.from(buf);
 }
 
+// Пытается превратить статусное сообщение "Загружаю..." прямо в аудио-сообщение
+// через editMessageMedia (media может быть file_id или прямой URL/InputFile).
+// Возвращает отредактированное Message при успехе, иначе null (нужен фолбэк на replyWithAudio).
+async function editStatusMessageIntoAudio(ctx, statusMsg, media, trackMeta) {
+  try {
+    const edited = await ctx.api.editMessageMedia(ctx.chat.id, statusMsg.message_id, {
+      type: "audio",
+      media,
+      title: trackMeta.title,
+      performer: trackMeta.performer,
+      duration: trackMeta.duration,
+    });
+    // editMessageMedia возвращает Message (не true), когда правим не inline-сообщение
+    markDeezerFlowMessage(ctx.chat.id, typeof edited === "object" ? edited.message_id : statusMsg.message_id);
+    return typeof edited === "object" ? edited : null;
+  } catch (e) {
+    console.error("Не удалось отредактировать статусное сообщение в аудио:", e.message || e);
+    return null;
+  }
+}
+
 async function handleDeezerQuery(ctx, query) {
   try {
     const tracks = await searchDeezerTracks(query, 5);
@@ -4887,13 +4908,24 @@ async function handleDeezerQuery(ctx, query) {
     const cacheKey = `deezer_fid:${bestTrack.id}:${format}`;
     const cachedFileId = await redis.get(cacheKey);
 
+    // Если true — статусное сообщение уже стало аудио-сообщением, отдельно
+    // удалять его в конце не нужно (и нечего).
+    let statusBecameAudio = false;
+
     if (cachedFileId) {
-      const audioMsg = await ctx.replyWithAudio(cachedFileId, {
-        title: trackMeta.title,
-        performer: trackMeta.performer,
-        duration: trackMeta.duration,
-      });
-      markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
+      const edited = await editStatusMessageIntoAudio(ctx, statusMsg, cachedFileId, trackMeta);
+      if (edited) {
+        statusBecameAudio = true;
+      } else {
+        // Редактирование не удалось (например, сообщение слишком старое) —
+        // откатываемся на старое поведение: отдельное сообщение + удаление статуса.
+        const audioMsg = await ctx.replyWithAudio(cachedFileId, {
+          title: trackMeta.title,
+          performer: trackMeta.performer,
+          duration: trackMeta.duration,
+        });
+        markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
+      }
     } else {
       let fileId = null;
       let usedFallback = false;
@@ -4912,10 +4944,23 @@ async function handleDeezerQuery(ctx, query) {
             fileId = json.file_id;
             // Сервер шлёт аудио в Telegram сам, напрямую по Bot API, минуя
             // ctx этого бота — так что message_id основного присланного
-            // трека нам обычно недоступен и пометить его нечем. Если
-            // сервер всё же вернёт message_id — используем его (иначе
-            // markDeezerFlowMessage просто no-op на пустом id).
-            markDeezerFlowMessage(ctx.chat.id, json?.message_id);
+            // трека нам обычно недоступен. Если сервер его всё же вернул —
+            // удаляем присланное им сообщение и вместо него редактируем
+            // наше статусное сообщение в аудио (тем самым получаем именно
+            // "редактирование" вместо двух сообщений).
+            if (json?.message_id) {
+              try {
+                await ctx.api.deleteMessage(ctx.chat.id, json.message_id);
+              } catch (e) {
+                // Игнорируем — если не удалилось, просто оставим как есть ниже
+              }
+              const edited = await editStatusMessageIntoAudio(ctx, statusMsg, fileId, trackMeta);
+              if (edited) {
+                statusBecameAudio = true;
+              } else {
+                markDeezerFlowMessage(ctx.chat.id, json.message_id);
+              }
+            }
           } else {
             throw new Error(json?.error || json?.description || "send_audio returned no file_id");
           }
@@ -4936,13 +4981,19 @@ async function handleDeezerQuery(ctx, query) {
         try {
           const fallbackFormat = "MP3_320";
           const fallbackUrl = getDeezerDownloadUrl(bestTrack.id, fallbackFormat, trackMeta, DEEZER_SPACE_URL_FALLBACK);
-          const sentMsg = await ctx.replyWithAudio(fallbackUrl, {
-            title: trackMeta.title,
-            performer: trackMeta.performer,
-            duration: trackMeta.duration,
-          });
-          markDeezerFlowMessage(ctx.chat.id, sentMsg.message_id);
-          fileId = sentMsg?.audio?.file_id || null;
+          const edited = await editStatusMessageIntoAudio(ctx, statusMsg, fallbackUrl, trackMeta);
+          if (edited) {
+            statusBecameAudio = true;
+            fileId = edited?.audio?.file_id || null;
+          } else {
+            const sentMsg = await ctx.replyWithAudio(fallbackUrl, {
+              title: trackMeta.title,
+              performer: trackMeta.performer,
+              duration: trackMeta.duration,
+            });
+            markDeezerFlowMessage(ctx.chat.id, sentMsg.message_id);
+            fileId = sentMsg?.audio?.file_id || null;
+          }
           usedFallback = true;
         } catch (fallbackErr) {
           console.error("Ошибка фолбэк-отправки трека через HF:", fallbackErr.message || fallbackErr);
@@ -4958,10 +5009,12 @@ async function handleDeezerQuery(ctx, query) {
       }
     }
 
-    try {
-      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
-    } catch (e) {
-      // Игнорируем ошибку если сообщение уже удалено или слишком старое
+    if (!statusBecameAudio) {
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
+      } catch (e) {
+        // Игнорируем ошибку если сообщение уже удалено или слишком старое
+      }
     }
   } catch (err) {
     console.error("Ошибка при получении трека Deezer:", err.message || err);
