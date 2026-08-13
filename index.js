@@ -3614,19 +3614,37 @@ async function fetchDaySummaryWeatherText(place, dayOffset) {
 // отдаёт hourly-массив по 24 записи на день начиная с сегодняшних 00:00 (в
 // таймзоне места) — просто берём срез [dayOffset*24, dayOffset*24+24).
 async function fetchHourlyWeatherText(place, dayOffset) {
+  // &current=temperature_2m нужен здесь не ради самой температуры (она не
+  // используется), а чтобы получить data.current.time — текущее время в
+  // ЛОКАЛЬНОЙ таймзоне места (place.timezone), а не время сервера бота: по
+  // нему для "сегодня" отсекаем уже прошедшие часы (см. ниже).
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
     `&hourly=temperature_2m,precipitation_probability,weather_code` +
+    `&current=temperature_2m` +
     `&forecast_days=${dayOffset + 1}&timezone=${encodeURIComponent(place.timezone)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`open-meteo forecast: ${res.status}`);
   const data = await res.json();
   const h = data.hourly;
-  const start = dayOffset * 24;
+  let start = dayOffset * 24;
   const end = Math.min(start + 24, h.time.length);
   if (start >= h.time.length) throw new Error("day out of range");
-  const date = formatShortDate(h.time[start].split("T")[0]);
+  // Для "сегодня" (dayOffset=0) прячем уже прошедшие часы — иначе список
+  // на весь день загромождён давно истёкшими показаниями (спросил вечером
+  // "погода по часам" — незачем видеть, что было в 8 утра). Для "завтра"/
+  // "послезавтра" ничего не режем: там всё ещё в будущем целиком.
+  if (dayOffset === 0 && data.current?.time) {
+    const currentHour = Number(data.current.time.split("T")[1]?.slice(0, 2));
+    if (Number.isFinite(currentHour)) {
+      while (start < end && Number(h.time[start].split("T")[1]?.slice(0, 2)) <= currentHour) start++;
+    }
+  }
+  const date = formatShortDate(h.time[dayOffset * 24].split("T")[0]);
   const dayLabel = DAY_OFFSET_LABEL[dayOffset] || date;
+  if (start >= end) {
+    return `Погода в ${locationLabel(place)} по часам на ${dayLabel} (${date}): на сегодня почасовых данных больше не осталось — день закончился, спроси про завтра`;
+  }
   const lines = [`Погода в ${locationLabel(place)} по часам на ${dayLabel} (${date}):`];
   for (let i = start; i < end; i++) {
     const timePart = (h.time[i].split("T")[1] || "").slice(0, 5);
