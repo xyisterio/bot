@@ -3366,6 +3366,20 @@ function describeWeatherCode(code) {
 // начинающиеся на "погод", но не имеющие отношения к погоде.
 const WEATHER_WORD_REGEX = /погод(?:а|ы|е|у|ой|ою)(?![а-яё])/i;
 
+// "сегодня"/"завтра"/"послезавтра" — единственные относительные даты,
+// которые бот понимает (без полноценного разбора произвольных дат/"через
+// 3 дня" и т.п. — это отдельная, более сложная задача). dayOffset: 0/1/2.
+const RELATIVE_DAY_REGEX = /(?:^|\s)(?:на\s+)?(послезавтра|завтра|сегодня)(?![а-яё])/i;
+const RELATIVE_DAY_OFFSET = { сегодня: 0, завтра: 1, послезавтра: 2 };
+
+// "почасовой прогноз"/"прогноз по часам"/"по часам"/"каждый час" — просьба
+// показать не общую сводку за день, а температуру и вероятность осадков по
+// каждому часу. Слово "прогноз" рядом с "почасов..."/"по часам" съедаем
+// вместе с триггером, иначе оно осталось бы висеть в оставшемся тексте и
+// испортило бы дальнейшее вычленение названия города.
+const HOURLY_REGEX =
+  /(?:^|\s)(?:почасов[а-яё]*(?:\s+прогноз[а-яё]*)?|прогноз[а-яё]*\s+по\s+часам|по\s+часам|каждый\s+час)/i;
+
 function parseWeatherIntent(text) {
   const weatherWordMatch = WEATHER_WORD_REGEX.exec(text);
   if (!weatherWordMatch) return null;
@@ -3373,6 +3387,23 @@ function parseWeatherIntent(text) {
   if (!rest) return null;
 
   let days = 1;
+  // dayOffset === null — конкретный день не указан явно (сегодня/сейчас по
+  // умолчанию); 0/1/2 — "сегодня"/"завтра"/"послезавтра" явно указаны.
+  let dayOffset = null;
+  let hourly = false;
+
+  const hourlyMatch = HOURLY_REGEX.exec(rest);
+  if (hourlyMatch) {
+    hourly = true;
+    rest = (rest.slice(0, hourlyMatch.index) + rest.slice(hourlyMatch.index + hourlyMatch[0].length)).trim();
+  }
+
+  const relDayMatch = RELATIVE_DAY_REGEX.exec(rest);
+  if (relDayMatch) {
+    dayOffset = RELATIVE_DAY_OFFSET[relDayMatch[1].toLowerCase()];
+    rest = (rest.slice(0, relDayMatch.index) + rest.slice(relDayMatch.index + relDayMatch[0].length)).trim();
+  }
+
   // "на" перед числом/"неделю" необязателен — "погода Киев 10 дней" (без
   // предлога) должна пониматься так же, как "погода в Киеве на 10 дней".
   const weekMatch = /(?:^|\s)(?:на\s+)?недел[а-яё]*/i.exec(rest);
@@ -3400,7 +3431,7 @@ function parseWeatherIntent(text) {
   // города (с большой буквы) — иначе просто разговорное упоминание погоды
   // ("хорошая погода сегодня") улетало бы в геокодер как имя города.
   if (!hadPreposition && !/^[А-ЯЁA-Z]/.test(rest)) return null;
-  return { city: rest, days };
+  return { city: rest, days, dayOffset, hourly };
 }
 
 
@@ -3488,21 +3519,23 @@ function locationLabel(place) {
   return parts.join(", ");
 }
 
-// Русские названия дней недели/месяцев для человекочитаемых дат в ответах
-// о погоде — чтобы явно было видно, к какому числу и времени относится
-// прогноз/показание (а не просто "1…2…3" без привязки к календарю).
+// Русские названия дней недели для человекочитаемых дат в ответах о погоде
+// — чтобы явно было видно, к какому числу и времени относится прогноз/
+// показание (а не просто "1…2…3" без привязки к календарю). Числа месяца —
+// в числовом формате DD.MM (раньше было полное название месяца, напр.
+// "13 августа" — по просьбе пользователя заменено на "13.08").
 const RU_WEEKDAYS_SHORT = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]; // Date#getUTCDay(): 0=Вс
-const RU_MONTHS_GENITIVE = [
-  "января", "февраля", "марта", "апреля", "мая", "июня",
-  "июля", "августа", "сентября", "октября", "ноября", "декабря",
-];
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
 
 // "YYYY-MM-DDTHH:MM" (локальное время места, как отдаёт Open-Meteo при
-// заданной timezone) -> "13 августа, 14:32".
+// заданной timezone) -> "13.08, 14:32".
 function formatDateTimeLabel(isoDateTime) {
   const [datePart, timePart] = isoDateTime.split("T");
   const [year, month, day] = datePart.split("-").map(Number);
-  return `${day} ${RU_MONTHS_GENITIVE[month - 1]}, ${timePart || ""}`.trim().replace(/,\s*$/, "");
+  return `${pad2(day)}.${pad2(month)}${timePart ? `, ${timePart}` : ""}`;
 }
 
 async function fetchCurrentWeatherText(place) {
@@ -3547,6 +3580,64 @@ async function fetchForecastWeatherText(place, days) {
 }
 
 
+// Русские подписи для dayOffset (0/1/2) в ответах о конкретном дне.
+const DAY_OFFSET_LABEL = { 0: "сегодня", 1: "завтра", 2: "послезавтра" };
+
+// Сводка (мин/макс температура + осадки) на конкретный будущий день
+// ("погода в Киеве на завтра") — не текущие показания (open-meteo "current"
+// работает только для "сейчас") и не диапазон из нескольких дней, а именно
+// один день по смещению от сегодня (dayOffset: 0=сегодня, 1=завтра и т.д.).
+async function fetchDaySummaryWeatherText(place, dayOffset) {
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
+    `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
+    `&forecast_days=${dayOffset + 1}&timezone=${encodeURIComponent(place.timezone)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`open-meteo forecast: ${res.status}`);
+  const data = await res.json();
+  const d = data.daily;
+  if (!d.time[dayOffset]) throw new Error("day out of range");
+  const w = describeWeatherCode(d.weather_code[dayOffset]);
+  const date = formatShortDate(d.time[dayOffset]);
+  const dayLabel = DAY_OFFSET_LABEL[dayOffset] || date;
+  const tMax = Math.round(d.temperature_2m_max[dayOffset]);
+  const tMin = Math.round(d.temperature_2m_min[dayOffset]);
+  const precip = d.precipitation_probability_max[dayOffset];
+  return (
+    `Погода в ${locationLabel(place)} на ${dayLabel} (${date}):\n` +
+    `${w.icon} ${tMin}…${tMax}°C, осадки ${precip}%`
+  );
+}
+
+// Почасовой прогноз (температура + вероятность осадков за каждый час) на
+// конкретный день (dayOffset: 0=сегодня, 1=завтра, 2=послезавтра). Open-Meteo
+// отдаёт hourly-массив по 24 записи на день начиная с сегодняшних 00:00 (в
+// таймзоне места) — просто берём срез [dayOffset*24, dayOffset*24+24).
+async function fetchHourlyWeatherText(place, dayOffset) {
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
+    `&hourly=temperature_2m,precipitation_probability,weather_code` +
+    `&forecast_days=${dayOffset + 1}&timezone=${encodeURIComponent(place.timezone)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`open-meteo forecast: ${res.status}`);
+  const data = await res.json();
+  const h = data.hourly;
+  const start = dayOffset * 24;
+  const end = Math.min(start + 24, h.time.length);
+  if (start >= h.time.length) throw new Error("day out of range");
+  const date = formatShortDate(h.time[start].split("T")[0]);
+  const dayLabel = DAY_OFFSET_LABEL[dayOffset] || date;
+  const lines = [`Погода в ${locationLabel(place)} по часам на ${dayLabel} (${date}):`];
+  for (let i = start; i < end; i++) {
+    const timePart = (h.time[i].split("T")[1] || "").slice(0, 5);
+    const w = describeWeatherCode(h.weather_code[i]);
+    const temp = Math.round(h.temperature_2m[i]);
+    const precip = h.precipitation_probability[i];
+    lines.push(`${timePart} ${w.icon} ${temp}°C, осадки ${precip}%`);
+  }
+  return lines.join("\n");
+}
+
 // "1 день" / "2 дня" / "5 дней" — русское словообразование числительных.
 function daysWordForm(n) {
   const mod10 = n % 10;
@@ -3556,13 +3647,11 @@ function daysWordForm(n) {
   return "дней";
 }
 
-// "2026-08-13" -> "Чт, 13 августа" — раньше отдавало только "13.08" без
-// дня недели и названия месяца, из-за чего в списке прогноза на несколько
-// дней не было сразу понятно, какой это день недели и какого месяца.
+// "2026-08-13" -> "Чт, 13.08" (день недели + число.месяц числом).
 function formatShortDate(isoDate) {
   const [year, month, day] = isoDate.split("-").map(Number);
   const weekday = RU_WEEKDAYS_SHORT[new Date(Date.UTC(year, month - 1, day)).getUTCDay()];
-  return `${weekday}, ${day} ${RU_MONTHS_GENITIVE[month - 1]}`;
+  return `${weekday}, ${pad2(day)}.${pad2(month)}`;
 }
 
 async function handleWeatherQuery(ctx, intent) {
@@ -3573,8 +3662,22 @@ async function handleWeatherQuery(ctx, intent) {
     return;
   }
   try {
-    const text =
-      intent.days > 1 ? await fetchForecastWeatherText(place, intent.days) : await fetchCurrentWeatherText(place);
+    let text;
+    if (intent.hourly) {
+      // Почасовой прогноз — если день не уточнён явно, показываем на
+      // сегодня (dayOffset=0).
+      text = await fetchHourlyWeatherText(place, intent.dayOffset ?? 0);
+    } else if (intent.dayOffset) {
+      // dayOffset=1/2 ("завтра"/"послезавтра") — сводка на конкретный
+      // будущий день. dayOffset=0 ("сегодня") сюда не попадает намеренно —
+      // для "сегодня" логичнее показать текущие показания (ветка ниже), а
+      // не мин/макс на весь день.
+      text = await fetchDaySummaryWeatherText(place, intent.dayOffset);
+    } else if (intent.days > 1) {
+      text = await fetchForecastWeatherText(place, intent.days);
+    } else {
+      text = await fetchCurrentWeatherText(place);
+    }
     await ctx.reply(text);
   } catch (err) {
     console.error("Ошибка получения погоды:", err);
