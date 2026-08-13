@@ -3,6 +3,7 @@ import express from "express";
 import { Redis } from "@upstash/redis";
 import { Chess } from "chess.js";
 import crypto from "node:crypto";
+import { BOT_SKILLS_PROMPT } from "./skills.js";
 
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -2432,7 +2433,12 @@ async function askLLM(chatId, userText) {
   const history = getHistory(chatId);
 
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
+    // BOT_SKILLS_PROMPT (см. skills.js) подмешан отдельным блоком в конец
+    // системного промпта — это знания бота о собственном функционале
+    // (погода/шахматы/фильмы/музыка/крокодил/пересказ и т.п.), нужны,
+    // чтобы модель могла осмысленно отвечать на вопросы вида "что ты
+    // умеешь"/"как сделать чтобы ты..." своим языком, а не сухим списком.
+    { role: "system", content: SYSTEM_PROMPT + "\n\n" + BOT_SKILLS_PROMPT },
     ...history,
     { role: "user", content: userText },
   ];
