@@ -830,6 +830,35 @@ function getBotReply(chatId, messageId) {
   return botRepliesByMessage.get(`${chatId}:${messageId}`) || null;
 }
 
+// ==== Сообщения бота, реально относящиеся к музыкальному потоку (Deezer) ====
+// Раньше "это реплай на музыкальное сообщение бота?" определялось нечётким
+// regex'ом по ТЕКСТУ сообщения, на которое ответили (/Загружаю|найден|
+// Deezer|🎵|🎚/i) — а текст этот в случае обычных ответов LLM (например,
+// рассказ о своих возможностях) вполне мог случайно содержать одно из этих
+// слов ("Deezer", "🎵" и т.п.), и тогда ЛЮБОЙ последующий реплай на такое
+// сообщение (даже "какая погода в Киеве?" или обычный вопрос) ошибочно
+// уходил в поиск трека на Deezer. Вместо угадывания по словам — явно
+// помечаем ID тех сообщений, которые бот сам отправил именно в рамках
+// музыкального потока (статус загрузки, "не найдено", ошибка, сам
+// присланный трек), и полагаемся только на эту точную метку.
+const DEEZER_MSG_TAG_LIMIT = 500;
+const deezerFlowMessageIds = new Map(); // `${chatId}:${messageId}` -> true
+
+function markDeezerFlowMessage(chatId, messageId) {
+  if (!messageId) return;
+  const key = `${chatId}:${messageId}`;
+  deezerFlowMessageIds.set(key, true);
+  if (deezerFlowMessageIds.size > DEEZER_MSG_TAG_LIMIT) {
+    const oldestKey = deezerFlowMessageIds.keys().next().value;
+    deezerFlowMessageIds.delete(oldestKey);
+  }
+}
+
+function isDeezerFlowMessage(chatId, messageId) {
+  if (!messageId) return false;
+  return deezerFlowMessageIds.has(`${chatId}:${messageId}`);
+}
+
 // ==== Пересланные сообщения (мемы/новости из других каналов) ====
 // Такие сообщения не должны засорять ни ChatLog (пересказ "о чём тут
 // речь"), ни обычную историю диалога — это не то, что писали сами
@@ -4786,12 +4815,14 @@ async function handleDeezerQuery(ctx, query) {
   try {
     const tracks = await searchDeezerTracks(query, 5);
     if (!tracks || tracks.length === 0) {
-      await ctx.reply(`🔍 По запросу «${query}» ничего не найдено.`);
+      const notFoundMsg = await ctx.reply(`🔍 По запросу «${query}» ничего не найдено.`);
+      markDeezerFlowMessage(ctx.chat.id, notFoundMsg.message_id);
       return;
     }
     const bestTrack = tracks[0];
     const trackMeta = getDeezerTrackMeta(bestTrack);
     const statusMsg = await ctx.reply(`🎵 Загружаю «${bestTrack.artist?.name || ""} — ${bestTrack.title}»...`);
+    markDeezerFlowMessage(ctx.chat.id, statusMsg.message_id);
 
     const userId = ctx.from?.id;
     const format = userId
@@ -4803,11 +4834,12 @@ async function handleDeezerQuery(ctx, query) {
     const cachedFileId = await redis.get(cacheKey);
 
     if (cachedFileId) {
-      await ctx.replyWithAudio(cachedFileId, {
+      const audioMsg = await ctx.replyWithAudio(cachedFileId, {
         title: trackMeta.title,
         performer: trackMeta.performer,
         duration: trackMeta.duration,
       });
+      markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
     } else {
       let fileId = null;
       let usedFallback = false;
@@ -4824,6 +4856,12 @@ async function handleDeezerQuery(ctx, query) {
           const json = await res.json();
           if (json?.ok && json?.file_id) {
             fileId = json.file_id;
+            // Сервер шлёт аудио в Telegram сам, напрямую по Bot API, минуя
+            // ctx этого бота — так что message_id основного присланного
+            // трека нам обычно недоступен и пометить его нечем. Если
+            // сервер всё же вернёт message_id — используем его (иначе
+            // markDeezerFlowMessage просто no-op на пустом id).
+            markDeezerFlowMessage(ctx.chat.id, json?.message_id);
           } else {
             throw new Error(json?.error || json?.description || "send_audio returned no file_id");
           }
@@ -4849,6 +4887,7 @@ async function handleDeezerQuery(ctx, query) {
             performer: trackMeta.performer,
             duration: trackMeta.duration,
           });
+          markDeezerFlowMessage(ctx.chat.id, sentMsg.message_id);
           fileId = sentMsg?.audio?.file_id || null;
           usedFallback = true;
         } catch (fallbackErr) {
@@ -4872,7 +4911,8 @@ async function handleDeezerQuery(ctx, query) {
     }
   } catch (err) {
     console.error("Ошибка при получении трека Deezer:", err.message || err);
-    await ctx.reply("⚠️ Не удалось загрузить трек с Deezer. Попробуй позже.");
+    const errMsg = await ctx.reply("⚠️ Не удалось загрузить трек с Deezer. Попробуй позже.");
+    markDeezerFlowMessage(ctx.chat.id, errMsg.message_id);
   }
 }
 
@@ -4989,10 +5029,15 @@ bot.on("message:text", async (ctx) => {
       await handleDeezerQuery(ctx, replyIntent);
       return;
     }
-    // Если бот спрашивал о музыке (его сообщение содержит "Загружаю" или "не найдено" или "Deezer")
-    const botMsgText = replyMsg.text || replyMsg.caption || "";
-    const isBotMusicMsg = /Загружаю|найден|Deezer|🎵|🎚/i.test(botMsgText);
-    if (isBotMusicMsg && rawText.length > 1 && rawText.length < 200) {
+    // Реплай на сообщение бота считаем музыкальным, ТОЛЬКО если это
+    // сообщение реально помечено как часть Deezer-потока (см.
+    // markDeezerFlowMessage/isDeezerFlowMessage) — раньше это определялось
+    // нечётким regex'ом по тексту сообщения (наличие слов "Загружаю"/
+    // "найден"/"Deezer"/🎵/🎚), из-за чего обычный ответ LLM (например,
+    // рассказ о своих возможностях), случайно упомянувший одно из этих
+    // слов, заставлял бота принимать ЛЮБОЙ следующий реплай на него
+    // (даже "какая погода в Киеве?") за поиск трека.
+    if (isDeezerFlowMessage(chatId, replyMsg.message_id) && rawText.length > 1 && rawText.length < 200) {
       await handleDeezerQuery(ctx, rawText.trim());
       return;
     }
