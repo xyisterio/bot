@@ -3345,16 +3345,37 @@ function describeWeatherCode(code) {
 // ВАЖНО: \b в JS работает через \w, который НЕ включает кириллицу (то же
 // уже отмечено в parseRequestedUserColor выше) — поэтому тут вместо \b
 // используются обычные пробелы/якоря начала-конца строки.
+// Разбирает намерение "погода в <город>[ на N дней|на неделю]" из текста.
+// Возвращает { city, days } (days=1 — текущая погода) или null.
+// ВАЖНО: \b в JS работает через \w, который НЕ включает кириллицу (то же
+// уже отмечено в parseRequestedUserColor выше) — поэтому тут вместо \b
+// используются обычные пробелы/якоря начала-конца строки.
+//
+// Раньше триггер ловил только "погода"/"погоды" (именительный/родительный
+// падеж) — из-за этого "пришли ПОГОДУ в Киеве" (винительный падеж) не
+// матчился вообще и улетало в обычный LLM-чат, где модель могла попытаться
+// сама придумать прогноз вместо реального. Теперь ловим слово "погод..." с
+// любым русским окончанием (погода/погоды/погоду/погоде/погодой и т.п.).
+// Раньше триггер ловил только "погода"/"погоды" (именительный/родительный
+// падеж) — из-за этого "пришли ПОГОДУ в Киеве" (винительный падеж) не
+// матчился вообще и улетало в обычный LLM-чат, где модель могла попытаться
+// сама придумать прогноз вместо реального. Теперь ловим конкретный набор
+// падежных окончаний слова "погода" (а/ы/е/у/ой/ою) — не любое окончание
+// подряд, иначе заодно матчилось бы "Погоди" (подожди) и подобные слова,
+// начинающиеся на "погод", но не имеющие отношения к погоде.
+const WEATHER_WORD_REGEX = /погод(?:а|ы|е|у|ой|ою)(?![а-яё])/i;
+
 function parseWeatherIntent(text) {
-  if (!/погод[аы]/i.test(text)) return null;
-  const afterMatch = text.match(/погод[аы](.*)$/is);
-  if (!afterMatch) return null;
-  let rest = afterMatch[1].trim();
+  const weatherWordMatch = WEATHER_WORD_REGEX.exec(text);
+  if (!weatherWordMatch) return null;
+  let rest = text.slice(weatherWordMatch.index + weatherWordMatch[0].length).trim();
   if (!rest) return null;
 
   let days = 1;
-  const weekMatch = /(?:^|\s)на\s+недел[а-яё]*/i.exec(rest);
-  const daysMatch = /(?:^|\s)на\s+(\d{1,2})\s*(?:дн[а-яё]*|days?)/i.exec(rest);
+  // "на" перед числом/"неделю" необязателен — "погода Киев 10 дней" (без
+  // предлога) должна пониматься так же, как "погода в Киеве на 10 дней".
+  const weekMatch = /(?:^|\s)(?:на\s+)?недел[а-яё]*/i.exec(rest);
+  const daysMatch = /(?:^|\s)(?:на\s+)?(\d{1,2})\s*(?:дн[а-яё]*|days?)/i.exec(rest);
   if (daysMatch) {
     days = Math.min(16, Math.max(1, parseInt(daysMatch[1], 10)));
     rest = rest.slice(0, daysMatch.index).trim();
@@ -3365,6 +3386,13 @@ function parseWeatherIntent(text) {
 
   const hadPreposition = /^(?:в|во|для|по)\s+/i.test(rest);
   rest = rest.replace(/^(?:в|во|для|по)\s+/i, "").trim();
+  // "в городе Киев" / "в городе Киеве" — филлер-слово "город(е/а/у)" перед
+  // самим названием, из-за геокодер получал бы "городе Киев" целиком и не
+  // нашёл бы ничего (геокодинг матчит по префиксу самого имени города, а
+  // не по произвольной фразе). Срезаем только когда после него идёт ещё
+  // слово — иначе случайно обрежем реальный город, у которого имя само
+  // начинается на "город..." (напр. "Городня"), если он указан без филлера.
+  rest = rest.replace(/^город[а-яё]*\s+(?=\S)/i, "").trim();
   rest = rest.replace(/[.,!?;:]+$/g, "").trim();
   if (!rest) return null;
   // Без предлога ("погода Львов") принимаем, только если похоже на имя
@@ -3373,6 +3401,7 @@ function parseWeatherIntent(text) {
   if (!hadPreposition && !/^[А-ЯЁA-Z]/.test(rest)) return null;
   return { city: rest, days };
 }
+
 
 // Геокодинг с фолбэком на грамматические падежи: Open-Meteo матчит только
 // по ПРЕФИКСУ индексированного имени (см. docs geocoding-api.open-meteo.com),
@@ -3458,6 +3487,23 @@ function locationLabel(place) {
   return parts.join(", ");
 }
 
+// Русские названия дней недели/месяцев для человекочитаемых дат в ответах
+// о погоде — чтобы явно было видно, к какому числу и времени относится
+// прогноз/показание (а не просто "1…2…3" без привязки к календарю).
+const RU_WEEKDAYS_SHORT = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]; // Date#getUTCDay(): 0=Вс
+const RU_MONTHS_GENITIVE = [
+  "января", "февраля", "марта", "апреля", "мая", "июня",
+  "июля", "августа", "сентября", "октября", "ноября", "декабря",
+];
+
+// "YYYY-MM-DDTHH:MM" (локальное время места, как отдаёт Open-Meteo при
+// заданной timezone) -> "13 августа, 14:32".
+function formatDateTimeLabel(isoDateTime) {
+  const [datePart, timePart] = isoDateTime.split("T");
+  const [year, month, day] = datePart.split("-").map(Number);
+  return `${day} ${RU_MONTHS_GENITIVE[month - 1]}, ${timePart || ""}`.trim().replace(/,\s*$/, "");
+}
+
 async function fetchCurrentWeatherText(place) {
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
@@ -3468,8 +3514,11 @@ async function fetchCurrentWeatherText(place) {
   const data = await res.json();
   const c = data.current;
   const w = describeWeatherCode(c.weather_code);
+  // c.time — локальное время места на момент замера (то самое "сейчас"),
+  // выводим его явно, а не просто слово "сейчас" без конкретики.
+  const whenLabel = c.time ? formatDateTimeLabel(c.time) : null;
   return (
-    `Погода в ${locationLabel(place)} сейчас:\n` +
+    `Погода в ${locationLabel(place)}${whenLabel ? ` на ${whenLabel} (по местному времени)` : " сейчас"}:\n` +
     `${w.icon} ${w.desc}, ${Math.round(c.temperature_2m)}°C (ощущается как ${Math.round(c.apparent_temperature)}°C)\n` +
     `💧 влажность ${c.relative_humidity_2m}% · 💨 ветер ${Math.round(c.wind_speed_10m)} м/с`
   );
@@ -3491,10 +3540,11 @@ async function fetchForecastWeatherText(place, days) {
     const tMax = Math.round(d.temperature_2m_max[i]);
     const tMin = Math.round(d.temperature_2m_min[i]);
     const precip = d.precipitation_probability_max[i];
-    lines.push(`${date} ${w.icon} ${tMin}…${tMax}°C, осадки ${precip}%`);
+    lines.push(`${date}: ${w.icon} ${tMin}…${tMax}°C, осадки ${precip}%`);
   }
   return lines.join("\n");
 }
+
 
 // "1 день" / "2 дня" / "5 дней" — русское словообразование числительных.
 function daysWordForm(n) {
@@ -3505,9 +3555,13 @@ function daysWordForm(n) {
   return "дней";
 }
 
+// "2026-08-13" -> "Чт, 13 августа" — раньше отдавало только "13.08" без
+// дня недели и названия месяца, из-за чего в списке прогноза на несколько
+// дней не было сразу понятно, какой это день недели и какого месяца.
 function formatShortDate(isoDate) {
-  const [, month, day] = isoDate.split("-");
-  return `${day}.${month}`;
+  const [year, month, day] = isoDate.split("-").map(Number);
+  const weekday = RU_WEEKDAYS_SHORT[new Date(Date.UTC(year, month - 1, day)).getUTCDay()];
+  return `${weekday}, ${day} ${RU_MONTHS_GENITIVE[month - 1]}`;
 }
 
 async function handleWeatherQuery(ctx, intent) {
