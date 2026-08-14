@@ -2726,6 +2726,12 @@ const DEEZER_ARL = process.env.DEEZER_ARL || "";
 const DEFAULT_DEEZER_QUALITY = process.env.DEEZER_QUALITY || "MP3_320";
 const DEEZER_SEND_AUDIO_TIMEOUT_MS = Number(process.env.DEEZER_SEND_AUDIO_TIMEOUT_MS || 60000);
 
+// ==== SoundCloud ====
+// SoundCloud работает через HF сервер (тот же что и Deezer fallback).
+// Максимальное качество: 256kbps AAC для Go+ треков, 128kbps MP3 для остальных.
+const SOUNDCLOUD_SERVER_URL = process.env.SOUNDCLOUD_SERVER_URL || DEEZER_SPACE_URL_FALLBACK || "";
+const SOUNDCLOUD_QUALITY = process.env.SOUNDCLOUD_QUALITY || "best"; // best, 256, 128
+
 const SECRET = "g4el58wc0zvf9na1";
 
 function getBlowfishKeyBuffer(trackId) {
@@ -4867,6 +4873,55 @@ function parseDeezerIntent(rawText) {
   return null;
 }
 
+// ==== SoundCloud функции ====
+
+// Проверяет, есть ли в запросе явное упоминание "soundcloud"
+function isSoundCloudIntent(text) {
+  return /\bsoundcloud\b/i.test(text);
+}
+
+// Убирает слово "soundcloud" из поискового запроса
+function stripSoundCloudKeyword(text) {
+  return text.replace(/\bsoundcloud\b/gi, "").trim();
+}
+
+// Поиск треков на SoundCloud через сервер
+async function searchSoundCloudTracks(query, limit = 5) {
+  if (!SOUNDCLOUD_SERVER_URL) {
+    throw new Error("SoundCloud server не настроен");
+  }
+  
+  const url = `${SOUNDCLOUD_SERVER_URL}/soundcloud/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`SoundCloud search status: ${res.status}`);
+  const data = await res.json();
+  return data.tracks || [];
+}
+
+// Формирует URL для скачивания трека с SoundCloud
+function getSoundCloudDownloadUrl(trackUrl, meta = {}) {
+  const params = new URLSearchParams({
+    url: trackUrl,
+    quality: SOUNDCLOUD_QUALITY,
+  });
+  
+  if (meta.title) params.set("title", meta.title);
+  if (meta.performer) params.set("performer", meta.performer);
+  if (meta.duration) params.set("duration", String(meta.duration));
+  
+  return `${SOUNDCLOUD_SERVER_URL}/soundcloud/download?${params.toString()}`;
+}
+
+// Извлекает метаданные из объекта трека SoundCloud
+function getSoundCloudTrackMeta(track = {}) {
+  return {
+    title: track.title || "",
+    performer: track.user?.username || track.artist || "",
+    duration: Math.floor((track.duration || 0) / 1000), // SoundCloud в миллисекундах
+    url: track.permalink_url || "",
+  };
+}
+
 async function searchDeezerTracks(query, limit = 10) {
   const url = `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=${limit}`;
   const res = await fetch(url);
@@ -5024,6 +5079,11 @@ async function handleDeezerQuery(ctx, query) {
   try {
     const tracks = await searchDeezerTracks(query, 5);
     if (!tracks || tracks.length === 0) {
+      // Если на Deezer не найдено и настроен SoundCloud - пробуем там
+      if (SOUNDCLOUD_SERVER_URL) {
+        console.log(`Deezer не нашёл "${query}", пробую SoundCloud`);
+        return await handleSoundCloudQuery(ctx, query);
+      }
       const notFoundMsg = await ctx.reply(`🔍 По запросу «${query}» ничего не найдено.`);
       markDeezerFlowMessage(ctx.chat.id, notFoundMsg.message_id);
       return;
@@ -5157,13 +5217,82 @@ async function handleDeezerQuery(ctx, query) {
   }
 }
 
+// ==== Обработка запросов SoundCloud ====
+async function handleSoundCloudQuery(ctx, query) {
+  try {
+    const tracks = await searchSoundCloudTracks(query, 5);
+    if (!tracks || tracks.length === 0) {
+      const notFoundMsg = await ctx.reply(`🔍 По запросу «${query}» ничего не найдено на SoundCloud.`);
+      markDeezerFlowMessage(ctx.chat.id, notFoundMsg.message_id);
+      return;
+    }
+    
+    const bestTrack = tracks[0];
+    const trackMeta = getSoundCloudTrackMeta(bestTrack);
+    const statusMsg = await ctx.reply(`🎵 Загружаю с SoundCloud: «${trackMeta.performer} — ${trackMeta.title}»...`);
+    markDeezerFlowMessage(ctx.chat.id, statusMsg.message_id);
+
+    // Кэш file_id
+    const cacheKey = `soundcloud_fid:${bestTrack.id || bestTrack.permalink}`;
+    const cachedFileId = await redis.get(cacheKey);
+
+    if (cachedFileId) {
+      const audioMsg = await ctx.replyWithAudio(cachedFileId, {
+        title: trackMeta.title,
+        performer: trackMeta.performer,
+        duration: trackMeta.duration,
+      });
+      markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
+    } else {
+      // Отправляем по URL - Telegram сам скачивает
+      const audioUrl = getSoundCloudDownloadUrl(trackMeta.url, trackMeta);
+      
+      try {
+        const audioMsg = await ctx.replyWithAudio(audioUrl, {
+          title: trackMeta.title,
+          performer: trackMeta.performer,
+          duration: trackMeta.duration,
+        });
+        markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
+        
+        const fileId = audioMsg?.audio?.file_id || null;
+        if (fileId) {
+          await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
+        }
+      } catch (e) {
+        console.error("Ошибка отправки SoundCloud трека в Telegram:", audioUrl, e.message || e);
+        throw e;
+      }
+    }
+
+    try {
+      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
+    } catch (e) {
+      // Игнорируем ошибку если сообщение уже удалено
+    }
+  } catch (err) {
+    console.error("Ошибка при получении трека SoundCloud:", err.message || err);
+    await ctx.reply("⚠️ Не удалось загрузить трек с SoundCloud. Попробуй позже.");
+  }
+}
+
 bot.command(["song", "deezer", "music", "track"], async (ctx) => {
   const match = ctx.message.text.match(/^\/(?:song|deezer|music|track)(?:@\w+)?\s+(.+)$/i);
   if (!match || !match[1]) {
     await ctx.reply("🎵 Использование: /song название песни");
     return;
   }
-  await handleDeezerQuery(ctx, match[1].trim());
+  
+  const rawQuery = match[1].trim();
+  
+  // Если в запросе явно указан "soundcloud" - ищем только там
+  if (isSoundCloudIntent(rawQuery)) {
+    const query = stripSoundCloudKeyword(rawQuery);
+    await handleSoundCloudQuery(ctx, query);
+  } else {
+    // Иначе ищем на Deezer (с fallback на SoundCloud если не найдено)
+    await handleDeezerQuery(ctx, rawQuery);
+  }
 });
 
 bot.command("quality", async (ctx) => {
@@ -5253,11 +5382,18 @@ bot.on("message:text", async (ctx) => {
   // которые парсит не LLM, а chess.js.
   const rawText = ctx.message.text;
 
-  // ==== Музыка / Deezer ====
+  // ==== Музыка / Deezer / SoundCloud ====
   // 1. Прямой intent-запрос ("скинь песню X", "найди трек X")
-  const deezerQuery = parseDeezerIntent(stripBotAddressing(rawText, ctx));
+  const strippedText = stripBotAddressing(rawText, ctx);
+  const deezerQuery = parseDeezerIntent(strippedText);
   if (deezerQuery) {
-    await handleDeezerQuery(ctx, deezerQuery);
+    // Проверяем, есть ли явное указание на SoundCloud
+    if (isSoundCloudIntent(deezerQuery)) {
+      const query = stripSoundCloudKeyword(deezerQuery);
+      await handleSoundCloudQuery(ctx, query);
+    } else {
+      await handleDeezerQuery(ctx, deezerQuery);
+    }
     return;
   }
 
@@ -5267,7 +5403,13 @@ bot.on("message:text", async (ctx) => {
     // Пользователь ответил на сообщение бота — проверяем intent
     const replyIntent = parseDeezerIntent(rawText);
     if (replyIntent) {
-      await handleDeezerQuery(ctx, replyIntent);
+      // Проверяем SoundCloud intent
+      if (isSoundCloudIntent(replyIntent)) {
+        const query = stripSoundCloudKeyword(replyIntent);
+        await handleSoundCloudQuery(ctx, query);
+      } else {
+        await handleDeezerQuery(ctx, replyIntent);
+      }
       return;
     }
     // Реплай на сообщение бота считаем музыкальным (запускаем новый поиск
