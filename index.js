@@ -5748,34 +5748,46 @@ bot.on("message:text", async (ctx) => {
       if (movieCard.genres) parts.push(`жанры: ${movieCard.genres}`);
       if (movieCard.summary) parts.push(`описание: ${movieCard.summary}`);
       userText = `[бот ранее прислал карточку — ${parts.join(", ")}] ${userText}`;
-    } else if (repliedToBotMsg.audio) {
-      // ==== Реплай на трек, который бот сам прислал (Deezer) ====
+    } else if (repliedToBotMsg.audio || getVoiceTranscript(chatId, repliedToBotMsg.message_id)) {
+      // ==== Реплай на трек (Deezer) или на присланный ботом дословный
+      // текст песни ====
       // Явные новые поисковые запросы ("найди трек X", просто голое
       // название) уже перехвачены раньше (см. блок Deezer выше) — сюда
       // попадают именно вопросы/комментарии о самой песне ("о чём эта
-      // песня?", "переведи", "нравится?" и т.п.). Если модель знает
-      // песню по названию/исполнителю — ей этого обычно достаточно; если
-      // нет (или чтобы не гадать про смысл) — прогоняем сам файл через
-      // тот же Whisper-пайплайн, что и для аудио/голосовых от людей (см.
-      // repliedTag выше и transcribeVoice) и подмешиваем распознанный
-      // текст песни в промпт. Кэш расшифровок (voiceTranscriptsByMessage)
-      // общий с тем блоком — повторный реплай на тот же трек не гоняет
-      // файл через Whisper заново.
+      // песня?", "переведи", "нравится?" и т.п.), причём реплаем МОГУТ быть
+      // как на сам аудиофайл трека, так и на отдельное текстовое сообщение
+      // с дословным текстом песни, которое бот раньше прислал по команде
+      // "текст"/"текст песни" (см. ветку wantsLiteralLyrics ниже — там при
+      // отправке текста мы дополнительно запоминаем его в этом же кэше
+      // расшифровок под message_id ЭТОГО сообщения, иначе повторный реплай
+      // на сам присланный текст песни, а не на аудиофайл, бот "не видел" —
+      // repliedToBotMsg.audio у текстового сообщения нет, и раньше это
+      // проваливалось в общую ветку getBotReply, которая про такое вообще
+      // не знала). Если модель знает песню по названию/исполнителю — ей
+      // этого обычно достаточно; если нет (или чтобы не гадать про смысл) —
+      // прогоняем сам файл через тот же Whisper-пайплайн, что и для
+      // аудио/голосовых от людей (см. repliedTag выше и transcribeVoice) и
+      // подмешиваем распознанный текст песни в промпт. Кэш расшифровок
+      // (voiceTranscriptsByMessage) общий с тем блоком — повторный реплай
+      // на тот же трек/текст не гоняет файл через Whisper заново.
       const trackAudio = repliedToBotMsg.audio;
-      const trackLabel = [trackAudio.performer, trackAudio.title].filter(Boolean).join(" — ");
+      let lyricsInfo = getVoiceTranscript(chatId, repliedToBotMsg.message_id);
+      const trackLabel =
+        (trackAudio && [trackAudio.performer, trackAudio.title].filter(Boolean).join(" — ")) ||
+        lyricsInfo?.name ||
+        "";
       const wantsLiteralLyrics = VOICE_TRANSCRIBE_INTENT_REGEX.test(rawText.trim());
 
-      let lyricsInfo = getVoiceTranscript(chatId, repliedToBotMsg.message_id);
       let lyricsError = null;
       let lyricsTooLarge = false;
       if (!lyricsInfo) {
-        if (trackAudio.file_size && trackAudio.file_size > MAX_TRANSCRIBE_FILE_SIZE) {
+        if (trackAudio?.file_size && trackAudio.file_size > MAX_TRANSCRIBE_FILE_SIZE) {
           lyricsTooLarge = true;
         } else {
           try {
             const { text } = await transcribeVoice(ctx, trackAudio.file_id);
-            lyricsInfo = { name: "бот", text };
-            rememberVoiceTranscript(chatId, repliedToBotMsg.message_id, "бот", text);
+            lyricsInfo = { name: trackLabel || "бот", text };
+            rememberVoiceTranscript(chatId, repliedToBotMsg.message_id, trackLabel || "бот", text);
           } catch (err) {
             lyricsError = err;
             console.error(
@@ -5807,10 +5819,14 @@ bot.on("message:text", async (ctx) => {
             message_thread_id: ctx.message.message_thread_id,
           });
         } else {
-          await ctx.reply(lyricsInfo.text, {
+          const sentLyricsMsg = await ctx.reply(lyricsInfo.text, {
             reply_parameters: { message_id: repliedToBotMsg.message_id },
             message_thread_id: ctx.message.message_thread_id,
           });
+          // Запоминаем текст под message_id ИМЕННО этого отправленного
+          // сообщения — см. пояснение в комментарии выше про реплай на сам
+          // присланный текст песни, а не на аудиофайл.
+          rememberVoiceTranscript(chatId, sentLyricsMsg.message_id, trackLabel || "бот", lyricsInfo.text);
         }
         return;
       }
