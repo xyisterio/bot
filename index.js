@@ -5248,10 +5248,23 @@ async function handleSoundCloudQuery(ctx, query) {
       const audioUrl = getSoundCloudDownloadUrl(trackMeta.url, trackMeta);
       
       try {
+        // Делаем HEAD запрос чтобы получить thumbnail из заголовков
+        let thumbnailUrl = null;
+        try {
+          const headResponse = await fetch(audioUrl, { method: 'HEAD' });
+          thumbnailUrl = headResponse.headers.get('x-thumbnail-url');
+          if (thumbnailUrl) {
+            console.log(`📸 Found thumbnail for SoundCloud track: ${thumbnailUrl}`);
+          }
+        } catch (e) {
+          console.warn('Failed to fetch thumbnail URL:', e.message);
+        }
+
         const audioMsg = await ctx.replyWithAudio(audioUrl, {
           title: trackMeta.title,
           performer: trackMeta.performer,
           duration: trackMeta.duration,
+          thumb: thumbnailUrl || undefined, // Добавляем обложку если есть
         });
         markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
         
