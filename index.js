@@ -2305,7 +2305,12 @@ async function savePinnedTargetIndex() {
 // Ошибки, при которых имеет смысл пробовать следующую цель:
 // модель/провайдер недоступны, лимиты исчерпаны и т.п.
 function isFallbackWorthy(status) {
-  return [400, 401, 403, 404, 422, 429, 500, 502, 503, 504].includes(status);
+  // 413 добавлен отдельно: Groq возвращает его, когда история чата вместе
+  // с системным промптом превышает TPM-лимит конкретной модели (напр.
+  // 8000 TPM у gpt-oss-120b/qwen3.6-27b на free tier) — это не "сообщение
+  // пользователя слишком длинное", а исчерпание лимита именно ЭТОЙ модели,
+  // так что имеет смысл пробовать следующую по списку, а не сразу сдаваться.
+  return [400, 401, 403, 404, 413, 422, 429, 500, 502, 503, 504].includes(status);
 }
 
 // Порядок попыток для одного запроса: НЕ с начала списка TARGETS, а от
@@ -2390,8 +2395,13 @@ async function callTarget(target, messages) {
     max_tokens: 3000,
   };
 
-  // Groq поддерживает это поле для reasoning-моделей (qwen3, gpt-oss).
-  if (target.provider === "groq") {
+  // Groq поддерживает reasoning_format/reasoning_effort ТОЛЬКО у
+  // reasoning-моделей (qwen3, gpt-oss) — обычные модели вроде
+  // llama-3.3-70b-versatile вообще не понимают это поле и падают с 400
+  // "reasoning_format is not supported with this model". Раньше поле
+  // слалось всем моделям на Groq без разбора — теперь только тем, что
+  // реально его поддерживают.
+  if (target.provider === "groq" && (target.model.includes("gpt-oss") || target.model.includes("qwen"))) {
     body.reasoning_format = "hidden";
 
     // У gpt-oss на Groq reasoning_effort реально снижает объём размышлений
@@ -2399,7 +2409,7 @@ async function callTarget(target, messages) {
     // основной способ сэкономить бюджет для этого провайдера.
     if (target.model.includes("gpt-oss")) {
       body.reasoning_effort = "low";
-    } else if (target.model.includes("qwen")) {
+    } else {
       body.reasoning_effort = "none";
     }
   }
