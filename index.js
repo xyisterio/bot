@@ -5281,12 +5281,18 @@ bot.on("message:text", async (ctx) => {
     // трека. И ЕЩЁ: сам текст реплая не должен быть похож на вопрос/
     // комментарий о песне (см. DEEZER_QUESTION_REGEX) — иначе "о чём эта
     // песня?" реплаем на трек тоже уходило в поиск (и закономерно ничего
-    // не находило) вместо обычного разговора о песне через LLM ниже.
+    // не находило) вместо обычного разговора о песне через LLM ниже. То же
+    // самое для прямой просьбы прислать дословный текст песни
+    // (VOICE_TRANSCRIBE_INTENT_REGEX: "текст", "текст песни", "расшифруй" и
+    // т.п.) — раньше "текст" реплаем на трек уходило в поиск нового трека
+    // по слову "текст" (и реально что-то находило под этим названием)
+    // вместо запуска Whisper-расшифровки в блоке isReplyToBot ниже.
     if (
       isDeezerFlowMessage(chatId, replyMsg.message_id) &&
       rawText.length > 1 &&
       rawText.length < 200 &&
-      !DEEZER_QUESTION_REGEX.test(rawText.trim())
+      !DEEZER_QUESTION_REGEX.test(rawText.trim()) &&
+      !VOICE_TRANSCRIBE_INTENT_REGEX.test(rawText.trim())
     ) {
       await handleDeezerQuery(ctx, rawText.trim());
       return;
