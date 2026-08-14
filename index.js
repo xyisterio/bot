@@ -5059,13 +5059,20 @@ async function getDeezerAudioBuffer(trackId, format = "MP3_320") {
 // Возвращает отредактированное Message при успехе, иначе null (нужен фолбэк на replyWithAudio).
 async function editStatusMessageIntoAudio(ctx, statusMsg, media, trackMeta) {
   try {
-    const edited = await ctx.api.editMessageMedia(ctx.chat.id, statusMsg.message_id, {
+    const mediaPayload = {
       type: "audio",
       media,
       title: trackMeta.title,
       performer: trackMeta.performer,
       duration: trackMeta.duration,
-    });
+    };
+    
+    // Добавляем thumbnail если есть
+    if (trackMeta.thumb) {
+      mediaPayload.thumb = trackMeta.thumb;
+    }
+    
+    const edited = await ctx.api.editMessageMedia(ctx.chat.id, statusMsg.message_id, mediaPayload);
     // editMessageMedia возвращает Message (не true), когда правим не inline-сообщение
     markDeezerFlowMessage(ctx.chat.id, typeof edited === "object" ? edited.message_id : statusMsg.message_id);
     return typeof edited === "object" ? edited : null;
@@ -5236,13 +5243,20 @@ async function handleSoundCloudQuery(ctx, query) {
     const cacheKey = `soundcloud_fid:${bestTrack.id || bestTrack.permalink}`;
     const cachedFileId = await redis.get(cacheKey);
 
+    let statusBecameAudio = false;
+
     if (cachedFileId) {
-      const audioMsg = await ctx.replyWithAudio(cachedFileId, {
-        title: trackMeta.title,
-        performer: trackMeta.performer,
-        duration: trackMeta.duration,
-      });
-      markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
+      const edited = await editStatusMessageIntoAudio(ctx, statusMsg, cachedFileId, trackMeta);
+      if (edited) {
+        statusBecameAudio = true;
+      } else {
+        const audioMsg = await ctx.replyWithAudio(cachedFileId, {
+          title: trackMeta.title,
+          performer: trackMeta.performer,
+          duration: trackMeta.duration,
+        });
+        markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
+      }
     } else {
       // Отправляем по URL - Telegram сам скачивает
       const audioUrl = getSoundCloudDownloadUrl(trackMeta.url, trackMeta);
@@ -5260,17 +5274,33 @@ async function handleSoundCloudQuery(ctx, query) {
           console.warn('Failed to fetch thumbnail URL:', e.message);
         }
 
-        const audioMsg = await ctx.replyWithAudio(audioUrl, {
-          title: trackMeta.title,
-          performer: trackMeta.performer,
-          duration: trackMeta.duration,
-          thumb: thumbnailUrl || undefined, // Добавляем обложку если есть
+        // Пробуем отредактировать статусное сообщение в аудио
+        const edited = await editStatusMessageIntoAudio(ctx, statusMsg, audioUrl, {
+          ...trackMeta,
+          thumb: thumbnailUrl || undefined,
         });
-        markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
-        
-        const fileId = audioMsg?.audio?.file_id || null;
-        if (fileId) {
-          await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
+
+        if (edited) {
+          statusBecameAudio = true;
+          // Сохраняем file_id из отредактированного сообщения
+          const fileId = edited?.audio?.file_id || null;
+          if (fileId) {
+            await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
+          }
+        } else {
+          // Редактирование не удалось - откат на обычную отправку
+          const audioMsg = await ctx.replyWithAudio(audioUrl, {
+            title: trackMeta.title,
+            performer: trackMeta.performer,
+            duration: trackMeta.duration,
+            thumb: thumbnailUrl || undefined,
+          });
+          markDeezerFlowMessage(ctx.chat.id, audioMsg.message_id);
+          
+          const fileId = audioMsg?.audio?.file_id || null;
+          if (fileId) {
+            await redis.set(cacheKey, fileId, { ex: 60 * 60 * 24 * 30 });
+          }
         }
       } catch (e) {
         console.error("Ошибка отправки SoundCloud трека в Telegram:", audioUrl, e.message || e);
@@ -5278,10 +5308,13 @@ async function handleSoundCloudQuery(ctx, query) {
       }
     }
 
-    try {
-      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
-    } catch (e) {
-      // Игнорируем ошибку если сообщение уже удалено
+    // Удаляем статусное сообщение только если оно не стало аудио
+    if (!statusBecameAudio) {
+      try {
+        await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
+      } catch (e) {
+        // Игнорируем ошибку если сообщение уже удалено
+      }
     }
   } catch (err) {
     console.error("Ошибка при получении трека SoundCloud:", err.message || err);
