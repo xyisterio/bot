@@ -2308,6 +2308,40 @@ function isFallbackWorthy(status) {
   return [400, 401, 403, 404, 422, 429, 500, 502, 503, 504].includes(status);
 }
 
+// Порядок попыток для одного запроса: НЕ с начала списка TARGETS, а от
+// activeTargetIndex (той цели, что ответила последней) вперёд по кругу —
+// чтобы держаться уже рабочей модели и не откатываться на более ранние
+// по списку цели (в т.ч. только что объявленные мёртвыми) на каждый новый
+// запрос. Раньше сортировка шла по исходному индексу в TARGETS, из-за чего
+// бот каждый новый запрос заново стучался в начало списка, а не продолжал
+// с той цели, что реально сработала — отсюда и петля повторных таймаутов
+// на уже недоступных моделях.
+// Цели в cooldown всё равно уходят в конец (чтобы не ждать таймаут на
+// заведомо мёртвой), но порядок ВНУТРИ каждой группы (не в cooldown / в
+// cooldown) — это порядок ротации от activeTargetIndex, а не исходный
+// индекс. Только когда буквально все цели в cooldown, порядок опять же
+// идёт по кругу от activeTargetIndex — то есть "возврат к началу" происходит
+// сам по себе, только когда действительно не осталось рабочих вариантов.
+function computeTargetOrder() {
+  const now = Date.now();
+  const n = TARGETS.length;
+  const rotationPos = (idx) => (idx - activeTargetIndex + n) % n;
+
+  let order = [...TARGETS.keys()].sort((a, b) => {
+    const aCold = cooldownUntil[a] > now ? 1 : 0;
+    const bCold = cooldownUntil[b] > now ? 1 : 0;
+    return aCold - bCold || rotationPos(a) - rotationPos(b);
+  });
+
+  // Ручной пин через /model — пробуем первой (если не в cooldown), поверх
+  // ротации, как и раньше.
+  if (pinnedTargetIndex !== null && cooldownUntil[pinnedTargetIndex] <= now) {
+    order = [pinnedTargetIndex, ...order.filter((idx) => idx !== pinnedTargetIndex)];
+  }
+
+  return order;
+}
+
 // Страховка от бага некоторых reasoning-моделей (замечено у gpt-oss на Groq):
 // вместо одного финального ответа модель иногда присылает черновик вида
 // `"Привет!" or "Привет, чё как?"` — несколько вариантов реплики в кавычках
@@ -2475,27 +2509,7 @@ async function askLLM(chatId, userText) {
 
   let lastErr;
 
-  // Порядок попыток на этот запрос: сначала цели НЕ в cooldown (в исходном
-  // порядке TARGETS — т.е. первой пробуется основной провайдер, напр.
-  // gemini), затем те, что ещё "остывают" после недавней ошибки — их
-  // пробуем последними, но не выкидываем совсем, чтобы бот всё равно
-  // ответил, если вдруг остыть успели вообще все.
-  // Благодаря этому бот не "залипает" на фолбэк-модели навсегда: как
-  // только у основной цели истёк cooldown, следующий же запрос снова
-  // начнёт с неё — переключение туда-обратно происходит само.
-  const now = Date.now();
-  let order = [...TARGETS.keys()].sort((a, b) => {
-    const aCold = cooldownUntil[a] > now ? 1 : 0;
-    const bCold = cooldownUntil[b] > now ? 1 : 0;
-    return aCold - bCold || a - b;
-  });
-
-  // Если владелец вручную закрепил модель кнопкой в /model — пробуем её
-  // первой (но только если она не остывает; если в cooldown, откатываемся
-  // к обычному порядку, чтобы не блокировать ответ бота на всём чате).
-  if (pinnedTargetIndex !== null && cooldownUntil[pinnedTargetIndex] <= now) {
-    order = [pinnedTargetIndex, ...order.filter((idx) => idx !== pinnedTargetIndex)];
-  }
+  const order = computeTargetOrder();
 
   for (const idx of order) {
     const target = TARGETS[idx];
@@ -4285,15 +4299,7 @@ async function askRecapLLM(userPrompt) {
     { role: "user", content: userPrompt },
   ];
 
-  const now = Date.now();
-  let order = [...TARGETS.keys()].sort((a, b) => {
-    const aCold = cooldownUntil[a] > now ? 1 : 0;
-    const bCold = cooldownUntil[b] > now ? 1 : 0;
-    return aCold - bCold || a - b;
-  });
-  if (pinnedTargetIndex !== null && cooldownUntil[pinnedTargetIndex] <= now) {
-    order = [pinnedTargetIndex, ...order.filter((idx) => idx !== pinnedTargetIndex)];
-  }
+  const order = computeTargetOrder();
 
   let lastErr;
   for (const idx of order) {
