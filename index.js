@@ -5370,6 +5370,66 @@ async function editStatusMessageIntoAudio(ctx, statusMsg, media, trackMeta) {
   }
 }
 
+// Достаёт числовой ID трека из ссылки на Deezer, если она есть в тексте.
+// Поддерживает: deezer.com/track/123, deezer.com/en/track/123 (и любой
+// другой локали), www.deezer.com, и короткие share-ссылки deezer.page.link
+// (там ID нет в самом URL — их нужно раскрывать через редирект отдельно,
+// см. resolveDeezerShareLink).
+const DEEZER_TRACK_LINK_REGEX = /(?:https?:\/\/)?(?:www\.)?deezer\.com\/(?:[a-z]{2}\/)?track\/(\d+)/i;
+const DEEZER_SHARE_LINK_REGEX = /(?:https?:\/\/)?(?:link\.deezer\.com|deezer\.page\.link)\/\S+/i;
+
+function extractDeezerTrackId(text) {
+  const match = text.match(DEEZER_TRACK_LINK_REGEX);
+  return match ? match[1] : null;
+}
+
+// Короткие share-ссылки (из шаринга в приложении Deezer) редиректят на
+// полный URL с ID трека — просто идём по редиректу и вытаскиваем ID оттуда.
+async function resolveDeezerShareLink(url) {
+  try {
+    const res = await fetch(url, { redirect: "follow" });
+    return extractDeezerTrackId(res.url || "");
+  } catch (e) {
+    console.error("Не удалось раскрыть Deezer share-ссылку:", url, e.message || e);
+    return null;
+  }
+}
+
+// Ищет в тексте сообщения ссылку на трек Deezer (обычную или короткую) и
+// возвращает числовой ID трека, либо null, если ссылок нет.
+async function findDeezerTrackIdInText(text) {
+  if (!text) return null;
+  const directId = extractDeezerTrackId(text);
+  if (directId) return directId;
+  const shareMatch = text.match(DEEZER_SHARE_LINK_REGEX);
+  if (shareMatch) return await resolveDeezerShareLink(shareMatch[0]);
+  return null;
+}
+
+// Получить трек с Deezer напрямую по ID (для ссылок вида deezer.com/track/ID) —
+// в отличие от searchDeezerTracks не полагается на текстовый поиск.
+async function getDeezerTrackById(trackId) {
+  const url = `https://api.deezer.com/track/${encodeURIComponent(trackId)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Deezer API status: ${res.status}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || "Deezer track not found");
+  return data;
+}
+
+// Обработка ссылки на трек Deezer, кинутой в чат: находим ID, тянем метаданные
+// напрямую по ID (без поиска) и скачиваем тем же путём, что и обычный /song.
+async function handleDeezerLinkQuery(ctx, trackId) {
+  try {
+    const track = await getDeezerTrackById(trackId);
+    await handleDeezerTrackObject(ctx, track);
+  } catch (err) {
+    console.error("Ошибка при получении трека Deezer по ссылке:", trackId, err.message || err);
+    const errMsg = await ctx.reply("⚠️ Не удалось найти этот трек на Deezer.");
+    markDeezerFlowMessage(ctx.chat.id, errMsg.message_id);
+  }
+}
+
 async function handleDeezerQuery(ctx, query) {
   try {
     const tracks = await searchDeezerTracks(query, 5);
@@ -5383,7 +5443,20 @@ async function handleDeezerQuery(ctx, query) {
       markDeezerFlowMessage(ctx.chat.id, notFoundMsg.message_id);
       return;
     }
-    const bestTrack = tracks[0];
+    await handleDeezerTrackObject(ctx, tracks[0]);
+  } catch (err) {
+    console.error("Ошибка при получении трека Deezer:", err.message || err);
+    const errMsg = await ctx.reply("⚠️ Не удалось загрузить трек с Deezer. Попробуй позже.");
+    markDeezerFlowMessage(ctx.chat.id, errMsg.message_id);
+  }
+}
+
+// Общая логика скачивания и отправки уже найденного трека Deezer (объект
+// как из /search, так и из /track/{id} — формат полей одинаковый) — раньше
+// была частью handleDeezerQuery, вынесена, чтобы её же использовала
+// handleDeezerLinkQuery (поиск трека по прямой ссылке).
+async function handleDeezerTrackObject(ctx, bestTrack) {
+  try {
     const trackMeta = getDeezerTrackMeta(bestTrack);
     const statusMsg = await ctx.reply(`🎵 Загружаю «${bestTrack.artist?.name || ""} — ${bestTrack.title}»...`);
     markDeezerFlowMessage(ctx.chat.id, statusMsg.message_id);
@@ -5728,6 +5801,14 @@ bot.on("message:text", async (ctx) => {
   const rawText = ctx.message.text;
 
   // ==== Музыка / Deezer / SoundCloud ====
+  // 0. Прямая ссылка на трек Deezer в сообщении — качаем без всякого
+  // распознавания интента, независимо от того, что написано вокруг ссылки.
+  const deezerLinkTrackId = await findDeezerTrackIdInText(rawText);
+  if (deezerLinkTrackId) {
+    await handleDeezerLinkQuery(ctx, deezerLinkTrackId);
+    return;
+  }
+
   // 1. Прямой intent-запрос ("скинь песню X", "найди трек X")
   const strippedText = stripBotAddressing(rawText, ctx);
   const deezerQuery = parseDeezerIntent(strippedText);
