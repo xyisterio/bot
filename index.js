@@ -5251,12 +5251,18 @@ function getDeezerDownloadUrl(trackId, format = "MP3_320", meta = {}, baseUrl = 
   return `${baseUrl}/download?${params.toString()}`;
 }
 
-function getDeezerSendAudioUrl(trackId, format, chatId, meta = {}) {
+function getDeezerSendAudioUrl(trackId, format, chatId, meta = {}, messageId = null) {
   const params = new URLSearchParams({
     id: String(trackId),
     format: String(format || "MP3_320"),
     chat_id: String(chatId),
   });
+
+  // Если передан message_id — просим сервер сразу отредактировать это
+  // сообщение через editMessageMedia (см. handleDeezerQuery), а не слать
+  // трек отдельным sendAudio. Так в чате не мелькает лишнее сообщение,
+  // которое бот тут же удаляет — правка идёт напрямую на бэкенде.
+  if (messageId) params.set("message_id", String(messageId));
 
   if (DEEZER_ARL) params.set("arl", DEEZER_ARL);
   appendDeezerMetaParams(params, meta);
@@ -5417,7 +5423,7 @@ async function handleDeezerQuery(ctx, query) {
       // и грузит трек в Telegram через Bot API (send_audio). Работает для любых
       // форматов, включая FLAC.
       try {
-        const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, trackMeta);
+        const sendAudioUrl = getDeezerSendAudioUrl(bestTrack.id, format, ctx.chat.id, trackMeta, statusMsg.message_id);
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), DEEZER_SEND_AUDIO_TIMEOUT_MS);
         const res = await fetch(sendAudioUrl, { signal: controller.signal }).finally(() => clearTimeout(timeoutId));
@@ -5425,13 +5431,18 @@ async function handleDeezerQuery(ctx, query) {
           const json = await res.json();
           if (json?.ok && json?.file_id) {
             fileId = json.file_id;
-            // Сервер шлёт аудио в Telegram сам, напрямую по Bot API, минуя
-            // ctx этого бота — так что message_id основного присланного
-            // трека нам обычно недоступен. Если сервер его всё же вернул —
-            // удаляем присланное им сообщение и вместо него редактируем
-            // наше статусное сообщение в аудио (тем самым получаем именно
-            // "редактирование" вместо двух сообщений).
-            if (json?.message_id) {
+
+            if (json?.edited) {
+              // Новый контракт: сервер сам отредактировал переданное
+              // message_id через editMessageMedia — никакого отдельного
+              // сообщения не создавалось, нам тут больше нечего делать.
+              statusBecameAudio = true;
+            } else if (json?.message_id) {
+              // Старый контракт (или сервер сам откатился на sendAudio,
+              // например если правка по message_id не удалась на его
+              // стороне) — сервер прислал трек ОТДЕЛЬНЫМ сообщением.
+              // Подчищаем: удаляем присланное им сообщение и вместо
+              // него редактируем своё статусное в аудио.
               try {
                 await ctx.api.deleteMessage(ctx.chat.id, json.message_id);
               } catch (e) {
@@ -5443,6 +5454,12 @@ async function handleDeezerQuery(ctx, query) {
               } else {
                 markDeezerFlowMessage(ctx.chat.id, json.message_id);
               }
+            } else {
+              // Ни edited, ни message_id — сервер просто вернул file_id
+              // без побочных действий в Telegram. Редактируем статусное
+              // сообщение сами (гладко, без мелькания).
+              const edited = await editStatusMessageIntoAudio(ctx, statusMsg, fileId, trackMeta);
+              statusBecameAudio = Boolean(edited);
             }
           } else {
             throw new Error(json?.error || json?.description || "send_audio returned no file_id");
