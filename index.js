@@ -516,7 +516,7 @@ async function saveAliases(chatId) {
 
 // value: { name: заданное имя, label: как человек выглядел в Telegram на момент задания }
 function setAlias(chatId, userId, name, label) {
-  getAliasMap(chatId).set(userId, { name, label });
+  getAliasMap(chatId).set(userId, { name, label, source: "manual" });
   saveAliases(chatId);
 }
 
@@ -608,12 +608,123 @@ function getGender(chatId, userId) {
 // ("бывший муж Лиды" пишет в чате не Лида) — поэтому извлечение
 // пытается понять, о КОМ идёт речь, а не всегда приписывает факт
 // автору сообщения (см. resolveUserIdByName).
-const chatProfiles = new Map(); // chatId -> Map<userId, { facts: string[], updatedAt }>
-const PROFILE_FACTS_CAP = 60; // не даём списку расти бесконечно — старые факты вытесняются новыми
+// Структура профиля в Redis (ключ profiles:{chatId}:{userId}):
+//   {
+//     name: "Женя",              // текущее известное имя — чтобы открыв ключ,
+//     username: "evgeniy_v",     // сразу было понятно, о ком речь, не сверяясь
+//                                // отдельно с members:{chatId}
+//     facts: {
+//       "семья": { text: "дочь София, 15 лет", updatedAt: 169... },
+//       "город": { text: "живёt в селе под Черниговом", updatedAt: 169... },
+//       ...
+//     },
+//     updatedAt: 169...           // последнее обновление любого поля
+//   }
+// Каждый факт — отдельный блок по своей категории (см. PROFILE_EXTRACT_SYSTEM_PROMPT):
+// новая инфа по уже существующей категории ДОПИСЫВАЕТСЯ/сливается в этот же
+// блок, а не плодит новую строку и не переписывает остальные категории.
+const chatProfiles = new Map(); // chatId -> Map<userId, ProfileRecord>
+const PROFILE_FACTS_CAP = 25; // не даём числу категорий на человека расти бесконечно
 
 function getProfileMap(chatId) {
   if (!chatProfiles.has(chatId)) chatProfiles.set(chatId, new Map());
   return chatProfiles.get(chatId);
+}
+
+// Старый формат хранил facts как плоский массив строк — приводим такие
+// записи (уже лежащие в Redis с прошлой версии бота) к новому формату при
+// первом обращении, чтобы ничего не потерять при миграции.
+function normalizeProfile(profile) {
+  if (!profile || typeof profile !== "object") return { facts: {} };
+  if (Array.isArray(profile.facts)) {
+    const migrated = {};
+    profile.facts.forEach((text, i) => {
+      if (typeof text === "string" && text.trim()) {
+        migrated[`факт ${i + 1}`] = { text: text.trim(), updatedAt: profile.updatedAt || Date.now() };
+      }
+    });
+    profile.facts = migrated;
+  } else if (!profile.facts || typeof profile.facts !== "object") {
+    profile.facts = {};
+  }
+  return profile;
+}
+
+// Записывает/сливает факт в конкретную категорию профиля человека. Модель
+// присылает уже готовый ПОЛНЫЙ текст блока (см. промпт) — если категория
+// новая, просто создаём её; если уже была, заменяем текст этим (модель
+// сама объединила старое+новое, наша часть — не трогать остальные
+// категории, которые в этом сообщении не затрагивались).
+// Модель сама придумывает категорию в свободной форме (см. промпт), но
+// склонна называть смыслово одно и то же по-разному от сообщения к
+// сообщению ("дети" vs "семья", "хобби" vs "увлечения") — без нормализации
+// это плодило бы дублирующиеся блоки вместо слияния в один. Список ниже —
+// не жёсткий enum (что угодно за его пределами просто остаётся как есть),
+// а просто маппинг известных синонимов на канонический ключ.
+const PROFILE_CATEGORY_SYNONYMS = {
+  // город / место проживания
+  "город": "город", "местоположение": "город", "локация": "город",
+  "проживание": "город", "адрес": "город", "страна": "город", "живёт": "город",
+
+  // семья: дети, родители, родственники (НЕ статус отношений — см. ниже)
+  "семья": "семья", "дети": "семья", "ребёнок": "семья", "родители": "семья",
+  "родственники": "семья", "братья": "семья", "сёстры": "семья", "сестры": "семья",
+
+  // статус отношений отдельно от "семьи": в браке/встречается/бывшие/свидания
+  "отношения": "отношения", "личная жизнь": "отношения", "статус": "отношения",
+  "семейное положение": "отношения", "свидания": "отношения", "брак": "отношения",
+  "бывший": "отношения", "бывшая": "отношения", "бывшие": "отношения",
+  "парень": "отношения", "девушка": "отношения", "муж": "отношения", "жена": "отношения",
+
+  // работа / карьера
+  "работа": "работа", "профессия": "работа", "должность": "работа", "карьера": "работа",
+
+  // вкусы и хобби (только явно заявленные — см. ограничение в промпте)
+  "увлечения": "увлечения", "хобби": "увлечения", "интересы": "увлечения",
+  "вкусы": "увлечения", "музыка": "увлечения", "еда": "увлечения",
+
+  // поездки
+  "путешествия": "путешествия", "поездки": "путешествия", "отпуск": "путешествия",
+
+  // здоровье (хронические факты, не сиюминутное самочувствие — это и так
+  // отсекается инструкцией "игнорируй бытовую мелочь момента" в промпте)
+  "здоровье": "здоровье", "болезнь": "здоровье",
+};
+
+// Приводит категорию от модели к канонической, если это известный синоним;
+// иначе просто нормализует регистр/пробелы и оставляет как есть (гибкость
+// сохраняется — новая осмысленная категория не потеряется, просто не
+// схлопнется с существующими).
+function normalizeCategoryKey(category) {
+  const cleaned = category.trim().toLowerCase().replace(/\s+/g, " ");
+  return PROFILE_CATEGORY_SYNONYMS[cleaned] || cleaned.slice(0, 30) || "другое";
+}
+
+function upsertProfileCategory(profile, category, text) {
+  const normalized = normalizeProfile(profile);
+  const key = normalizeCategoryKey(category);
+  const value = text.trim();
+  if (!value) return normalized;
+  normalized.facts[key] = { text: value, updatedAt: Date.now() };
+
+  const keys = Object.keys(normalized.facts);
+  if (keys.length > PROFILE_FACTS_CAP) {
+    // Вытесняем самые старые по updatedAt категории, а не первые по
+    // порядку — так под лимит скорее попадут давно не обновлявшиеся блоки.
+    const sorted = keys.sort((a, b) => normalized.facts[a].updatedAt - normalized.facts[b].updatedAt);
+    delete normalized.facts[sorted[0]];
+  }
+  normalized.updatedAt = Date.now();
+  return normalized;
+}
+
+// Обратный поиск username по userId — username хранится как индекс
+// "ник -> id" (см. rememberUsername), тут просто ищем в обратную сторону.
+function getKnownUsername(chatId, userId) {
+  for (const [username, id] of getUsernameIndex(chatId)) {
+    if (id === userId) return username;
+  }
+  return null;
 }
 
 async function saveProfile(chatId, userId) {
@@ -621,6 +732,11 @@ async function saveProfile(chatId, userId) {
   try {
     const profile = getProfileMap(chatId).get(userId);
     if (!profile) return;
+    // Синхронизируем имя/ник при каждом сохранении — чтобы открыв ключ в
+    // Redis сразу было видно, о ком досье, без похода в members:{chatId}.
+    profile.name = getMemberNameMap(chatId).get(userId) || profile.name;
+    const username = getKnownUsername(chatId, userId);
+    if (username) profile.username = username;
     await redis.set(`profiles:${chatId}:${userId}`, profile);
   } catch (err) {
     console.error(`Redis: не удалось сохранить досье ${userId} в чате ${chatId}:`, err);
@@ -690,24 +806,77 @@ function findMentionedMemberIds(chatId, text, speakerId) {
   return [...ids];
 }
 
-// Добавляет новые факты в профиль с грубой дедупликацией (не пишем
-// почти дословный повтор дважды) и ограничением размера списка.
-function appendFacts(profile, newFacts) {
-  if (!Array.isArray(profile.facts)) profile.facts = [];
-  for (const fact of newFacts) {
-    const normalized = fact.trim();
-    if (!normalized) continue;
-    const isDuplicate = profile.facts.some((existing) => existing.toLowerCase() === normalized.toLowerCase());
-    if (isDuplicate) continue;
-    profile.facts.push(normalized);
-  }
-  if (profile.facts.length > PROFILE_FACTS_CAP) {
-    profile.facts = profile.facts.slice(profile.facts.length - PROFILE_FACTS_CAP);
-  }
-  profile.updatedAt = Date.now();
+
+// --- Автоопределение алиаса по обращению реплаем ---
+// Идея: если A отвечает НА сообщение B и начинает свой текст с "Вася, ..."
+// или "Вася!" — мы точно знаем, к кому обращаются (reply_to_message.from.id
+// даёт настоящий userId, тут не нужно гадать по нечёткому стемматчу, как в
+// findMentionedMemberIds). Это надёжнее ника из Telegram, если человек в
+// чате известен под настоящим именем, а не под своим @username/first_name.
+//
+// Чтобы не словить ложное срабатывание на обычные вводные слова в начале
+// фразы ("Слушай, ты не прав", "Кстати, видел новость?") — которые в
+// русском тоже пишутся с большой буквы и тоже стоят перед запятой — держим
+// чёрный список таких слов и требуем ДВУХ разных сообщений с одним и тем же
+// именем на одного и того же адресата, прежде чем реально ставить алиас.
+const VOCATIVE_BLACKLIST = new Set([
+  "слушай", "слушайте", "кстати", "блин", "короче", "ладно", "ну", "просто",
+  "вообще", "так", "ребят", "ребята", "пацаны", "народ", "всем", "привет",
+  "стоп", "погоди", "подожди", "если", "кстате", "блять", "походу", "видимо",
+  "теперь", "может", "может быть", "короч", "чё", "что", "блд", "ёпта",
+  "господи", "боже", "ясно", "понятно", "окей", "ок", "хотя", "вот", "ой",
+  "ай", "нет", "да", "не", "спс", "спасибо", "пожалуйста",
+]);
+
+// "Имя," или "Имя!" строго в начале сообщения, кириллица, без пробелов —
+// 3-16 букв, первая заглавная (нормальный формат обращения по имени).
+const VOCATIVE_NAME_REGEX = /^\s*([А-ЯЁ][а-яё]{2,15})\s*[,!]/;
+
+// Сколько РАЗНЫХ сообщений с одним и тем же именем на одного и того же
+// адресата нужно увидеть, прежде чем ставить алиас автоматически — только
+// в памяти, не переживает рестарт (не критично, наберётся заново).
+const AUTO_ALIAS_CONFIRM_COUNT = 2;
+const pendingAutoAliasCounts = new Map(); // chatId -> Map<"targetId:nameLower", count>
+
+function getPendingAutoAliasMap(chatId) {
+  if (!pendingAutoAliasCounts.has(chatId)) pendingAutoAliasCounts.set(chatId, new Map());
+  return pendingAutoAliasCounts.get(chatId);
 }
 
-// --- Эвристика по имени ---
+// Если сообщение — реплай на другого живого участника и начинается с
+// обращения по имени, копим счётчик подтверждений и, набрав порог, тихо
+// ставим алиас (не трогая ничего, если человеку уже задан алиас — вручную
+// через /alias или автоматически ранее, чтобы не переписывать поверх).
+function maybeLearnAliasFromReply(chatId, ctx, rawText) {
+  const replyTarget = ctx.message.reply_to_message?.from;
+  if (!replyTarget || replyTarget.is_bot) return;
+  if (replyTarget.id === ctx.from.id) return; // сам себе не обращается
+
+  const match = rawText.match(VOCATIVE_NAME_REGEX);
+  if (!match) return;
+  const name = match[1];
+  const nameLower = name.toLowerCase();
+  if (VOCATIVE_BLACKLIST.has(nameLower)) return;
+
+  if (getAliasMap(chatId).has(replyTarget.id)) return; // уже есть алиас — не трогаем
+
+  const pending = getPendingAutoAliasMap(chatId);
+  const key = `${replyTarget.id}:${nameLower}`;
+  const count = (pending.get(key) || 0) + 1;
+
+  if (count < AUTO_ALIAS_CONFIRM_COUNT) {
+    pending.set(key, count);
+    return;
+  }
+
+  pending.delete(key);
+  const label = replyTarget.username ? `@${replyTarget.username}` : (replyTarget.first_name || "юзер");
+  getAliasMap(chatId).set(replyTarget.id, { name, label, source: "auto" });
+  saveAliases(chatId);
+  console.log(`Авто-алиас: в чате ${chatId} ${label} теперь называется "${name}" (по обращению реплаем)`);
+}
+
+
 // Уменьшительные/имена, которые оканчиваются на -а/-я, но мужские —
 // без этого списка их угадало бы как женские.
 const MALE_NAME_EXCEPTIONS = new Set([
@@ -873,6 +1042,33 @@ function pushChatLog(chatId, name, text, toBot, event) {
   while (log.length > CHAT_LOG_LIMIT) log.shift();
   saveChatLog(chatId);
 }
+
+// Собирает контекст для extractProfileFacts, чтобы короткие ответы не
+// терялись без понимания, на что они отвечают:
+//   1) реплай (на бота ИЛИ на другого человека) — самый точный сигнал,
+//      берём текст именно того сообщения;
+//   2) иначе — несколько последних реплик чата (без реплая, просто вопрос
+//      и ответ подряд, как в живой беседе).
+// pushChatLog для текущего сообщения уже отработал к моменту вызова —
+// поэтому в chatLog последняя запись это ОНО САМО, её пропускаем.
+const PROFILE_CONTEXT_WINDOW = 3;
+
+function buildProfileExtractionContext(chatId, ctx) {
+  const replyMsg = ctx.message.reply_to_message;
+  if (replyMsg && replyMsg.text && replyMsg.from?.id !== ctx.from.id) {
+    const replyName = replyMsg.from?.is_bot ? "бот" : getDisplayName(chatId, replyMsg.from);
+    return `Сообщение ниже — реплай на сообщение "${replyName}": "${replyMsg.text.slice(0, 300)}"`;
+  }
+
+  const log = getChatLog(chatId);
+  // Последняя запись — текущее сообщение (pushChatLog уже отработал выше),
+  // поэтому окно берём ПЕРЕД ней.
+  const recent = log.slice(-1 - PROFILE_CONTEXT_WINDOW, -1).filter((e) => !e.event && e.text);
+  if (recent.length === 0) return null;
+  const lines = recent.map((e) => `${e.name}: ${e.text}`).join("\n");
+  return `Несколько предыдущих реплик в чате для контекста (сообщение ниже может отвечать на один из этих вопросов):\n${lines}`;
+}
+
 
 // Формирует текст события входа/выхода с согласованием рода, если он
 // известен (см. getGender) — по тому же принципу, что и остальные
@@ -2689,16 +2885,20 @@ async function askLLM(chatId, userText) {
 // Узкий системный промпт под конкретную задачу — НЕ полный SYSTEM_PROMPT
 // с личностью Жени (там 30+ тысяч символов), поэтому даже дешёвые Groq-
 // модели с маленьким TPM это спокойно тянут на каждое сообщение.
-const PROFILE_EXTRACT_SYSTEM_PROMPT = `Ты — фоновый анализатор сообщений в Telegram-чате. Тебе дают список уже известных боту людей в чате и одно новое сообщение. Задача — вытащить из сообщения ЛЮБЫЕ существенные, долгоиграющие факты о людях: страна/город проживания, семейное положение (в браке/разводе/встречается), дети (имена, пол, возраст), любые родственные связи (родители, братья/сёстры, супруги, бывшие), свидания и личная жизнь, любимая еда/музыка/цвета, поездки — прошлые, текущие или запланированные, свои или близких родственников. Вообще любая конкретная деталь о человеке, которая может пригодиться позже.
+const PROFILE_EXTRACT_SYSTEM_PROMPT = `Ты — фоновый анализатор сообщений в Telegram-чате. Тебе дают список уже известных боту людей в чате и одно новое сообщение. Задача — вытащить из сообщения ЛЮБЫЕ существенные, долгоиграющие факты о людях: страна/город проживания, семейное положение (в браке/разводе/встречается), дети (имена, пол, возраст), любые родственные связи (родители, братья/сёстры, супруги, бывшие), свидания и личная жизнь, явно заявленные вкусы (еда/музыка/цвета — см. важное ограничение ниже), поездки — прошлые, текущие или запланированные, свои или близких родственников. Вообще любая конкретная деталь о человеке, которая может пригодиться позже.
 
 Важно: сообщение может быть НЕ о самом авторе, а о ком-то другом ("бывший муж Лиды", "у Пети дочь родилась", "мама Саши приезжает") — тогда факт относится к тому, о ком речь, а не к автору сообщения.
 
-Игнорируй: бытовую мелочь момента (что поел прямо сейчас, разовые планы на сегодня, самочувствие в моменте типа "голова болит"), шутки, флуд, игровые ходы (крокодил/шахматы/шашки и т.п.) — если это не несёт долгоиграющей личной информации.
+Если тебе передан контекст (реплай на чьё-то сообщение или несколько предыдущих реплик чата) — используй его ТОЛЬКО чтобы понять смысл короткого ответа, но факт всё равно относится к автору ЭТОГО сообщения (если он отвечает о себе), если только сам текст явно не говорит о третьем лице. Например: кто-то спросил "Люда, а у тебя сколько детей?", Люда ответила "трое" → это Люда отвечает о себе, факт "трое детей" относится к SPEAKER (то есть к Люде — автору сообщения "трое"), не к тому, кто спросил. Без контекста короткие однословные ответы обычно ничего не значат — не выдумывай факт, если из контекста не очевидно, о чём вообще речь.
+
+КРИТИЧЕСКИ ВАЖНОЕ ОГРАНИЧЕНИЕ про вкусы и предпочтения: считай фактом ТОЛЬКО явное высказывание отношения ("мне нравится...", "обожаю...", "ненавижу...", "это моя любимая песня/еда/группа"). Просьба прислать/найти/поставить трек, фильм, песню — это НЕ факт о вкусах, даже если человек просил это несколько раз подряд или в разных сообщениях. Точно так же однократное упоминание чего-либо (посмотрел фильм, поел что-то) — это не устойчивое предпочтение. Не додумывай вкус или характер человека по его действиям/запросам — только по прямым словам.
+
+Игнорируй: бытовую мелочь момента (что поел прямо сейчас, разовые планы на сегодня, самочувствие в моменте типа "голова болит"), шутки, флуд, игровые ходы (крокодил/шахматы/шашки и т.п.), любые запросы к самому боту (поставь трек, найди фильм, какая погода и т.п.) — если это не несёт долгоиграющей личной информации.
 
 Формат ответа — ТОЛЬКО валидный JSON-массив, без пояснений и markdown-обёртки:
-[{"person": "<имя из списка известных людей ИЛИ 'SPEAKER' если факт об авторе сообщения ИЛИ произвольное имя, если человек не из списка (например родственник/бывший)>", "facts": ["короткий самостоятельный факт", "..."]}]
+[{"person": "<имя из списка известных людей ИЛИ 'SPEAKER' если факт об авторе сообщения ИЛИ произвольное имя, если человек не из списка (например родственник/бывший)>", "entries": [{"category": "<короткая категория в 1-2 слова на русском, например: город, семья, отношения, работа, увлечения, путешествия, здоровье, другое. "семья" — про детей/родителей/родственников, "отношения" — отдельно про статус (в браке/встречается/бывшие/свидания)>", "fact": "<текст факта по этой категории>"}]}]
 
-Если в разделе "Текущие факты о вероятно упомянутых людях" для человека уже что-то указано — верни для него ПОЛНЫЙ обновлённый список фактов: объедини новую информацию со старой (если факт про одно и то же — уточни/замени, например "дочь София" + "дочери 15 лет" → "дочь София, 15 лет"), остальные его факты, не связанные с новым сообщением, просто оставь как есть в списке, допиши новые. Если для человека в этом разделе ничего не было (он там не фигурирует вовсе) — перечисли только его НОВЫЕ факты, не повторяя чужого.
+У каждого факта — своя категория, отдельным блоком. Если в разделе "Текущие факты" для человека уже есть блок с такой же (или явно той же по смыслу) категорией — верни для неё ПОЛНЫЙ обновлённый текст, слив старое с новым (например было "дочь София", узнали "дочери 15 лет" → верни "дочь София, 15 лет" под той же категорией). Категории, которых это сообщение не касается, вообще не включай в ответ — они и так останутся как есть, дублировать их не нужно.
 
 Каждый факт — короткая фраза, не абзац. Если в сообщении нет ничего существенного — верни пустой массив [].`;
 
@@ -2715,11 +2915,43 @@ function stripJsonFence(text) {
     .trim();
 }
 
+// Дешёвый regex-предфильтр ПЕРЕД тем, как вообще дёргать Groq — экономит
+// не столько TPM (промпт и так укладывается с запасом в ~12K TPM лимит
+// llama-3.3-70b-versatile), сколько ЗАПРОСЫ В ДЕНЬ (RPD), а он на бесплатном
+// тарифе — всего ~1000/день и ОБЩИЙ с обычными ответами бота в чате (тот же
+// TARGETS/cooldownUntil пул). В активном чате без фильтра каждое сообщение
+// от 12 символов — это отдельный запрос, что может откусывать заметную долю
+// дневного лимита впустую на явно бытовых сообщениях. Список — не строгая
+// классификация, а грубое "есть ли вообще шанс, что тут личный факт" — если
+// ни одно слово не совпало, почти наверняка LLM всё равно вернула бы [].
+const PROFILE_FACT_HINT_REGEX =
+  /жив[ёе]т|живу|переех|город|странa|роди[лт]|дет[ия]|сын|доч[ья]|ребён|ребен|жена|муж|парен|девушк|встреча|расста|развел|развод|бывш|свида|люблю|обожа|ненавиж|нравится|нравят|любим|работа|должност|професс|устро[ий]лся|устрои|уволил|поездк|путешеств|отпуск|переезд|болею|болезн|диагноз|день рождени|годовщин|свадьб|женил|замуж/i;
+
+// Человекочитаемый дамп текущих категорий факта для одного человека —
+// используется и в подсказке модели, и (при желании) для дебага в логах.
+function formatProfileFactsBlock(profile) {
+  const facts = normalizeProfile(profile).facts;
+  const keys = Object.keys(facts);
+  if (keys.length === 0) return "(фактов ещё нет)";
+  return keys.map((k) => `${k}: ${facts[k].text}`).join("; ");
+}
+
 // Фоновое, не блокирующее основной ответ бота извлечение — вызывается
 // fire-and-forget (без await) из основного обработчика сообщений. Любая
 // ошибка тут — просто лог, никогда не должна аукнуться на обычном чате.
-async function extractProfileFacts(chatId, speakerId, speakerName, text) {
-  if (!text || text.trim().length < PROFILE_EXTRACT_MIN_LENGTH) return;
+async function extractProfileFacts(chatId, speakerId, speakerName, text, conversationContext = null) {
+  // Фильтр минимальной длины снимаем, если есть контекст диалога — короткое
+  // "розы"/"трое" само по себе бессмысленно по длине, но осмысленно вместе
+  // с вопросом/предыдущими репликами (см. buildProfileExtractionContext).
+  if (!text || (text.trim().length < PROFILE_EXTRACT_MIN_LENGTH && !conversationContext)) return;
+
+  // Если ни само сообщение, ни контекст вокруг него не содержат вообще
+  // никакого намёка на личный факт — не тратим на это запрос к Groq.
+  // Контекст обязательно проверяем тоже: короткое "трое" само по себе не
+  // матчнёт ни одно слово из списка, но вопрос-контекст "сколько детей" —
+  // матчнёт, и это ровно тот случай, который не хочется потерять.
+  const haystack = `${text} ${conversationContext || ""}`;
+  if (!PROFILE_FACT_HINT_REGEX.test(haystack)) return;
 
   // Роутим строго через Groq — промпт узкий и не требует ни "личности"
   // Жени, ни мультимодальности Gemini, а бесплатный Groq для такой мелкой
@@ -2736,18 +2968,17 @@ async function extractProfileFacts(chatId, speakerId, speakerName, text) {
   const knownNames = [...new Set(getMemberNameMap(chatId).values())].slice(0, 40);
   const knownList = knownNames.length ? knownNames.join(", ") : "(пока никого не знаю по именам)";
 
-  // Подкладываем модели текущие факты о тех, кого сообщение вероятно
-  // касается (сам автор + любой похожий по имени человек из чата) —
-  // чтобы она могла отредактировать существующую запись, а не создать
-  // дублирующую строку об одном и том же.
+  // Подкладываем модели текущие факты (по категориям) о тех, кого сообщение
+  // вероятно касается (сам автор + любой похожий по имени человек из чата) —
+  // чтобы она могла отредактировать существующий блок, а не создать
+  // дублирующую запись об одном и том же.
   const map = getProfileMap(chatId);
   const candidateIds = findMentionedMemberIds(chatId, text, speakerId);
   const existingBlocks = candidateIds
     .map((id) => {
       const name = id === speakerId ? speakerName : getMemberNameMap(chatId).get(id);
       if (!name) return null;
-      const facts = map.get(id)?.facts ?? [];
-      return `${name}: ${facts.length ? facts.join("; ") : "(фактов ещё нет)"}`;
+      return `${name}: ${formatProfileFactsBlock(map.get(id))}`;
     })
     .filter(Boolean)
     .join("\n");
@@ -2756,7 +2987,10 @@ async function extractProfileFacts(chatId, speakerId, speakerName, text) {
     { role: "system", content: PROFILE_EXTRACT_SYSTEM_PROMPT },
     {
       role: "user",
-      content: `Известные люди в чате: ${knownList}\n\nТекущие факты о вероятно упомянутых людях:\n${existingBlocks}\n\nАвтор сообщения: ${speakerName}\nСообщение: "${text}"`,
+      content:
+        `Известные люди в чате: ${knownList}\n\nТекущие факты о вероятно упомянутых людях:\n${existingBlocks}\n\n` +
+        (conversationContext ? `${conversationContext}\n\n` : "") +
+        `Автор сообщения: ${speakerName}\nСообщение: "${text}"`,
     },
   ];
 
@@ -2767,41 +3001,26 @@ async function extractProfileFacts(chatId, speakerId, speakerName, text) {
 
     for (const entry of parsed) {
       if (!entry || typeof entry !== "object") continue;
-      const facts = Array.isArray(entry.facts) ? entry.facts.filter((f) => typeof f === "string" && f.trim()) : [];
-      if (facts.length === 0) continue;
+      const rawEntries = Array.isArray(entry.entries) ? entry.entries : [];
+      const validEntries = rawEntries.filter(
+        (e) => e && typeof e.category === "string" && e.category.trim() && typeof e.fact === "string" && e.fact.trim()
+      );
+      if (validEntries.length === 0) continue;
 
       const isAboutSpeaker = !entry.person || entry.person === "SPEAKER";
       const resolvedUserId = isAboutSpeaker ? speakerId : resolveUserIdByName(chatId, entry.person);
+      // Если это третье лицо (не в списке чата) — прикрепляем к досье
+      // автора, но помечаем категорию именем этого человека, чтобы не
+      // перепутать с фактами самого автора.
+      const targetUserId = resolvedUserId || speakerId;
+      const categoryPrefix = resolvedUserId ? "" : `${entry.person ? `${entry.person} — ` : ""}`;
 
-      if (resolvedUserId && candidateIds.includes(resolvedUserId)) {
-        // Этому человеку подкладывали текущие факты — модель вернула
-        // ПОЛНЫЙ обновлённый список, просто заменяем им старый целиком
-        // (это и есть "правка", а не добавление дубля).
-        const profile = map.get(resolvedUserId) || { facts: [] };
-        profile.facts = facts.slice(0, PROFILE_FACTS_CAP);
-        profile.updatedAt = Date.now();
-        map.set(resolvedUserId, profile);
-        saveProfile(chatId, resolvedUserId);
-      } else if (resolvedUserId) {
-        // Известный участник, но фактов ему не подкладывали (эвристика
-        // findMentionedMemberIds не распознала упоминание в тексте) —
-        // на всякий случай просто дописываем как новые, с грубой
-        // дедупликацией по appendFacts.
-        const profile = map.get(resolvedUserId) || { facts: [] };
-        appendFacts(profile, facts);
-        map.set(resolvedUserId, profile);
-        saveProfile(chatId, resolvedUserId);
-      } else {
-        // Человек не из чата (родственник, бывший и т.п.) — прикрепляем
-        // факт к досье автора сообщения с пометкой, о ком речь.
-        const profile = map.get(speakerId) || { facts: [] };
-        appendFacts(
-          profile,
-          facts.map((f) => `${entry.person ? `${entry.person}: ` : ""}${f}`)
-        );
-        map.set(speakerId, profile);
-        saveProfile(chatId, speakerId);
+      let profile = normalizeProfile(map.get(targetUserId) || { facts: {} });
+      for (const e of validEntries) {
+        profile = upsertProfileCategory(profile, `${categoryPrefix}${e.category}`, e.fact);
       }
+      map.set(targetUserId, profile);
+      saveProfile(chatId, targetUserId);
     }
   } catch (err) {
     // Не критично — просто лог, чат не должен ничего заметить.
@@ -6012,9 +6231,20 @@ bot.on("message:text", async (ctx) => {
       // сообщения (см. resolveUserIdByName).
       rememberMemberName(chatId, ctx.from.id, speakerName);
 
+      // Реплай с обращением по имени ("Вася, ...") на другого участника —
+      // надёжный сигнал для алиаса, без гадания по нику (см. VOCATIVE_NAME_REGEX).
+      maybeLearnAliasFromReply(chatId, ctx, rawText);
+
       // Досье — фоново, без await: не должно задерживать обычный ответ
       // бота и не должно уронить обработку сообщения, если вдруг упадёт.
-      extractProfileFacts(chatId, ctx.from.id, speakerName, rawText).catch(() => {});
+      // Подкладываем контекст, чтобы короткие ответы не терялись:
+      // 1) если это реплай (на бота ИЛИ на другого человека) — берём текст
+      //    того сообщения напрямую, это самый точный сигнал;
+      // 2) иначе — несколько последних реплик чата, вдруг вопрос и ответ
+      //    просто идут подряд без формального реплая ("Люда, сколько у
+      //    тебя детей?" -> следующим сообщением "трое").
+      const conversationContext = buildProfileExtractionContext(chatId, ctx);
+      extractProfileFacts(chatId, ctx.from.id, speakerName, rawText, conversationContext).catch(() => {});
     }
 
     if (!isAddressedToBot) {
