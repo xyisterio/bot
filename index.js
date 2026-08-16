@@ -7,7 +7,16 @@ import { BOT_SKILLS_PROMPT } from "./skills.js";
 
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
+// Groq поддерживает НЕСКОЛЬКО ключей (с разных аккаунтов) через запятую в
+// GROQ_API_KEYS — по тому же принципу, что и GEMINI_API_KEYS выше: у каждого
+// аккаунта своя дневная квота TPD/RPD, несколько ключей суммарно продлевают
+// доступный бюджет. GROQ_API_KEY (в единственном числе) — для обратной
+// совместимости, если ключ один.
+const GROQ_API_KEYS = (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || "")
+  .split(",")
+  .map((k) => k.trim())
+  .filter(Boolean);
+
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY; // опционально
 const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY; // опционально
 const PORT = process.env.PORT || 3000;
@@ -33,7 +42,7 @@ const GEMINI_API_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_K
   .filter(Boolean);
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан в переменных окружения");
-if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY не задан в переменных окружения");
+if (!GROQ_API_KEYS.length) throw new Error("GROQ_API_KEY(S) не задан в переменных окружения");
 
 // ID бота, полученный напрямую из токена (гарантированно существует до выполнения любых запросов)
 const BOT_ID = Number(BOT_TOKEN.split(":")[0]) || null;
@@ -152,7 +161,7 @@ const PROVIDER_CONFIGS = {
   },
   groq: {
     baseUrl: "https://api.groq.com/openai/v1/chat/completions",
-    apiKeys: [GROQ_API_KEY].filter(Boolean),
+    apiKeys: GROQ_API_KEYS,
     models: GROQ_MODELS,
   },
   huggingface: {
@@ -2955,13 +2964,17 @@ async function extractProfileFacts(chatId, speakerId, speakerName, text, convers
 
   // Роутим строго через Groq — промпт узкий и не требует ни "личности"
   // Жени, ни мультимодальности Gemini, а бесплатный Groq для такой мелкой
-  // задачи более чем достаточен. Берём первую цель без cooldown; если
-  // ВСЕ Groq-аккаунты/модели сейчас остывают — просто пропускаем этот
-  // цикл извлечения (не критично, попробуем на следующем сообщении).
+  // задачи более чем достаточен. В отличие от askLLM тут своя копия
+  // фолбэк-цикла (не переиспользуем computeTargetOrder — та учитывает
+  // pinnedTargetIndex/выбор пользователя через /model, что тут не нужно):
+  // перебираем ВСЕ Groq-цели (модель × ключ, см. GROQ_API_KEYS) по порядку
+  // TARGETS, пропуская то, что сейчас в cooldown, и переходим к следующей
+  // при ошибке — так лишний аккаунт реально подхватывается автоматически,
+  // а не только тогда, когда на него попутно наткнётся обычный чат.
   const now = Date.now();
-  const groqTargetIdx = TARGETS.findIndex((t, idx) => t.provider === "groq" && cooldownUntil[idx] <= now);
-  if (groqTargetIdx === -1) return;
-  const target = TARGETS[groqTargetIdx];
+  const groqTargetIndices = TARGETS.map((t, idx) => (t.provider === "groq" ? idx : -1)).filter((idx) => idx !== -1);
+  const availableGroqIndices = groqTargetIndices.filter((idx) => cooldownUntil[idx] <= now);
+  if (availableGroqIndices.length === 0) return; // все Groq-цели остывают — пропускаем этот цикл
 
   // Список известных людей в чате — чтобы модель могла сослаться на
   // конкретного знакомого человека, а не только на автора сообщения.
@@ -2994,8 +3007,38 @@ async function extractProfileFacts(chatId, speakerId, speakerName, text, convers
     },
   ];
 
+  let reply = null;
+  let lastErr = null;
+  for (const idx of availableGroqIndices) {
+    const target = TARGETS[idx];
+    try {
+      const result = await callTarget(target, messages);
+      reply = result.reply;
+      cooldownUntil[idx] = 0; // на успехе снимаем cooldown, если он был
+      break;
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `Досье: ошибка у ${targetLabel(target)} (чат ${chatId}, от ${speakerName}):`,
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+      // Без статуса — считаем фолбэк-достойной (сетевая/таймаут); с явным
+      // статусом смотрим isFallbackWorthy (429/5xx — пробуем следующий
+      // ключ/модель, 400 и т.п. — нет смысла, тут же и остальные упадут).
+      if (err.status && !isFallbackWorthy(err.status)) break;
+      cooldownUntil[idx] = Date.now() + MODEL_COOLDOWN_MS;
+    }
+  }
+
+  if (reply === null) {
+    if (lastErr) {
+      console.error(`Досье: не удалось извлечь факты (чат ${chatId}, от ${speakerName}) — все Groq-цели исчерпаны`);
+    }
+    return;
+  }
+
   try {
-    const { reply } = await callTarget(target, messages);
     const parsed = JSON.parse(stripJsonFence(reply));
     if (!Array.isArray(parsed)) return;
 
@@ -3024,7 +3067,7 @@ async function extractProfileFacts(chatId, speakerId, speakerName, text, convers
     }
   } catch (err) {
     // Не критично — просто лог, чат не должен ничего заметить.
-    console.error(`Досье: не удалось извлечь факты (чат ${chatId}, от ${speakerName}):`, err.status ?? "-", err.body ?? err.message);
+    console.error(`Досье: не удалось распарсить ответ модели (чат ${chatId}, от ${speakerName}):`, err.message);
   }
 }
 
@@ -5016,7 +5059,7 @@ async function transcribeVoice(ctx, fileId) {
     try {
       res = await fetch(GROQ_WHISPER_ENDPOINT, {
         method: "POST",
-        headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+        headers: { Authorization: `Bearer ${GROQ_API_KEYS[0]}` },
         body: form,
         signal: controller.signal,
       });
@@ -5123,7 +5166,7 @@ async function captionPhoto(ctx, fileId) {
     provider: "groq",
     model: GROQ_VISION_MODEL,
     baseUrl: PROVIDER_CONFIGS.groq.baseUrl,
-    apiKey: GROQ_API_KEY,
+    apiKey: GROQ_API_KEYS[0],
   };
   const messages = [
     {
