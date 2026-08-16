@@ -3,6 +3,7 @@ import express from "express";
 import { Redis } from "@upstash/redis";
 import { Chess } from "chess.js";
 import crypto from "node:crypto";
+import { Client as GradioClient, handle_file } from "@gradio/client";
 import { BOT_SKILLS_PROMPT } from "./skills.js";
 
 // ==== Конфиг из переменных окружения ====
@@ -20,6 +21,15 @@ const GROQ_API_KEYS = (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY; // опционально
 const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY; // опционально
 const PORT = process.env.PORT || 3000;
+
+// Свой Gradio Space с GigaAM-v3 (см. app.py) — опционально, если не задан,
+// транскрибация просто всегда идёт через Groq Whisper как раньше. Формат —
+// "username/space-name", то, что указано в адресной строке HF после
+// huggingface.co/spaces/. Бесплатный ZeroGPU-контейнер засыпает при
+// простое — первый вызов после паузы может ждать холодный старт, поэтому
+// таймаут под него отдельный и заметно щедрее, чем у самого Whisper.
+const GIGAAM_SPACE = process.env.GIGAAM_SPACE || null;
+const GIGAAM_TIMEOUT_MS = Number(process.env.GIGAAM_TIMEOUT_MS) || 60000;
 
 // TMDB (themoviedb.org) — для поиска фильмов по команде "фильм <название>"
 // (см. блок "Поиск фильмов (TMDB)" ниже). Опционально: без ключа бот просто
@@ -5029,9 +5039,48 @@ function stripWhisperHallucinations(text) {
   return cleaned.replace(/\s{2,}/g, " ").trim();
 }
 
-// Скачивает голосовое/кружочек и прогоняет через Groq Whisper. Один retry
-// на 5xx/сетевую ошибку — как в callTarget, но без общего cooldown-меха-
-// низма TARGETS: это разовый точечный вызов, а не часть общего фолбэка.
+// Пытается распознать через свой GigaAM-Space (см. app.py) — если он не
+// настроен (GIGAAM_SPACE пуст), не отвечает вовремя, или падает — просто
+// возвращает null, а не бросает исключение: вызывающий код (transcribeVoice)
+// в этом случае молча уходит на Groq Whisper, пользователь ничего не
+// замечает. Первый запрос после того, как Space "заснул" от простоя, может
+// идти долго (холодный старт контейнера + загрузка весов) — GIGAAM_TIMEOUT_MS
+// это учитывает.
+let gradioClientPromise = null; // переиспользуем соединение между вызовами
+function getGradioClient() {
+  if (!gradioClientPromise) {
+    gradioClientPromise = GradioClient.connect(GIGAAM_SPACE).catch((err) => {
+      gradioClientPromise = null; // при неудаче — пробуем переподключиться в следующий раз
+      throw err;
+    });
+  }
+  return gradioClientPromise;
+}
+
+async function transcribeViaGigaAM(buffer, ext) {
+  if (!GIGAAM_SPACE) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GIGAAM_TIMEOUT_MS);
+  try {
+    const client = await getGradioClient();
+    const blob = new Blob([buffer], { type: `audio/${ext}` });
+    const result = await client.predict("/transcribe", { audio_path: handle_file(blob) });
+    const text = (result?.data?.[0] || "").toString().trim();
+    return text || null;
+  } catch (err) {
+    console.error("GigaAM-Space: не удалось распознать, фолбэк на Whisper:", err.message || err);
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// Скачивает голосовое/кружочек и прогоняет через GigaAM (если настроен),
+// с фолбэком на Groq Whisper — либо сразу через Whisper, если GigaAM не
+// подключен. Один retry на 5xx/сетевую ошибку у Whisper — как в callTarget,
+// но без общего cooldown-механизма TARGETS: это разовый точечный вызов,
+// а не часть общего фолбэка.
 async function transcribeVoice(ctx, fileId) {
   const { buffer, filePath } = await downloadTelegramFile(ctx, fileId);
   // Telegram отдаёт голосовые с расширением .oga (хотя по факту это тот же
@@ -5043,6 +5092,10 @@ async function transcribeVoice(ctx, fileId) {
   const rawExt = (filePath.split(".").pop() || "ogg").toLowerCase();
   const EXT_ALIASES = { oga: "ogg" };
   const ext = EXT_ALIASES[rawExt] || rawExt;
+
+  const gigaamText = await transcribeViaGigaAM(buffer, ext);
+  if (gigaamText) return { text: gigaamText };
+  // GigaAM не настроен/не ответил/упал — едем на Whisper как раньше.
 
   let lastErr;
   for (let attempt = 0; attempt < 2; attempt++) {
