@@ -158,6 +158,19 @@ const OPENROUTER_MODELS = (
 // чем считать её недоступной и уйти на фолбэк (вместо того чтобы зависать
 // на несколько минут, если провайдер просто не отвечает).
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 20000;
+// SEARCH_TIMEOUT_MS — отдельный, более щедрый таймаут для веб-поиска
+// (Groq Compound реально ходит в интернет и может думать 20-60+ секунд —
+// REQUEST_TIMEOUT_MS для обычного чата был слишком тесным и обрубал поиск
+// на середине, отправляя userText дальше с "поиск не удался" вместо
+// результата).
+const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS) || 45000;
+// POST_SEARCH_ASK_TIMEOUT_MS — таймаут на сам ответ Жени (askLLM), когда в
+// userText уже подмешаны результаты поиска. Промпт в этом случае заметно
+// длиннее обычного — Gemini на нём объективно отвечает дольше, и обычного
+// REQUEST_TIMEOUT_MS не хватало: бот считал, что Gemini "не ответила", и
+// зря переключался на следующий аккаунт/провайдера, хотя она просто не
+// успевала уложиться в 20 секунд с более длинным контекстом.
+const POST_SEARCH_ASK_TIMEOUT_MS = Number(process.env.POST_SEARCH_ASK_TIMEOUT_MS) || 35000;
 // MODEL_COOLDOWN_MS — на сколько "замораживаем" модель после ошибки, прежде
 // чем снова пробовать её первой. Пока цель в cooldown — бот сразу пробует
 // следующую по списку, не дожидаясь таймаута на мёртвой модели каждый раз.
@@ -2718,7 +2731,7 @@ function looksLikeReasoningLeak(text) {
   return yesNoCount >= 2;
 }
 
-async function callTarget(target, messages) {
+async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS) {
   const body = {
     model: target.model,
     messages,
@@ -2759,14 +2772,22 @@ async function callTarget(target, messages) {
     body.reasoning_effort = "low";
   }
 
-  // Таймаут на сам запрос: если провайдер завис и не отвечает вообще
-  // (не дал ни 200, ни ошибку) — раньше это вешало ответ пользователю
-  // на минуты вперёд. Теперь через REQUEST_TIMEOUT_MS обрываем запрос и
+  // Таймаут на весь запрос целиком: если провайдер завис и не отвечает
+  // вообще (не дал ни 200, ни ошибку) — раньше это вешало ответ
+  // пользователю на минуты вперёд. Через timeoutMs обрываем запрос и
   // уходим на фолбэк, как при обычной ошибке.
+  // ВАЖНО: раньше clearTimeout вызывался сразу после await fetch(...), то
+  // есть таймер разоружался, как только приходили заголовки ответа — но
+  // fetch() резолвится по заголовкам, а не по полному телу. Для медленных
+  // ответов с телом, которое досылается ещё долго после заголовков (как
+  // раз кейс поиска: реального веб-поиска ещё может не быть в момент
+  // заголовков) — таймаут просто не срабатывал, и запрос мог висеть
+  // намного дольше timeoutMs. Теперь таймер держим до тех пор, пока не
+  // прочитано и распарсено тело ответа целиком.
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-  let res;
+  let res, data;
   try {
     res = await fetch(target.baseUrl, {
       method: "POST",
@@ -2777,10 +2798,20 @@ async function callTarget(target, messages) {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      const err = new Error(`${target.provider} API вернул ${res.status}`);
+      err.status = res.status;
+      err.body = errText;
+      throw err;
+    }
+
+    data = await res.json();
   } catch (err) {
     if (err.name === "AbortError") {
       const timeoutErr = new Error(
-        `${targetLabel(target)} не ответил за ${REQUEST_TIMEOUT_MS}мс — таймаут`
+        `${targetLabel(target)} не ответил за ${timeoutMs}мс — таймаут`
       );
       timeoutErr.status = 504;
       throw timeoutErr;
@@ -2790,15 +2821,6 @@ async function callTarget(target, messages) {
     clearTimeout(timeoutId);
   }
 
-  if (!res.ok) {
-    const errText = await res.text();
-    const err = new Error(`${target.provider} API вернул ${res.status}`);
-    err.status = res.status;
-    err.body = errText;
-    throw err;
-  }
-
-  const data = await res.json();
   const choice = data.choices?.[0];
   let reply = choice?.message?.content?.trim();
   if (!reply) throw new Error(`Пустой ответ от ${target.provider}`);
@@ -2840,7 +2862,7 @@ async function callTarget(target, messages) {
 }
 
 // ==== Запрос к LLM с фолбэком по провайдерам и моделям ====
-async function askLLM(chatId, userText) {
+async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
   const history = getHistory(chatId);
 
   const messages = [
@@ -2862,7 +2884,7 @@ async function askLLM(chatId, userText) {
     const target = TARGETS[idx];
 
     try {
-      const { reply: rawReply, actualModel, systemFingerprint } = await callTarget(target, messages);
+      const { reply: rawReply, actualModel, systemFingerprint } = await callTarget(target, messages, timeoutMs);
       // ВРЕМЕННЫЙ DEBUG-ЛОГ — убрать после проверки тегов [sticker: ...].
       // Показывает сырой ответ модели ДО вырезания тега, чтобы понять,
       // ставит ли модель тег вообще, и если ставит — с правильным ли ключом.
@@ -5332,7 +5354,7 @@ async function searchWeb(query) {
     },
     { role: "user", content: query },
   ];
-  const { reply } = await callTarget(searchTarget, messages);
+  const { reply } = await callTarget(searchTarget, messages, SEARCH_TIMEOUT_MS);
   return reply;
 }
 
@@ -6344,6 +6366,11 @@ bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
   let userText = ctx.message.text;
+  // Ставим true при успешном веб-поиске (см. ниже оба места вызова
+  // searchWeb) — используется, чтобы дать финальному askLLM больше
+  // времени: с подмешанными результатами поиска промпт длиннее обычного,
+  // и модель объективно отвечает на нём дольше (см. POST_SEARCH_ASK_TIMEOUT_MS).
+  let searchUsedThisMessage = false;
   // Сырой текст без последующих преобразований userText (вырезание имени,
   // добавление префиксов) — нужен для распознавания шахматных ходов,
   // которые парсит не LLM, а chess.js.
@@ -6903,6 +6930,7 @@ bot.on("message:text", async (ctx) => {
         try {
           const found = await searchWeb(`${movieContext}. Запрос: ${strippedQuestion}`);
           userText = `[результаты веб-поиска про ${movieContext} по запросу «${strippedQuestion}»: ${found}] ${userText}`;
+          searchUsedThisMessage = true;
         } catch (err) {
           console.error(
             `Ошибка веб-поиска (карточка фильма) в чате ${chatId}:`,
@@ -7053,6 +7081,7 @@ bot.on("message:text", async (ctx) => {
       try {
         const found = await searchWeb(searchQuery);
         userText = `[результаты веб-поиска по запросу «${searchQuery}»: ${found}] ${userText}`;
+        searchUsedThisMessage = true;
       } catch (err) {
         console.error("Ошибка веб-поиска:", err.status ?? "-", err.body ?? err.message);
         userText = `[попытка веб-поиска по запросу «${searchQuery}» не удалась технически — если знаешь ответ по своим знаниям, отвечай сам, иначе честно скажи, что не смог погуглить] ${userText}`;
@@ -7536,7 +7565,11 @@ bot.on("message:text", async (ctx) => {
   try {
     let reply, stickerKey;
     await withTyping(ctx, async () => {
-      const res = await askLLM(chatId, userText);
+      const res = await askLLM(
+        chatId,
+        userText,
+        searchUsedThisMessage ? POST_SEARCH_ASK_TIMEOUT_MS : undefined
+      );
       reply = res.text;
       stickerKey = res.stickerKey;
       await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
