@@ -126,22 +126,62 @@ export function parseBirthDateArgs(argsText) {
 // корректно матчится сам по себе.
 const NOT_CYRILLIC_LETTER = "(?![а-яёА-ЯЁ])";
 
+// ==== Тематический гороскоп (здоровье / любовь / карьера-деньги) ====
+//
+// Тема — необязательный фильтр ПОВЕРХ периода: "гороскоп на любовь",
+// "гороскоп по здоровью", "гороскоп на завтра по карьере". Сами данные
+// (транзиты/натальные аспекты) не меняются — тема лишь просит LLM
+// сфокусироваться на нужной сфере (см. THEME_FOCUS_INSTRUCTIONS в
+// index.js). Важная оговорка: положения планет — реальная астрономия, а
+// вот СВЯЗЬ конкретной планеты/дома с "здоровьем" или "любовью" — это
+// астрологическая традиция, а не измеримый факт (в отличие от самих
+// координат планет). LLM-промпт в index.js об этом честно предупреждает,
+// особенно для темы "здоровье" — там же явный запрет на мед. советы.
+const THEME_PATTERNS = [
+  { key: "health", re: /здоровь/i },
+  { key: "love", re: /любв|любов|отношени|личн[а-яёА-ЯЁ]*\s+жизн/i },
+  { key: "career", re: /карьер|работ|финанс|деньг|денеж/i },
+];
+
+// "жизнь" как ПЕРИОД ("гороскоп на жизнь" = долгосрочный разбор без
+// транзитов) не должна путаться с ТЕМОЙ "личная жизнь" (это про любовь,
+// а период там обычный — "на сегодня") — отсюда негативный lookbehind:
+// не считаем это периодом "жизнь", если "жизн" идёт сразу после "личн...".
+const LIFE_PERIOD_RE = /(?<!личн[а-яёА-ЯЁ]*\s)жизн/i;
+
+// Если в тексте совпало сразу несколько тем — берём ту, что встретилась
+// раньше по тексту (а не первую в THEME_PATTERNS), это интуитивнее.
+function detectTheme(rest) {
+  let theme = null;
+  let bestIndex = Infinity;
+  for (const tp of THEME_PATTERNS) {
+    const match = tp.re.exec(rest);
+    if (match && match.index < bestIndex) {
+      theme = tp.key;
+      bestIndex = match.index;
+    }
+  }
+  return theme;
+}
+
 export function parseHoroscopeQueryIntent(text) {
   const t = (text || "").trim();
   if (!t) return null;
 
-  const horoscopeRe = new RegExp(
-    `^гороскоп${NOT_CYRILLIC_LETTER}(?:\\s*(?:на|по)?\\s*(сегодня|завтра|недел[юяи]|жизнь|жизни))?`,
-    "i"
-  );
+  // Раньше здесь ловился только один заранее известный период-словом; теперь
+  // забираем весь кириллический "хвост" после "гороскоп" одним куском и
+  // ищем в нём и период, и тему — так работают любые сочетания вида
+  // "гороскоп на завтра по любви" независимо от порядка слов.
+  const horoscopeRe = new RegExp(`^гороскоп${NOT_CYRILLIC_LETTER}([\\sа-яёА-ЯЁ]*)`, "i");
   let m = horoscopeRe.exec(t);
   if (m) {
-    const word = (m[1] || "").toLowerCase();
+    const rest = (m[1] || "").toLowerCase();
     let period = "today";
-    if (/завтра/.test(word)) period = "tomorrow";
-    else if (/недел/.test(word)) period = "week";
-    else if (/жизн/.test(word)) period = "life";
-    return { type: "horoscope", period };
+    if (/завтра/.test(rest)) period = "tomorrow";
+    else if (/недел/.test(rest)) period = "week";
+    else if (LIFE_PERIOD_RE.test(rest)) period = "life";
+    const theme = detectTheme(rest);
+    return { type: "horoscope", period, theme };
   }
 
   // [а-яёА-ЯЁ]* вместо \w* — та же причина, что и с \b выше: \w не видит
@@ -483,19 +523,23 @@ function formatRuDate(parts) {
 
 // taskType — то же значение, что index.js передаёт в askAstroLLM:
 // "chart" | "aspects" | "today" | "tomorrow" | "week" | "life".
-export function formatHoroscopeDateLabel(natal, taskType) {
+// theme — необязательно: "health" | "love" | "career" | null.
+const THEME_LABEL_RU = { health: "здоровье", love: "любовь", career: "карьера и деньги" };
+
+export function formatHoroscopeDateLabel(natal, taskType, theme = null) {
   const tz = natal.profile.timezone || "UTC";
+  const themeSuffix = theme && THEME_LABEL_RU[theme] ? ` — ${THEME_LABEL_RU[theme]}` : "";
   if (taskType === "chart") return "натальная карта";
   if (taskType === "aspects") return "аспекты";
-  if (taskType === "life") return "гороскоп на жизнь";
+  if (taskType === "life") return `гороскоп на жизнь${themeSuffix}`;
   if (taskType === "week") {
     const start = transitSnapshotParts(tz, 0, { noon: true });
     const end = transitSnapshotParts(tz, 7, { noon: true });
     const startStr = start.month === end.month ? `${start.day}` : `${start.day} ${MONTH_RU_GENITIVE[start.month - 1]}`;
-    return `гороскоп на неделю, ${startStr} — ${end.day} ${MONTH_RU_GENITIVE[end.month - 1]}`;
+    return `гороскоп на неделю${themeSuffix}, ${startStr} — ${end.day} ${MONTH_RU_GENITIVE[end.month - 1]}`;
   }
   const dayOffset = taskType === "tomorrow" ? 1 : 0;
   const parts = transitSnapshotParts(tz, dayOffset, { noon: dayOffset > 0 });
   const label = taskType === "tomorrow" ? "гороскоп на завтра" : "гороскоп на сегодня";
-  return `${label}, ${formatRuDate(parts)}`;
+  return `${label}${themeSuffix}, ${formatRuDate(parts)}`;
 }

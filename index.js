@@ -4425,6 +4425,32 @@ const NATAL_TASK_INSTRUCTIONS = {
     "случится.",
 };
 
+// Тематический фокус — необязательная добавка ПОВЕРХ инструкции периода
+// выше (см. askAstroLLM: base + focus). Данные остаются те же самые
+// реальные транзиты/аспекты — тема лишь просит модель раскрыть их под
+// конкретным углом, а не придумывает новые данные. Для "здоровья" —
+// отдельный жёсткий запрет на медицинские советы/диагнозы: связь планет
+// со здоровьем — астрологическая традиция, а не медицинский факт, и
+// нельзя, чтобы это прозвучало как рекомендация врача.
+const THEME_FOCUS_INSTRUCTIONS = {
+  health:
+    "\n\nДополнительно сделай акцент на теме самочувствия и энергии — " +
+    "куда стоит быть внимательнее физически (усталость/подъём сил/дни " +
+    "поберечься и т.п.), опираясь на те же данные выше. Это НЕ " +
+    "медицинский совет и НЕ диагноз: никогда не называй конкретные " +
+    "болезни, симптомы, диагнозы или лечение — только общий фон " +
+    "энергии/нагрузки. Если уместно, мягко добавь, что при реальных " +
+    "проблемах со здоровьем стоит идти к врачу, а не к гороскопу.",
+  love:
+    "\n\nДополнительно сделай акцент на теме отношений и личной жизни — " +
+    "партнёрство, чувства, общение с близкими, — опираясь на те же " +
+    "данные выше.",
+  career:
+    "\n\nДополнительно сделай акцент на теме работы, карьеры и денег — " +
+    "дела, договорённости, финансовые решения, — опираясь на те же " +
+    "данные выше.",
+};
+
 // Отдельный, но структурно такой же, как askLLM, фолбэк-цикл по TARGETS —
 // не переиспользуем сам askLLM, потому что тому нужна история чата и он
 // сам кладёт userText/reply в неё по фиксированному формату; тут же в
@@ -4433,12 +4459,13 @@ const NATAL_TASK_INSTRUCTIONS = {
 // как "userText" было бы нечестно по отношению к будущему контексту
 // диалога. Персонаж (SYSTEM_PROMPT) тот же, чтобы ответ звучал как Женя, а
 // не как безликий астрологический сервис.
-async function askAstroLLM(taskType, dataBlock, timeoutMs = REQUEST_TIMEOUT_MS) {
+async function askAstroLLM(taskType, dataBlock, theme = null, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const themeFocus = theme && THEME_FOCUS_INSTRUCTIONS[theme] ? THEME_FOCUS_INSTRUCTIONS[theme] : "";
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
     {
       role: "user",
-      content: `${NATAL_TASK_INSTRUCTIONS[taskType]}\n\n${dataBlock}`,
+      content: `${NATAL_TASK_INSTRUCTIONS[taskType]}${themeFocus}\n\n${dataBlock}`,
     },
   ];
 
@@ -4584,15 +4611,17 @@ async function handleHoroscopeQuery(ctx, intent) {
       taskType = "today";
     }
 
-    const reply = await askAstroLLM(taskType, dataBlock);
+    const theme = intent.theme || null;
+    const reply = await askAstroLLM(taskType, dataBlock, theme);
 
-    // Шапка с адресатом и датой — без неё в групповом чате, где гороскоп
-    // могут спросить несколько человек подряд, непонятно, кому конкретно
-    // ответил бот и на какой день посчитан прогноз (см. formatHoroscopeDateLabel
-    // в natal.js). Плюс reply_parameters — физический реплай на сообщение
-    // человека, а не просто сообщение "в пустоту" рядом.
+    // Шапка с адресатом, датой и темой (если была) — без неё в групповом
+    // чате, где гороскоп могут спросить несколько человек подряд, непонятно,
+    // кому конкретно ответил бот, на какой день и про какую сферу жизни
+    // (см. formatHoroscopeDateLabel в natal.js). Плюс reply_parameters —
+    // физический реплай на сообщение человека, а не просто сообщение
+    // "в пустоту" рядом.
     const displayName = getDisplayName(chatId, ctx.from);
-    const dateLabel = formatHoroscopeDateLabel(natal, taskType);
+    const dateLabel = formatHoroscopeDateLabel(natal, taskType, theme);
     const header = `${dateLabel[0].toUpperCase()}${dateLabel.slice(1)}, для ${displayName}:`;
     await ctx.reply(`${header}\n\n${reply}`, {
       reply_parameters: { message_id: ctx.message.message_id },
