@@ -5057,7 +5057,7 @@ function getGradioClient() {
   return gradioClientPromise;
 }
 
-async function transcribeViaGigaAM(buffer, ext) {
+async function transcribeViaGigaAM(buffer, ext, forceGiga = false) {
   if (!GIGAAM_SPACE) return null;
 
   const controller = new AbortController();
@@ -5065,7 +5065,16 @@ async function transcribeViaGigaAM(buffer, ext) {
   try {
     const client = await getGradioClient();
     const blob = new Blob([buffer], { type: `audio/${ext}` });
-    const result = await client.predict("/transcribe", { audio_path: handle_file(blob) });
+    // force_giga=true — второй вход /transcribe в app.py, пропускает
+    // language-id на стороне Space и всегда прогоняет через GigaAM (нужен
+    // для ручного "Жень текст giga" ниже). В обычном режиме (false) Space
+    // сам определяет язык и на не-русском вернёт "" — тогда просто едем
+    // на Whisper как при недоступном Space, никакой отдельной обработки
+    // "чужой язык" тут не нужно.
+    const result = await client.predict("/transcribe", {
+      audio_path: handle_file(blob),
+      force_giga: forceGiga,
+    });
     const text = (result?.data?.[0] || "").toString().trim();
     return text || null;
   } catch (err) {
@@ -5076,12 +5085,31 @@ async function transcribeViaGigaAM(buffer, ext) {
   }
 }
 
-// Скачивает голосовое/кружочек и прогоняет через GigaAM (если настроен),
-// с фолбэком на Groq Whisper — либо сразу через Whisper, если GigaAM не
-// подключен. Один retry на 5xx/сетевую ошибку у Whisper — как в callTarget,
-// но без общего cooldown-механизма TARGETS: это разовый точечный вызов,
-// а не часть общего фолбэка.
-async function transcribeVoice(ctx, fileId) {
+// Ручной выбор движка распознавания из текста команды — "Жень текст
+// Whisper" / "Жень расшифруй через гигу" и т.п. Нужен на случай, когда
+// GigaAM (или, наоборот, авто-язык) ошибается — например, языковая
+// детекция на коротком/тихом отрывке песни определила язык неверно, и
+// расшифровка (а с ней и весь дальнейший ответ про "о чём песня")
+// съехала. "giga"/"гига" ловит и "gigaam"/"гигаам" вариантах написания.
+const WHISPER_ENGINE_REGEX = /\bwhisper\b|\bвиспер\b/i;
+const GIGA_ENGINE_REGEX = /\bgiga\s*am\b|\bгига\s*ам?\b|\bгига\b/i;
+
+function detectEngineOverride(text) {
+  if (!text) return "auto";
+  if (WHISPER_ENGINE_REGEX.test(text)) return "whisper";
+  if (GIGA_ENGINE_REGEX.test(text)) return "giga";
+  return "auto";
+}
+
+// Скачивает голосовое/кружочек и прогоняет через GigaAM (если настроен и
+// не форсирован Whisper), с фолбэком на Groq Whisper — либо сразу через
+// Whisper, если GigaAM не подключен/не справился. engine: "auto" (по
+// умолчанию — GigaAM сам решает по языку), "giga" (принудительно, минуя
+// language-id) или "whisper" (сразу Groq, GigaAM не трогаем вовсе). Один
+// retry на 5xx/сетевую ошибку у Whisper — как в callTarget, но без общего
+// cooldown-механизма TARGETS: это разовый точечный вызов, а не часть
+// общего фолбэка.
+async function transcribeVoice(ctx, fileId, engine = "auto") {
   const { buffer, filePath } = await downloadTelegramFile(ctx, fileId);
   // Telegram отдаёт голосовые с расширением .oga (хотя по факту это тот же
   // контейнер OGG/Opus) — Groq же принимает строго определённый список
@@ -5093,9 +5121,12 @@ async function transcribeVoice(ctx, fileId) {
   const EXT_ALIASES = { oga: "ogg" };
   const ext = EXT_ALIASES[rawExt] || rawExt;
 
-  const gigaamText = await transcribeViaGigaAM(buffer, ext);
-  if (gigaamText) return { text: gigaamText };
-  // GigaAM не настроен/не ответил/упал — едем на Whisper как раньше.
+  if (engine !== "whisper") {
+    const gigaamText = await transcribeViaGigaAM(buffer, ext, engine === "giga");
+    if (gigaamText) return { text: gigaamText, engine: "giga" };
+    // GigaAM не настроен/не ответил/упал/не тот язык (auto) — либо не
+    // справился даже принудительно (giga) — едем на Whisper как раньше.
+  }
 
   let lastErr;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -5150,7 +5181,7 @@ async function transcribeVoice(ctx, fileId) {
       : (data.text || "").trim();
 
     text = stripWhisperHallucinations(text);
-    return { text };
+    return { text, engine: "whisper" };
   }
 
   throw lastErr ?? new Error("Groq Whisper не ответил после повторной попытки");
@@ -6480,8 +6511,14 @@ bot.on("message:text", async (ctx) => {
             ? ` (${[mediaObj.performer, mediaObj.title].filter(Boolean).join(" — ")})`
             : "";
         const wantsLiteralText = VOICE_TRANSCRIBE_INTENT_REGEX.test(strippedQuestion);
+        // Ручной выбор движка ("текст whisper"/"текст giga") — при явном
+        // выборе не берём закэшированную расшифровку (она могла быть
+        // сделана другим движком раньше), а перераспознаём и перезаписываем
+        // кэш, иначе явная просьба "давай через Whisper" молча вернула бы
+        // старый (возможно ошибочный) результат GigaAM.
+        const engineOverride = detectEngineOverride(strippedQuestion);
 
-        let info = getVoiceTranscript(chatId, repliedTo.message_id);
+        let info = engineOverride === "auto" ? getVoiceTranscript(chatId, repliedTo.message_id) : null;
         let transcribeError = null;
         let tooLarge = false;
         if (!info) {
@@ -6492,7 +6529,7 @@ bot.on("message:text", async (ctx) => {
             tooLarge = true;
           } else {
             try {
-              const { text } = await transcribeVoice(ctx, mediaObj.file_id);
+              const { text } = await transcribeVoice(ctx, mediaObj.file_id, engineOverride);
               info = { name: repliedName, text };
               rememberVoiceTranscript(chatId, repliedTo.message_id, repliedName, text);
             } catch (err) {
@@ -6675,12 +6712,17 @@ bot.on("message:text", async (ctx) => {
       // (voiceTranscriptsByMessage) общий с тем блоком — повторный реплай
       // на тот же трек/текст не гоняет файл через Whisper заново.
       const trackAudio = repliedToBotMsg.audio;
-      let lyricsInfo = getVoiceTranscript(chatId, repliedToBotMsg.message_id);
+      const wantsLiteralLyrics = VOICE_TRANSCRIBE_INTENT_REGEX.test(rawText.trim());
+      // Как и в блоке про голосовые выше — явный выбор движка обходит кэш
+      // и перераспознаёт заново (актуально в первую очередь тут: короткий
+      // отрывок иностранной песни — самый частый случай, когда GigaAM или
+      // авто-язык может ошибиться, и хочется явно сказать "через Whisper").
+      const engineOverride = detectEngineOverride(rawText);
+      let lyricsInfo = engineOverride === "auto" ? getVoiceTranscript(chatId, repliedToBotMsg.message_id) : null;
       const trackLabel =
         (trackAudio && [trackAudio.performer, trackAudio.title].filter(Boolean).join(" — ")) ||
         lyricsInfo?.name ||
         "";
-      const wantsLiteralLyrics = VOICE_TRANSCRIBE_INTENT_REGEX.test(rawText.trim());
 
       let lyricsError = null;
       let lyricsTooLarge = false;
@@ -6689,7 +6731,7 @@ bot.on("message:text", async (ctx) => {
           lyricsTooLarge = true;
         } else {
           try {
-            const { text } = await transcribeVoice(ctx, trackAudio.file_id);
+            const { text } = await transcribeVoice(ctx, trackAudio.file_id, engineOverride);
             lyricsInfo = { name: trackLabel || "бот", text };
             rememberVoiceTranscript(chatId, repliedToBotMsg.message_id, trackLabel || "бот", text);
           } catch (err) {
