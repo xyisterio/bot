@@ -5265,25 +5265,157 @@ async function captionPhoto(ctx, fileId) {
   return extractPhotoReaction(reply);
 }
 
-// ==== Реакция стикером на присланную песню/аудио ====
-// Отдельно от текстовых ответов через LLM — тут модель вообще не участвует,
-// это чисто механическая реакция: пришло аудио/голосовое → шлём стикер из
-// категории "music". В группе реагируем, только если это реплай на
-// сообщение бота (иначе бот реагировал бы на любую музыку в чате подряд).
-bot.on(["message:audio", "message:voice"], async (ctx) => {
-  const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
-  if (isGroup) {
-    const isReply = isReplyToBot(ctx);
-    if (!isReply) return;
+// ==== Фоновая расшифровка голосовых/аудио для сводки чата ====
+// В отличие от реактивной расшифровки выше (реплай на ГС с "текст"/"о чём
+// там") — эта молчаливая: результат никогда не уходит в сам чат, только в
+// ChatLog (см. pushChatLog) и в общий кэш расшифровок
+// (voiceTranscriptsByMessage), чтобы "Женя, что я пропустил?" (см.
+// RECAP_INTENT_REGEX/handleRecapQuery) знал реальное содержание голосовых,
+// а не только факт "кто-то прислал голосовое". Кэш общий с реактивным
+// путём — если кто-то потом реплайнет на ЭТО ЖЕ голосовое с "текст"/"о чём
+// там" (см. VOICE_TRANSCRIBE_INTENT_REGEX/getVoiceTranscript выше по коду),
+// расшифровка уже готова и повторного прохода через GigaAM/Whisper не
+// будет — engine="auto" тут и там даёт один и тот же кэш-ключ.
+// Молчим полностью при любой ошибке — это фон, отдельно ловим и логируем
+// в консоль на вызывающей стороне (см. bot.on ниже), в чат ничего не
+// падает.
+async function backgroundTranscribeVoiceForRecap(ctx) {
+  const chatId = ctx.chat.id;
+  const mediaObj = ctx.message.voice || ctx.message.audio;
+  if (!mediaObj) return;
+
+  rememberUsername(chatId, ctx.from);
+  const displayName = getDisplayName(chatId, ctx.from);
+  const kind = ctx.message.voice ? "voice" : "audio";
+  const label = kind === "voice" ? "голосовое" : "аудиофайл";
+  const durationLabel = formatVoiceDuration(mediaObj.duration);
+  const durationPart = durationLabel ? ` (${durationLabel})` : "";
+  // Название/исполнитель — есть только у audio (см. аналогичный код в
+  // реактивном блоке выше).
+  const trackMeta =
+    kind === "audio" && (mediaObj.title || mediaObj.performer)
+      ? ` (${[mediaObj.performer, mediaObj.title].filter(Boolean).join(" — ")})`
+      : "";
+
+  let text = null;
+  if (mediaObj.file_size && mediaObj.file_size > MAX_TRANSCRIBE_FILE_SIZE) {
+    // Файл крупнее 20MB Bot API всё равно не отдаст (см. tooLarge в
+    // реактивном блоке) — даже не пытаемся скачивать.
+  } else {
+    try {
+      ({ text } = await transcribeVoice(ctx, mediaObj.file_id, "auto"));
+    } catch (err) {
+      console.error(
+        `Фоновая расшифровка ${label} в чате ${chatId} не удалась:`,
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+    }
   }
 
-  const stickerId = pickSticker("music");
-  if (!stickerId) return; // категория ещё не заполнена — молчим
+  if (text) {
+    // Тот же кэш и тот же ключ (chatId:messageId), что читает реактивный
+    // блок выше — реплай на это голосовое с "текст" отдаст готовый
+    // результат мгновенно, без повторной расшифровки.
+    rememberVoiceTranscript(chatId, ctx.message.message_id, displayName, text);
+  }
 
-  await ctx.replyWithSticker(stickerId, {
-    reply_parameters: { message_id: ctx.message.message_id },
-    message_thread_id: ctx.message.message_thread_id,
+  const logLine = text
+    ? `[${label}${trackMeta}${durationPart}]: ${text}`
+    : `[${label}${trackMeta}${durationPart} — текст не распознан]`;
+  // toBot=false — сам факт присылки голосового не значит, что обратились к
+  // боту (в отличие от caption у фото, тут никакого текста-обращения нет).
+  pushChatLog(chatId, displayName, logLine, false);
+}
+
+// ==== Фоновая расшифровка кружочков (video_note) для сводки чата ====
+// Тот же принцип, что и у голосовых/аудио выше (см.
+// backgroundTranscribeVoiceForRecap) — молчаливо, только в ChatLog и в
+// общий кэш расшифровок, никакого ответа в чат. Отдельная функция, а не
+// переиспользование backgroundTranscribeVoiceForRecap, потому что у
+// video_note нет ни title/performer, ни смысла в стикер-реакции "music"
+// (это видеосообщение, а не музыка) — общего между ними по факту только
+// сама расшифровка через transcribeVoice.
+async function backgroundTranscribeVideoNoteForRecap(ctx) {
+  const chatId = ctx.chat.id;
+  const mediaObj = ctx.message.video_note;
+  if (!mediaObj) return;
+
+  rememberUsername(chatId, ctx.from);
+  const displayName = getDisplayName(chatId, ctx.from);
+  const durationLabel = formatVoiceDuration(mediaObj.duration);
+  const durationPart = durationLabel ? ` (${durationLabel})` : "";
+
+  let text = null;
+  if (mediaObj.file_size && mediaObj.file_size > MAX_TRANSCRIBE_FILE_SIZE) {
+    // Файл крупнее 20MB Bot API всё равно не отдаст — даже не пытаемся.
+  } else {
+    try {
+      ({ text } = await transcribeVoice(ctx, mediaObj.file_id, "auto"));
+    } catch (err) {
+      console.error(
+        `Фоновая расшифровка кружочка в чате ${chatId} не удалась:`,
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+    }
+  }
+
+  if (text) {
+    rememberVoiceTranscript(chatId, ctx.message.message_id, displayName, text);
+  }
+
+  const logLine = text
+    ? `[кружочек${durationPart}]: ${text}`
+    : `[кружочек${durationPart} — текст не распознан]`;
+  pushChatLog(chatId, displayName, logLine, false);
+}
+
+bot.on("message:video_note", async (ctx) => {
+  const chatId = ctx.chat.id;
+  const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+  if (!isGroup || ctx.from.is_bot) return; // в личке ChatLog не ведётся, чужих ботов не логируем
+
+  backgroundTranscribeVideoNoteForRecap(ctx).catch((err) => {
+    console.error(`Фоновая расшифровка кружочка в чате ${chatId} упала:`, err.message || err);
   });
+});
+
+
+// Стикер — отдельно от текстовых ответов через LLM, модель тут не
+// участвует: пришло аудио/голосовое → шлём стикер из категории "music". В
+// группе стикером реагируем ТОЛЬКО если это реплай на сообщение бота
+// (иначе бот реагировал бы на любую музыку/ГС в чате подряд) — но
+// расшифровка для сводки, в отличие от стикера, уходит в фон для ЛЮБОГО
+// голосового/аудио в группе, вне зависимости от реплая, чтобы "что я
+// пропустил" знал содержание всех голосовых, а не только тех, на которые
+// среагировал бот.
+bot.on(["message:audio", "message:voice"], async (ctx) => {
+  const chatId = ctx.chat.id;
+  const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+  const isReply = isGroup && isReplyToBot(ctx);
+
+  if (!isGroup || isReply) {
+    const stickerId = pickSticker("music");
+    if (stickerId) {
+      await ctx.replyWithSticker(stickerId, {
+        reply_parameters: { message_id: ctx.message.message_id },
+        message_thread_id: ctx.message.message_thread_id,
+      });
+    }
+  }
+
+  // Фоновая расшифровка для ChatLog — только в группах (в личке ChatLog
+  // вообще не ведётся, см. комментарий у chatLogs выше) и не для других
+  // ботов (тот же фильтр, что у фото/текста).
+  if (isGroup && !ctx.from.is_bot) {
+    // Намеренно не await — это фон, не должен задерживать обработку
+    // сообщения (стикер уже отправлен выше). Ошибки ловятся внутри самой
+    // функции и здесь же on catch — в чат ничего не падает.
+    backgroundTranscribeVoiceForRecap(ctx).catch((err) => {
+      console.error(`Фоновая расшифровка голосового/аудио в чате ${chatId} упала:`, err.message || err);
+    });
+  }
 });
 
 // ==== Вход/выход участников группы ====
