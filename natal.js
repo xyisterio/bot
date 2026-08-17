@@ -461,3 +461,41 @@ export function formatSavedProfileLabel(profile, locationLabel) {
     : " (время неизвестно)";
   return `${datePart}${timePart}, ${locationLabel}`;
 }
+
+// ==== Заголовок гороскопа для чата ====
+//
+// В групповом чате несколько человек могут спрашивать гороскоп подряд, и
+// без подписи непонятно, кому какой ответ адресован и на какой именно день
+// он посчитан. formatHoroscopeDateLabel строит короткую шапку вида
+// "гороскоп на завтра, вторник, 18 августа" — index.js добавляет к ней имя
+// адресата и кладёт перед текстом гороскопа (а также отвечает реплаем на
+// исходное сообщение — это уже отдельная механика в index.js).
+const WEEKDAY_RU = ["воскресенье", "понедельник", "вторник", "среда", "четверг", "пятница", "суббота"];
+const MONTH_RU_GENITIVE = [
+  "января", "февраля", "марта", "апреля", "мая", "июня",
+  "июля", "августа", "сентября", "октября", "ноября", "декабря",
+];
+
+function formatRuDate(parts) {
+  const weekday = WEEKDAY_RU[new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay()];
+  return `${weekday}, ${parts.day} ${MONTH_RU_GENITIVE[parts.month - 1]}`;
+}
+
+// taskType — то же значение, что index.js передаёт в askAstroLLM:
+// "chart" | "aspects" | "today" | "tomorrow" | "week" | "life".
+export function formatHoroscopeDateLabel(natal, taskType) {
+  const tz = natal.profile.timezone || "UTC";
+  if (taskType === "chart") return "натальная карта";
+  if (taskType === "aspects") return "аспекты";
+  if (taskType === "life") return "гороскоп на жизнь";
+  if (taskType === "week") {
+    const start = transitSnapshotParts(tz, 0, { noon: true });
+    const end = transitSnapshotParts(tz, 7, { noon: true });
+    const startStr = start.month === end.month ? `${start.day}` : `${start.day} ${MONTH_RU_GENITIVE[start.month - 1]}`;
+    return `гороскоп на неделю, ${startStr} — ${end.day} ${MONTH_RU_GENITIVE[end.month - 1]}`;
+  }
+  const dayOffset = taskType === "tomorrow" ? 1 : 0;
+  const parts = transitSnapshotParts(tz, dayOffset, { noon: dayOffset > 0 });
+  const label = taskType === "tomorrow" ? "гороскоп на завтра" : "гороскоп на сегодня";
+  return `${label}, ${formatRuDate(parts)}`;
+}

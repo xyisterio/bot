@@ -15,6 +15,7 @@ import {
   buildWeekHoroscopeContext,
   buildLifeContext,
   formatSavedProfileLabel,
+  formatHoroscopeDateLabel,
 } from "./natal.js";
 
 // ==== Конфиг из переменных окружения ====
@@ -4535,7 +4536,9 @@ bot.command("natal", async (ctx) => {
     `сохранил: ${formatSavedProfileLabel(profile, profile.locationLabel)}${timeNote}\n` +
       "Теперь можно спросить: \"гороскоп\", \"гороскоп на завтра\", " +
       "\"гороскоп на неделю\", \"гороскоп на жизнь\", \"натальная карта\" " +
-      "или \"мои аспекты\""
+      "или \"мои аспекты\"\n\n" +
+      "Ошибся в данных? Пришли /natal с новыми — они перезапишут старые. " +
+      "Стереть совсем — /natal reset"
   );
 });
 
@@ -4582,7 +4585,18 @@ async function handleHoroscopeQuery(ctx, intent) {
     }
 
     const reply = await askAstroLLM(taskType, dataBlock);
-    await ctx.reply(reply);
+
+    // Шапка с адресатом и датой — без неё в групповом чате, где гороскоп
+    // могут спросить несколько человек подряд, непонятно, кому конкретно
+    // ответил бот и на какой день посчитан прогноз (см. formatHoroscopeDateLabel
+    // в natal.js). Плюс reply_parameters — физический реплай на сообщение
+    // человека, а не просто сообщение "в пустоту" рядом.
+    const displayName = getDisplayName(chatId, ctx.from);
+    const dateLabel = formatHoroscopeDateLabel(natal, taskType);
+    const header = `${dateLabel[0].toUpperCase()}${dateLabel.slice(1)}, для ${displayName}:`;
+    await ctx.reply(`${header}\n\n${reply}`, {
+      reply_parameters: { message_id: ctx.message.message_id },
+    });
 
     // Кладём в историю чата в упрощённом виде (не сырые данные карты) —
     // чтобы если человек тут же спросит "а почему так?", у бота был
