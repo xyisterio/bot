@@ -5,6 +5,17 @@ import { Chess } from "chess.js";
 import crypto from "node:crypto";
 import { Client as GradioClient, handle_file } from "@gradio/client";
 import { BOT_SKILLS_PROMPT } from "./skills.js";
+import {
+  parseBirthDateArgs,
+  parseHoroscopeQueryIntent,
+  computeNatalProfile,
+  buildChartContext,
+  buildAspectsOnlyContext,
+  buildDayHoroscopeContext,
+  buildWeekHoroscopeContext,
+  buildLifeContext,
+  formatSavedProfileLabel,
+} from "./natal.js";
 
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -4305,6 +4316,285 @@ async function handleWeatherQuery(ctx, intent) {
   }
 }
 
+// ==== Натальная карта / гороскопы ====
+//
+// Сами расчёты (парсинг даты, построение карты, аспекты, транзиты,
+// форматирование в текст) — в natal.js, тут только: хранение даты рождения
+// пользователя в Redis, обвязка команды /natal, роутинг запросов гороскопа
+// и вызов LLM поверх готового астрологического контекста. Геокодинг города
+// переиспользует geocodeCity/locationLabel выше (тот же Open-Meteo, что и
+// у погоды) — специально не второй геокодер, чтобы не путать пользователя
+// двумя разными базами городов с разным поведением.
+
+// Кэш в памяти процесса поверх Redis — то же самое решение, что у
+// deezer_quality (redis.get на каждый чих не нужен, если профиль уже
+// читали в этом процессе). В отличие от алиасов/истории чата это НЕ грузим
+// целиком при старте (loadPersistedState) — профилей может быть много, а
+// нужны они только по явному запросу гороскопа, так что грузим лениво, по
+// первому обращению конкретного userId.
+const natalProfiles = new Map();
+
+async function getNatalProfile(userId) {
+  if (natalProfiles.has(userId)) return natalProfiles.get(userId);
+  if (redis) {
+    try {
+      const data = await redis.get(`natal:${userId}`);
+      if (data) {
+        natalProfiles.set(userId, data);
+        return data;
+      }
+    } catch (err) {
+      console.error(`Не удалось прочитать натальный профиль ${userId} из Redis:`, err.message);
+    }
+  }
+  return null;
+}
+
+async function saveNatalProfile(userId, profile) {
+  natalProfiles.set(userId, profile);
+  if (redis) {
+    try {
+      await redis.set(`natal:${userId}`, profile);
+    } catch (err) {
+      console.error(`Не удалось сохранить натальный профиль ${userId} в Redis:`, err.message);
+    }
+  }
+}
+
+async function deleteNatalProfile(userId) {
+  natalProfiles.delete(userId);
+  if (redis) {
+    try {
+      await redis.del(`natal:${userId}`);
+    } catch (err) {
+      console.error(`Не удалось удалить натальный профиль ${userId} из Redis:`, err.message);
+    }
+  }
+}
+
+// Задача для LLM — отдельная под каждый тип запроса (характер/аспекты/
+// гороскоп на день/неделю/жизнь), приклеивается поверх SYSTEM_PROMPT (та
+// же личность Жени, что и в обычном чате) и реального астрологического
+// контекста из natal.js (buildChartContext и т.п.). Ключевое требование
+// везде одно и то же — писать ТОЛЬКО по переданным данным, ничего не
+// домысливая сверх них (см. аналогичный принцип в BOT_SKILLS_PROMPT про
+// погоду: модель не должна изображать, что "знает", то чего у неё нет).
+const NATAL_TASK_INSTRUCTIONS = {
+  chart:
+    "Ниже — реальные астрономические данные натальной карты человека " +
+    "(положения планет по знакам и домам + натальные аспекты, посчитанные " +
+    "по формулам, а не выдуманные). Опираясь СТРОГО на эти данные, опиши " +
+    "характер, сильные и слабые стороны человека — живым языком, в своей " +
+    "обычной манере, без списков и заголовков, 4-6 предложений. Не " +
+    "добавляй ни одной планеты, знака, дома или аспекта, которых нет в " +
+    "данных ниже. Орб в градусах — техническая величина для тебя самой, " +
+    "не зачитывай её пользователю дословно, вместо этого словами передай " +
+    "силу аспекта (точно проявлен / фоново ощущается и т.п.), если вообще " +
+    "об этом упоминаешь.",
+  aspects:
+    "Ниже — список натальных аспектов человека (реальный расчёт углов " +
+    "между планетами, не выдумка). Объясни своими словами, что эти " +
+    "аспекты в целом говорят о человеке — связным текстом, а не построчным " +
+    "разбором каждого аспекта по отдельности, 3-5 предложений. Не " +
+    "добавляй никаких аспектов сверх списка ниже и не зачитывай орбы в " +
+    "градусах дословно.",
+  today:
+    "Ниже — реальные транзиты (текущие положения планет) и их аспекты к " +
+    "натальной карте человека на сегодня. Напиши короткий гороскоп на " +
+    "сегодня по этим данным — 3-5 предложений, конкретно и по делу (на " +
+    "что обратить внимание, где лёгкость, где напряжение), без общих фраз " +
+    "вида \"звёзды говорят\" и без единой детали сверх данных ниже.",
+  tomorrow:
+    "Ниже — реальные транзиты на завтра и их аспекты к натальной карте. " +
+    "Напиши короткий гороскоп на завтра, 3-5 предложений, по тем же " +
+    "правилам, что и для \"сегодня\" — только по этим данным, ничего не " +
+    "выдумывая сверх них.",
+  week:
+    "Ниже — транзиты на начало и на конец недели (для сравнения динамики " +
+    "внутри недели). Напиши гороскоп на неделю, 4-6 предложений — как " +
+    "фон/настроение может меняться от начала к концу недели, опираясь " +
+    "только на данные ниже, не выдумывая деталей на конкретные дни.",
+  life:
+    "Ниже — натальная карта человека (это НЕ прогноз на сегодня, тут " +
+    "нет транзитов вообще — только сама карта). Напиши общий разбор " +
+    "долгосрочных жизненных тем, склонностей и повторяющихся паттернов, " +
+    "5-7 предложений, опираясь только на данные ниже. Не изображай " +
+    "конкретные предсказуемые события (даты, имена, точные исходы) — " +
+    "натальная карта про склонности и темы, а не про то, что буквально " +
+    "случится.",
+};
+
+// Отдельный, но структурно такой же, как askLLM, фолбэк-цикл по TARGETS —
+// не переиспользуем сам askLLM, потому что тому нужна история чата и он
+// сам кладёт userText/reply в неё по фиксированному формату; тут же в
+// сообщении пользователю совсем другой формат (сырые астрологические
+// данные, а не то, что реально произнёс человек), и класть ИХ в историю
+// как "userText" было бы нечестно по отношению к будущему контексту
+// диалога. Персонаж (SYSTEM_PROMPT) тот же, чтобы ответ звучал как Женя, а
+// не как безликий астрологический сервис.
+async function askAstroLLM(taskType, dataBlock, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    {
+      role: "user",
+      content: `${NATAL_TASK_INSTRUCTIONS[taskType]}\n\n${dataBlock}`,
+    },
+  ];
+
+  let lastErr;
+  const order = computeTargetOrder();
+  for (const idx of order) {
+    const target = TARGETS[idx];
+    try {
+      const { reply } = await callTarget(target, messages, timeoutMs);
+      cooldownUntil[idx] = 0;
+      return reply;
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `Астрология: ошибка [${targetLabel(target)}]:`,
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+      if (err.status && !isFallbackWorthy(err.status)) break;
+      cooldownUntil[idx] = Date.now() + MODEL_COOLDOWN_MS;
+    }
+  }
+  throw lastErr ?? new Error("Все провайдеры и модели недоступны");
+}
+
+// "/natal" — без аргументов показывает то, что уже сохранено (или
+// инструкцию, если ничего нет); "/natal reset" стирает сохранённые данные;
+// "/natal ДД.ММ.ГГГГ[ ЧЧ:ММ] Город" сохраняет/перезаписывает дату рождения.
+bot.command("natal", async (ctx) => {
+  const userId = ctx.from.id;
+  const args = (ctx.match || "").trim();
+
+  if (!args) {
+    const saved = await getNatalProfile(userId);
+    if (!saved) {
+      await ctx.reply(
+        "натальную карту ещё не сохранял. Пришли дату рождения командой:\n" +
+          "/natal ДД.ММ.ГГГГ ЧЧ:ММ Город\n" +
+          "Например: /natal 15.03.1995 14:30 Киев\n" +
+          "Время можно не указывать (тогда без домов/Асцендента):\n" +
+          "/natal 15.03.1995 Киев"
+      );
+      return;
+    }
+    const label = formatSavedProfileLabel(saved, saved.locationLabel);
+    await ctx.reply(
+      `сейчас сохранено: ${label}\n` +
+        "Чтобы поменять — просто пришли /natal с новыми данными ещё раз.\n" +
+        "Чтобы стереть — /natal reset"
+    );
+    return;
+  }
+
+  if (/^reset$/i.test(args)) {
+    await deleteNatalProfile(userId);
+    await ctx.reply("стёр сохранённую дату рождения");
+    return;
+  }
+
+  const parsed = parseBirthDateArgs(args);
+  if (!parsed) {
+    await ctx.reply(
+      "не смог разобрать. Формат: /natal ДД.ММ.ГГГГ ЧЧ:ММ Город " +
+        "(например /natal 15.03.1995 14:30 Киев) — время можно опустить, " +
+        "если точно неизвестно"
+    );
+    return;
+  }
+
+  sendTypingAction(ctx);
+  const place = await geocodeCity(parsed.cityRaw);
+  if (!place) {
+    await ctx.reply(`не нашёл такой город — "${parsed.cityRaw}". Проверь название и попробуй ещё раз`);
+    return;
+  }
+
+  const profile = {
+    day: parsed.day,
+    month: parsed.month,
+    year: parsed.year,
+    hour: parsed.hour,
+    minute: parsed.minute,
+    hasTime: parsed.hasTime,
+    latitude: place.latitude,
+    longitude: place.longitude,
+    timezone: place.timezone,
+    locationLabel: locationLabel(place),
+  };
+  await saveNatalProfile(userId, profile);
+
+  const timeNote = parsed.hasTime
+    ? ""
+    : "\n(время не указано — Асцендент, MC и дома считать не буду, только знаки планет)";
+  await ctx.reply(
+    `сохранил: ${formatSavedProfileLabel(profile, profile.locationLabel)}${timeNote}\n` +
+      "Теперь можно спросить: \"гороскоп\", \"гороскоп на завтра\", " +
+      "\"гороскоп на неделю\", \"гороскоп на жизнь\", \"натальная карта\" " +
+      "или \"мои аспекты\""
+  );
+});
+
+// Общий обработчик всех видов запроса гороскопа (см. parseHoroscopeQueryIntent
+// в natal.js) — если данных рождения ещё нет, вместо ошибки честно
+// подсказывает команду /natal, а не пытается что-то угадать или отправить
+// запрос в обычный чат с LLM (та же философия, что у ГЖЁСТКОГО ПРАВИЛА про
+// погоду в skills.js: без реальных данных модель ничего не придумывает).
+async function handleHoroscopeQuery(ctx, intent) {
+  const userId = ctx.from.id;
+  const chatId = ctx.chat.id;
+  const saved = await getNatalProfile(userId);
+  if (!saved) {
+    await ctx.reply(
+      "у меня ещё нет твоей даты рождения. Пришли:\n" +
+        "/natal ДД.ММ.ГГГГ ЧЧ:ММ Город\n" +
+        "Например: /natal 15.03.1995 14:30 Киев — и тогда спрашивай гороскоп"
+    );
+    return;
+  }
+
+  sendTypingAction(ctx);
+  try {
+    const natal = computeNatalProfile(saved);
+    let dataBlock, taskType;
+    if (intent.type === "chart") {
+      dataBlock = buildChartContext(natal);
+      taskType = "chart";
+    } else if (intent.type === "aspects") {
+      dataBlock = buildAspectsOnlyContext(natal);
+      taskType = "aspects";
+    } else if (intent.period === "tomorrow") {
+      dataBlock = buildDayHoroscopeContext(natal, 1);
+      taskType = "tomorrow";
+    } else if (intent.period === "week") {
+      dataBlock = buildWeekHoroscopeContext(natal);
+      taskType = "week";
+    } else if (intent.period === "life") {
+      dataBlock = buildLifeContext(natal);
+      taskType = "life";
+    } else {
+      dataBlock = buildDayHoroscopeContext(natal, 0);
+      taskType = "today";
+    }
+
+    const reply = await askAstroLLM(taskType, dataBlock);
+    await ctx.reply(reply);
+
+    // Кладём в историю чата в упрощённом виде (не сырые данные карты) —
+    // чтобы если человек тут же спросит "а почему так?", у бота был
+    // контекст, что речь про только что данный гороскоп/разбор характера.
+    pushHistory(chatId, "user", `[запрос: ${JSON.stringify(intent)}]`);
+    pushHistory(chatId, "assistant", reply);
+  } catch (err) {
+    console.error("Ошибка гороскопа:", err.status ?? "-", err.body ?? err.message);
+    await ctx.reply("не получилось составить гороскоп — все модели сейчас недоступны, попробуй чуть позже");
+  }
+}
+
 // ==== Поиск фильмов/сериалов/мультфильмов (TMDB) ====
 // Триггер — слово из MOVIE_TRIGGER_WORDS В САМОМ НАЧАЛЕ сообщения (после
 // вырезанного обращения к боту), например "фильм <название>[ год]". Это
@@ -5372,6 +5662,25 @@ async function searchWeb(query) {
 // Молчим полностью при любой ошибке — это фон, отдельно ловим и логируем
 // в консоль на вызывающей стороне (см. bot.on ниже), в чат ничего не
 // падает.
+//
+// ВАЖНО: гоняем через Whisper тут ТОЛЬКО голосовые/OGG-подобное аудио, а не
+// вообще любой присланный звук. voice (ctx.message.voice) — это всегда OGG/
+// Opus, реальная речь. audio (ctx.message.audio) — это чаще всего музыка
+// (mp3/flac/wav/m4a и т.п.), которую кто-то скинул как трек: гонять её
+// через речевое распознавание для сводки чата бессмысленно (текст песни
+// никому не нужен в "что я пропустил") и просто тратит лимит Whisper
+// впустую на каждый шаренный трек. Если кому-то реально нужен текст
+// песни — есть отдельный явный путь (реплай "о чём песня"/"текст" на
+// трек, см. комментарий выше про реактивный блок) — там transcribeVoice
+// вызывается намеренно и по запросу, эта функция его не трогает.
+const VOICE_LIKE_AUDIO_EXT_REGEX = /\.(ogg|oga|opus)$/i;
+function isVoiceLikeAudio(mediaObj, kind) {
+  if (kind === "voice") return true; // Telegram voice — всегда OGG/Opus, других вариантов не бывает
+  const mime = (mediaObj.mime_type || "").toLowerCase();
+  if (mime.includes("ogg") || mime.includes("opus")) return true;
+  return VOICE_LIKE_AUDIO_EXT_REGEX.test(mediaObj.file_name || "");
+}
+
 async function backgroundTranscribeVoiceForRecap(ctx) {
   const chatId = ctx.chat.id;
   const mediaObj = ctx.message.voice || ctx.message.audio;
@@ -5390,8 +5699,13 @@ async function backgroundTranscribeVoiceForRecap(ctx) {
       ? ` (${[mediaObj.performer, mediaObj.title].filter(Boolean).join(" — ")})`
       : "";
 
+  const isMusic = !isVoiceLikeAudio(mediaObj, kind);
+
   let text = null;
-  if (mediaObj.file_size && mediaObj.file_size > MAX_TRANSCRIBE_FILE_SIZE) {
+  if (isMusic) {
+    // Музыкальный трек — сознательно не расшифровываем в фоне (см.
+    // комментарий выше), просто зафиксируем сам факт в логе ниже.
+  } else if (mediaObj.file_size && mediaObj.file_size > MAX_TRANSCRIBE_FILE_SIZE) {
     // Файл крупнее 20MB Bot API всё равно не отдаст (см. tooLarge в
     // реактивном блоке) — даже не пытаемся скачивать.
   } else {
@@ -5415,7 +5729,9 @@ async function backgroundTranscribeVoiceForRecap(ctx) {
 
   const logLine = text
     ? `[${label}${trackMeta}${durationPart}]: ${text}`
-    : `[${label}${trackMeta}${durationPart} — текст не распознан]`;
+    : isMusic
+      ? `[${label}${trackMeta}${durationPart} — музыкальный трек, распознавание речи не запускали]`
+      : `[${label}${trackMeta}${durationPart} — текст не распознан]`;
   // toBot=false — сам факт присылки голосового не значит, что обратились к
   // боту (в отличие от caption у фото, тут никакого текста-обращения нет).
   pushChatLog(chatId, displayName, logLine, false);
@@ -7106,6 +7422,16 @@ bot.on("message:text", async (ctx) => {
   const movieIntent = parseMovieIntent(stripBotAddressing(rawText, ctx));
   if (movieIntent) {
     await handleMovieQuery(ctx, movieIntent);
+    return;
+  }
+
+  // ==== Гороскоп / натальная карта ("гороскоп на завтра", "натальная
+  // карта", "мои аспекты") ====
+  // Тоже до шахмат/обычного чата, той же причины ради — иначе "гороскоп"
+  // рискует улететь в LLM как обычный текст вместо реального расчёта.
+  const horoscopeIntent = parseHoroscopeQueryIntent(stripBotAddressing(rawText, ctx));
+  if (horoscopeIntent) {
+    await handleHoroscopeQuery(ctx, horoscopeIntent);
     return;
   }
 
