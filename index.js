@@ -110,6 +110,18 @@ const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
 // студийная транскрипция). Список актуальных моделей — console.groq.com/docs/speech-to-text.
 const GROQ_WHISPER_MODEL = process.env.GROQ_WHISPER_MODEL || "whisper-large-v3-turbo";
 
+// Отдельная модель для поиска в интернете (см. блок "Поиск в интернете" и
+// searchWeb ниже) — Groq Compound, система со встроенным веб-поиском
+// (Tavily) поверх открытых моделей (GPT-OSS 120B/Llama 4/Llama 3.3), а не
+// обычная модель для болтовни. "-mini" — вариант с одним вызовом тула за
+// запрос (нам больше и не нужно, это разовое "найди X", не агентная цепочка
+// из нескольких поисков подряд) и в среднем втрое быстрее полного
+// groq/compound. Дёргаем отдельным точечным вызовом, в обход
+// GROQ_MODELS/общего TARGETS-фолбэка — Compound не модель общего чата, а
+// система с побочным эффектом (реальный HTTP-запрос наружу через Tavily),
+// смешивать её с обычной ротацией моделей странно.
+const GROQ_SEARCH_MODEL = process.env.GROQ_SEARCH_MODEL || "groq/compound-mini";
+
 const GEMINI_MODELS = (process.env.GEMINI_MODEL || "gemini-flash-latest,gemini-3.5-flash")
   .split(",")
   .map((m) => m.trim())
@@ -5239,6 +5251,32 @@ function formatVoiceDuration(sec) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+// ==== Поиск в интернете по явной просьбе ("Жень поищи в интернете X",
+// "Жень глянь в интернете", "Жень поищи в нете инфу", "Жень загугли X" и
+// т.п.) ====
+// Два случая:
+// 1) "загугли"/"погугли"/"нагугли" — сами по себе однозначно означают
+//    поиск, место упоминать не нужно.
+// 2) Более общие глаголы ("поищи"/"глянь"/"посмотри"/"проверь"/"найди")
+//    слишком расплывчаты сами по себе (пересекаются с другими интентами —
+//    "найди трек", "глянь карточку" и т.п.), поэтому для них ОБЯЗАТЕЛЬНО
+//    требуем ещё и явное упоминание места поиска ("в интернете"/"в нете"/
+//    "в сети"/"в гугле"/просто "гугл").
+// ВАЖНО: без \b — в JS-регэкспах \b распознаёт границы слов только по
+// ASCII-буквам, а не по кириллице (тот же нюанс уже обойдён выше в файле
+// через lookahead, см. WEATHER_WORD_REGEX) — \b перед кириллической "в"
+// после пробела тут в принципе не сработал бы. Вместо границ слов просто
+// матчим корень как подстроку — коллизии в реальных фразах маловероятны.
+const SEARCH_STANDALONE_VERB_REGEX = /(?:за|по|на)гугл(?:и|ишь|ить)?/i;
+const SEARCH_GENERIC_VERB_REGEX = /(?:по|на)?ищ[иь]|глянь|посмотри|проверь|найд[иь]/i;
+const SEARCH_LOCATION_REGEX = /в\s+(?:интернет|нет[еи]|сет[ьи])|гугл/i;
+
+function hasSearchIntent(text) {
+  if (!text) return false;
+  if (SEARCH_STANDALONE_VERB_REGEX.test(text)) return true;
+  return SEARCH_GENERIC_VERB_REGEX.test(text) && SEARCH_LOCATION_REGEX.test(text);
+}
+
 // Отдельный точечный вызов vision-модели — в обход askLLM/TARGETS-фолбэка:
 // тут только одна конкретная модель (GROQ_VISION_MODEL), без перебора
 // провайдеров, потому что это узкоспециальная задача, а не общий чат.
@@ -5263,6 +5301,39 @@ async function captionPhoto(ctx, fileId) {
   ];
   const { reply } = await callTarget(visionTarget, messages);
   return extractPhotoReaction(reply);
+}
+
+// ==== Поиск в интернете (Groq Compound) ====
+// Разделение по задачам, как просили: Compound сам решает, гуглить ли,
+// реально ходит в интернет и возвращает сырой фактический конспект — НЕ
+// финальный ответ в персоне Жени. Этот конспект дальше подмешивается
+// тегом в userText (см. SEARCH_INTENT_REGEX/hasSearchIntent и место
+// вызова в bot.on("message:text")) и уходит в обычный askLLM/TARGETS —
+// то есть уже сам финальный ответ с сарказмом и с учётом истории
+// переписки формулирует Gemini (или следующий по фолбэку), как обычно.
+// Compound тут только "гуглит", не "разговаривает" — поэтому и системный
+// промпт ниже намеренно сухой и фактический, а не в характере бота.
+async function searchWeb(query) {
+  const searchTarget = {
+    provider: "groq",
+    model: GROQ_SEARCH_MODEL,
+    baseUrl: PROVIDER_CONFIGS.groq.baseUrl,
+    apiKey: GROQ_API_KEYS[0],
+  };
+  const messages = [
+    {
+      role: "system",
+      content:
+        "Ты — инструмент веб-поиска. По запросу пользователя найди актуальную " +
+        "информацию через поиск в интернете и изложи её кратким фактическим " +
+        "конспектом на русском: конкретика (даты, цифры, названия), без " +
+        "вступлений и без собственных оценок. Если источники противоречат " +
+        "друг другу — отметь это прямо в тексте.",
+    },
+    { role: "user", content: query },
+  ];
+  const { reply } = await callTarget(searchTarget, messages);
+  return reply;
 }
 
 // ==== Фоновая расшифровка голосовых/аудио для сводки чата ====
@@ -6821,6 +6892,26 @@ bot.on("message:text", async (ctx) => {
       if (movieCard.genres) parts.push(`жанры: ${movieCard.genres}`);
       if (movieCard.summary) parts.push(`описание: ${movieCard.summary}`);
       userText = `[бот ранее прислал карточку — ${parts.join(", ")}] ${userText}`;
+
+      // Реплаем на карточку ещё и явно попросили что-то поискать в
+      // интернете ("Жень поищи когда сиквел") — гоняем отдельный запрос
+      // через Compound с контекстом фильма, чтобы поиск был предметным
+      // (без названия фильма в запросе "когда сиквел" ушло бы в пустоту).
+      if (hasSearchIntent(rawText)) {
+        sendTypingAction(ctx);
+        const movieContext = `${movieCard.kindLabel} «${movieCard.title}»${movieCard.year ? ` (${movieCard.year})` : ""}`;
+        try {
+          const found = await searchWeb(`${movieContext}. Запрос: ${strippedQuestion}`);
+          userText = `[результаты веб-поиска про ${movieContext} по запросу «${strippedQuestion}»: ${found}] ${userText}`;
+        } catch (err) {
+          console.error(
+            `Ошибка веб-поиска (карточка фильма) в чате ${chatId}:`,
+            err.status ?? "-",
+            err.body ?? err.message
+          );
+          userText = `[попытка веб-поиска про ${movieContext} не удалась технически — если знаешь ответ по своим знаниям, отвечай сам, иначе честно скажи, что не смог погуглить] ${userText}`;
+        }
+      }
     } else if (repliedToBotMsg.audio || getVoiceTranscript(chatId, repliedToBotMsg.message_id)) {
       // ==== Реплай на трек (Deezer) или на присланный ботом дословный
       // текст песни ====
@@ -6945,6 +7036,28 @@ bot.on("message:text", async (ctx) => {
     sendTypingAction(ctx);
     await ctx.reply(await getJoke(chatId), { reply_parameters: { message_id: ctx.message.message_id } });
     return;
+  }
+
+  // ==== Поиск в интернете по явной просьбе ====
+  // В отличие от погоды/фильмов ниже — НЕ возвращаемся сразу. Результат
+  // поиска подмешивается тегом в userText (тот же приём, что и у
+  // repliedTag/movieCard выше) и уходит дальше по обычному пути в
+  // askLLM в конце обработчика — так ответ идёт в персоне Жени, с учётом
+  // истории переписки, а не отдельным сухим блоком фактов от Compound.
+  // Дошли сюда — сообщение уже точно адресовано боту (см. isAddressedToBot
+  // внутри if (isGroup) выше; в личке — адресовано по умолчанию).
+  {
+    const searchQuery = stripBotAddressing(rawText, ctx);
+    if (hasSearchIntent(searchQuery)) {
+      sendTypingAction(ctx);
+      try {
+        const found = await searchWeb(searchQuery);
+        userText = `[результаты веб-поиска по запросу «${searchQuery}»: ${found}] ${userText}`;
+      } catch (err) {
+        console.error("Ошибка веб-поиска:", err.status ?? "-", err.body ?? err.message);
+        userText = `[попытка веб-поиска по запросу «${searchQuery}» не удалась технически — если знаешь ответ по своим знаниям, отвечай сам, иначе честно скажи, что не смог погуглить] ${userText}`;
+      }
+    }
   }
 
   // ==== Погода ====
