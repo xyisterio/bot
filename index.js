@@ -4787,17 +4787,20 @@ async function askTarotLLM(spreadType, dataBlock, timeoutMs = REQUEST_TIMEOUT_MS
 }
 
 // "/tarot" — без аргументов делает расклад на три карты; "/tarot день" —
-// карта дня; "/tarot <вопрос>" — расклад с учётом вопроса (см. runTarotSpread
-// ниже — та же логика выбора расклада, что и у parseTarotQueryIntent в
-// tarot.js, продублирована тут явно для команды, а не через обычный текст).
+// карта дня; "/tarot кельтский крест[ <вопрос>]" — Кельтский крест, с
+// опциональным вопросом после него; "/tarot <вопрос>" — расклад на три
+// карты с учётом вопроса (см. runTarotSpread ниже — та же логика выбора
+// расклада, что и у parseTarotQueryIntent в tarot.js, продублирована тут
+// явно для команды, а не через обычный текст).
 bot.command("tarot", async (ctx) => {
   const args = (ctx.match || "").trim();
   if (/^день$/i.test(args)) {
     await runTarotSpread(ctx, "day", null);
     return;
   }
-  if (/^кельтский\s+крест$/i.test(args)) {
-    await runTarotSpread(ctx, "celtic", null);
+  const celticMatch = /^кельтский\s+крест(?:\s+([\s\S]+))?$/i.exec(args);
+  if (celticMatch) {
+    await runTarotSpread(ctx, "celtic", celticMatch[1]?.trim() || null);
     return;
   }
   const spreadType = args ? "situation" : "three";
