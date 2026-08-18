@@ -3,6 +3,7 @@ import express from "express";
 import { Redis } from "@upstash/redis";
 import { Chess } from "chess.js";
 import crypto from "node:crypto";
+import path from "node:path";
 import { Client as GradioClient, handle_file } from "@gradio/client";
 import { BOT_SKILLS_PROMPT } from "./skills.js";
 import {
@@ -18,6 +19,15 @@ import {
   formatSavedProfileLabel,
   formatHoroscopeDateLabel,
 } from "./natal.js";
+import {
+  drawCards,
+  drawDailyCard,
+  buildTarotContext,
+  parseTarotQueryIntent,
+  cardImageFileName,
+  SPREADS,
+  SPREAD_LABEL_RU,
+} from "./tarot.js";
 
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -4700,6 +4710,141 @@ async function handleHoroscopeQuery(ctx, intent) {
   }
 }
 
+// ==== Таро ====
+//
+// Сами данные (колода, значения карт, тасовка, расклады, форматирование
+// в текст) — в tarot.js, тут только: инструкция для LLM под каждый тип
+// расклада, вызов модели поверх готового текстового блока и сама команда/
+// роутинг из обычного текста — та же структура, что и у натальной карты
+// выше (askAstroLLM/handleHoroscopeQuery), просто без Redis-профиля: для
+// Таро не нужно ничего сохранять между сообщениями (кроме детерминизма
+// "карты дня" — она уже сама зашита внутри drawDailyCard в tarot.js).
+const TAROT_TASK_INSTRUCTIONS = {
+  day:
+    "Ниже — одна карта Таро, вытянутая случайно (не выдумка), с её " +
+    "реальным значением. Опиши, что эта карта говорит на сегодня, " +
+    "2-4 предложения, живым языком, опираясь СТРОГО на значение ниже. " +
+    "Не добавляй других карт и не выдумывай деталей сверх значения.",
+  yesno:
+    "Ниже — одна карта Таро как ответ на вопрос человека. Дай короткий " +
+    "ответ в духе да/нет/скорее да/скорее нет, опираясь на то, прямая " +
+    "карта или перевёрнутая и что она значит (перевёрнутая обычно ближе " +
+    "к \"нет\"/затруднению, прямая — к \"да\"/благоприятному ходу), " +
+    "2-3 предложения, без выдуманных деталей сверх значения ниже.",
+  three:
+    "Ниже — расклад из трёх карт Таро (реально вытянутых, не выдуманных) " +
+    "по трём позициям. Опиши связный расклад 4-6 предложений: что " +
+    "каждая позиция говорит и как они складываются в общую картину. " +
+    "Явно упомяни все три карты по именам. Не добавляй карт или " +
+    "деталей сверх данных ниже.",
+  situation:
+    "Ниже — расклад из трёх карт Таро на конкретный вопрос человека " +
+    "(ситуация / действие / вероятный итог). Опиши связно, 4-6 " +
+    "предложений, явно упомянув все три карты. Не выдумывай ничего " +
+    "сверх значений ниже, и не изображай расклад как гарантию исхода — " +
+    "Таро про тенденции, а не про точный факт будущего.",
+  celtic:
+    "Ниже — расклад Таро \"Кельтский крест\" из 10 карт (реально " +
+    "вытянутых, не выдуманных) с подписанными позициями. Это самый " +
+    "подробный из раскладов, так что дай развёрнутый ответ, 8-12 " +
+    "предложений: сначала суть ситуации (первые карты), затем внешние " +
+    "влияния и внутреннее состояние человека, и в конце — к чему всё " +
+    "идёт (последняя карта). Явно упомяни имена всех 10 карт хотя бы по " +
+    "разу. Не добавляй карт или деталей сверх данных ниже, и не " +
+    "изображай итог как гарантированный факт — Таро про тенденции.",
+};
+
+// Та же логика, что и у ASTRO_TEMPERATURE — реальным вытянутым картам
+// нужна устойчивость к конкретике, а не разговорная живость 0.9 по
+// умолчанию у обычного чата Жени.
+const TAROT_TEMPERATURE = 0.5;
+
+async function askTarotLLM(spreadType, dataBlock, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const instruction = TAROT_TASK_INSTRUCTIONS[spreadType];
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: `${instruction}\n\n${dataBlock}` },
+  ];
+
+  let lastErr;
+  const order = computeTargetOrder();
+  for (const idx of order) {
+    const target = TARGETS[idx];
+    try {
+      const { reply } = await callTarget(target, messages, timeoutMs, TAROT_TEMPERATURE);
+      cooldownUntil[idx] = 0;
+      return reply;
+    } catch (err) {
+      lastErr = err;
+      console.error(`Таро: ошибка [${targetLabel(target)}]:`, err.status ?? "-", err.body ?? err.message);
+      if (err.status && !isFallbackWorthy(err.status)) break;
+      cooldownUntil[idx] = Date.now() + MODEL_COOLDOWN_MS;
+    }
+  }
+  throw lastErr ?? new Error("Все провайдеры и модели недоступны");
+}
+
+// "/tarot" — без аргументов делает расклад на три карты; "/tarot день" —
+// карта дня; "/tarot <вопрос>" — расклад с учётом вопроса (см. runTarotSpread
+// ниже — та же логика выбора расклада, что и у parseTarotQueryIntent в
+// tarot.js, продублирована тут явно для команды, а не через обычный текст).
+bot.command("tarot", async (ctx) => {
+  const args = (ctx.match || "").trim();
+  if (/^день$/i.test(args)) {
+    await runTarotSpread(ctx, "day", null);
+    return;
+  }
+  if (/^кельтский\s+крест$/i.test(args)) {
+    await runTarotSpread(ctx, "celtic", null);
+    return;
+  }
+  const spreadType = args ? "situation" : "three";
+  await runTarotSpread(ctx, spreadType, args || null);
+});
+
+// Общий обработчик и для команды /tarot, и для обычного текстового
+// триггера (см. parseTarotQueryIntent в конце основного text-хендлера
+// ниже). Сначала шлём картинки вытянутых карт (если ассеты есть в
+// проекте — assets/tarot/, см. tarot.js:cardImageFileName), потом текст
+// расклада отдельным сообщением-реплаем.
+async function runTarotSpread(ctx, spreadType, question) {
+  sendTypingAction(ctx);
+  try {
+    const spread = SPREADS[spreadType];
+    const drawn =
+      spreadType === "day"
+        ? [drawDailyCard(ctx.from.id, undefined)]
+        : drawCards(spread.count);
+
+    const dataBlock = buildTarotContext(spreadType, drawn, question);
+    const reply = await askTarotLLM(spreadType, dataBlock);
+
+    for (const { card } of drawn) {
+      const filePath = path.join(process.cwd(), "assets", "tarot", cardImageFileName(card));
+      try {
+        await ctx.replyWithPhoto(new InputFile(filePath));
+      } catch (err) {
+        // Не фатально — просто нет ассетов в проекте (см. README про
+        // assets/tarot/), едем дальше без картинки этой карты.
+        console.error("Таро: не смог отправить картинку карты:", filePath, err.message);
+      }
+    }
+
+    const displayName = getDisplayName(ctx.chat.id, ctx.from);
+    const label = SPREAD_LABEL_RU[spreadType] || "расклад Таро";
+    const header = `${label[0].toUpperCase()}${label.slice(1)}, для ${displayName}:`;
+    await ctx.reply(`${header}\n\n${reply}`, {
+      reply_parameters: { message_id: ctx.message.message_id },
+    });
+
+    pushHistory(ctx.chat.id, "user", `[запрос Таро: ${spreadType}${question ? ", вопрос: " + question : ""}]`);
+    pushHistory(ctx.chat.id, "assistant", reply);
+  } catch (err) {
+    console.error("Ошибка расклада Таро:", err.status ?? "-", err.body ?? err.message);
+    await ctx.reply("не получилось разложить карты — все модели сейчас недоступны, попробуй чуть позже");
+  }
+}
+
 // ==== Поиск фильмов/сериалов/мультфильмов (TMDB) ====
 // Триггер — слово из MOVIE_TRIGGER_WORDS В САМОМ НАЧАЛЕ сообщения (после
 // вырезанного обращения к боту), например "фильм <название>[ год]". Это
@@ -7540,6 +7685,17 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
+  // ==== Таро ("карта дня", "таро", "расклад таро", "три карты",
+  // "кельтский крест") ====
+  // Та же логика, что и у гороскопа выше — до шахмат/обычного чата, иначе
+  // "таро"/"карта дня" рискует улететь в LLM как обычный текст вместо
+  // реального (случайного) расклада.
+  const tarotIntent = parseTarotQueryIntent(stripBotAddressing(rawText, ctx));
+  if (tarotIntent) {
+    await runTarotSpread(ctx, tarotIntent.spreadType, tarotIntent.question);
+    return;
+  }
+
   // ==== Пересказ чата ("Женя, о чём тут речь? 100") ====
   // Только в группах — лог (ChatLog) заполняется исключительно там, в
   // личке пересказывать нечего (там и так вся история — это диалог с
@@ -8062,6 +8218,8 @@ async function registerCommands() {
     { command: "model", description: "выбрать модель / посмотреть текущую" },
     { command: "krokodil", description: "сыграть в крокодил (объясни слово)" },
     { command: "krokodil_reset", description: "сбросить зависший раунд крокодила" },
+    { command: "natal", description: "сохранить дату рождения / посмотреть натальную карту" },
+    { command: "tarot", description: "расклад Таро (день / три карты / вопрос / кельтский крест)" },
   ]);
   console.log("Команды зарегистрированы в Telegram");
 }
