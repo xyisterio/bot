@@ -28,6 +28,7 @@ import {
   SPREADS,
   SPREAD_LABEL_RU,
 } from "./tarot.js";
+import { buildSpreadCollage } from "./tarotImage.js";
 
 // ==== Конфиг из переменных окружения ====
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -4745,13 +4746,14 @@ const TAROT_TASK_INSTRUCTIONS = {
     "Таро про тенденции, а не про точный факт будущего.",
   celtic:
     "Ниже — расклад Таро \"Кельтский крест\" из 10 карт (реально " +
-    "вытянутых, не выдуманных) с подписанными позициями. Это самый " +
-    "подробный из раскладов, так что дай развёрнутый ответ, 8-12 " +
-    "предложений: сначала суть ситуации (первые карты), затем внешние " +
-    "влияния и внутреннее состояние человека, и в конце — к чему всё " +
-    "идёт (последняя карта). Явно упомяни имена всех 10 карт хотя бы по " +
-    "разу. Не добавляй карт или деталей сверх данных ниже, и не " +
-    "изображай итог как гарантированный факт — Таро про тенденции.",
+    "вытянутых, не выдуманных) с подписанными позициями. Дай ёмкий, но " +
+    "содержательный ответ, 6-9 предложений (не длиннее — ответ идёт " +
+    "подписью к фото с ограничением по длине): сначала суть ситуации " +
+    "(первые карты), затем внешние влияния и внутреннее состояние " +
+    "человека, и в конце — к чему всё идёт (последняя карта). Явно " +
+    "упомяни имена всех 10 карт хотя бы по разу, коротко. Не добавляй " +
+    "карт или деталей сверх данных ниже, и не изображай итог как " +
+    "гарантированный факт — Таро про тенденции.",
 };
 
 // Та же логика, что и у ASTRO_TEMPERATURE — реальным вытянутым картам
@@ -4804,9 +4806,40 @@ bot.command("tarot", async (ctx) => {
 
 // Общий обработчик и для команды /tarot, и для обычного текстового
 // триггера (см. parseTarotQueryIntent в конце основного text-хендлера
-// ниже). Сначала шлём картинки вытянутых карт (если ассеты есть в
-// проекте — assets/tarot/, см. tarot.js:cardImageFileName), потом текст
-// расклада отдельным сообщением-реплаем.
+// ниже). Собирает один коллаж со всеми вытянутыми картами (см.
+// tarotImage.js:buildSpreadCollage — перевёрнутые карты показаны
+// перевёрнутыми, у каждой карты подписана её позиция в раскладе) и шлёт
+// его ОДНИМ сообщением, с текстом расклада подписью к фото — раньше это
+// были две карточки: сначала картинки карт по одной, потом текст
+// отдельным сообщением-реплаем.
+//
+// Ограничение Telegram: подпись к фото не может быть длиннее 1024
+// символов. Для длинных раскладов (особенно "Кельтский крест", где нужно
+// упомянуть все 10 карт) собранный текст иногда в это не влезает — в
+// этом случае обрезаем по границе предложения и добавляем "…" (см.
+// truncateForCaption ниже), а не молча падаем или разбиваем на два
+// сообщения — так расклад всё равно приходит одним сообщением.
+const TAROT_CAPTION_LIMIT = 1024;
+
+function truncateForCaption(text, limit) {
+  if (text.length <= limit) return text;
+  const slice = text.slice(0, limit - 1);
+  const lastEnd = Math.max(
+    slice.lastIndexOf(". "),
+    slice.lastIndexOf("! "),
+    slice.lastIndexOf("? "),
+    slice.lastIndexOf(".\n")
+  );
+  let cut;
+  if (lastEnd > limit * 0.6) {
+    cut = slice.slice(0, lastEnd + 1);
+  } else {
+    const lastSpace = slice.lastIndexOf(" ");
+    cut = slice.slice(0, lastSpace > 0 ? lastSpace : slice.length);
+  }
+  return `${cut.trimEnd()}…`;
+}
+
 async function runTarotSpread(ctx, spreadType, question) {
   sendTypingAction(ctx);
   try {
@@ -4819,23 +4852,48 @@ async function runTarotSpread(ctx, spreadType, question) {
     const dataBlock = buildTarotContext(spreadType, drawn, question);
     const reply = await askTarotLLM(spreadType, dataBlock);
 
-    for (const { card } of drawn) {
-      const filePath = path.join(process.cwd(), "assets", "tarot", cardImageFileName(card));
-      try {
-        await ctx.replyWithPhoto(new InputFile(filePath));
-      } catch (err) {
-        // Не фатально — просто нет ассетов в проекте (см. README про
-        // assets/tarot/), едем дальше без картинки этой карты.
-        console.error("Таро: не смог отправить картинку карты:", filePath, err.message);
-      }
-    }
-
     const displayName = getDisplayName(ctx.chat.id, ctx.from);
     const label = SPREAD_LABEL_RU[spreadType] || "расклад Таро";
     const header = `${label[0].toUpperCase()}${label.slice(1)}, для ${displayName}:`;
-    await ctx.reply(`${header}\n\n${reply}`, {
-      reply_parameters: { message_id: ctx.message.message_id },
-    });
+    // Названия карт на русском явно в тексте сообщения (не только на
+    // картинке) — без пометки карта прямая, "(перевёрнутая)" только у тех,
+    // что выпали перевёрнутыми (тот же принцип, что и в подписи на
+    // коллаже — см. tarotImage.js:labelBuffer).
+    const cardsLine = drawn
+      .map(({ card, reversed }) => `«${card.nameRu}»${reversed ? " (перевёрнутая)" : ""}`)
+      .join(", ");
+    const cardsWord = drawn.length > 1 ? "Карты" : "Карта";
+    const fullText = `${header}\n${cardsWord}: ${cardsLine}\n\n${reply}`;
+
+    let collage;
+    try {
+      collage = await buildSpreadCollage(spreadType, drawn, spread.positions);
+    } catch (err) {
+      console.error("Таро: не смог собрать коллаж расклада:", err.message);
+      collage = null;
+    }
+
+    if (collage) {
+      const caption = truncateForCaption(fullText, TAROT_CAPTION_LIMIT);
+      await ctx.replyWithPhoto(new InputFile(collage, "tarot.png"), {
+        caption,
+        reply_parameters: { message_id: ctx.message.message_id },
+      });
+    } else {
+      // Фолбэк на случай, если коллаж почему-то не собрался (например,
+      // проблема с sharp на конкретном деплое) — старое поведение: карты
+      // по одной картинкой, затем текст отдельным сообщением. Лучше так,
+      // чем упасть в ошибку и не ответить вовсе.
+      for (const { card } of drawn) {
+        const filePath = path.join(process.cwd(), "assets", "tarot", cardImageFileName(card));
+        try {
+          await ctx.replyWithPhoto(new InputFile(filePath));
+        } catch (err) {
+          console.error("Таро: не смог отправить картинку карты:", filePath, err.message);
+        }
+      }
+      await ctx.reply(fullText, { reply_parameters: { message_id: ctx.message.message_id } });
+    }
 
     pushHistory(ctx.chat.id, "user", `[запрос Таро: ${spreadType}${question ? ", вопрос: " + question : ""}]`);
     pushHistory(ctx.chat.id, "assistant", reply);
