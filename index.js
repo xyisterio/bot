@@ -4673,8 +4673,14 @@ async function handleHoroscopeQuery(ctx, intent) {
     // (см. formatHoroscopeDateLabel в natal.js). Плюс reply_parameters —
     // физический реплай на сообщение человека, а не просто сообщение
     // "в пустоту" рядом.
+    // Для "chart" берём подпись из самого intent (chartLabel) — "натальная
+    // карта" и "характер" считаются идентично (один и тот же
+    // buildChartContext), но заголовок должен отвечать тем же словом,
+    // каким спросил человек, а не всегда "натальная карта".
     const displayName = getDisplayName(chatId, ctx.from);
-    const dateLabel = formatHoroscopeDateLabel(natal, taskType, theme, years);
+    const dateLabel = intent.type === "chart"
+      ? (intent.chartLabel || "натальная карта")
+      : formatHoroscopeDateLabel(natal, taskType, theme, years);
     const header = `${dateLabel[0].toUpperCase()}${dateLabel.slice(1)}, для ${displayName}:`;
     await ctx.reply(`${header}\n\n${reply}`, {
       reply_parameters: { message_id: ctx.message.message_id },
