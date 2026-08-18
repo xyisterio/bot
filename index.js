@@ -13,6 +13,7 @@ import {
   buildAspectsOnlyContext,
   buildDayHoroscopeContext,
   buildWeekHoroscopeContext,
+  buildYearsHoroscopeContext,
   buildLifeContext,
   formatSavedProfileLabel,
   formatHoroscopeDateLabel,
@@ -2743,11 +2744,11 @@ function looksLikeReasoningLeak(text) {
   return yesNoCount >= 2;
 }
 
-async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS) {
+async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS, temperature = 0.9) {
   const body = {
     model: target.model,
     messages,
-    temperature: 0.9,
+    temperature,
     // gemini-2.5-flash (единственная линейка, где Google даёт thinking_budget=0
     // по-настоящему) снята с доступа — остался gemini-flash-latest/3.5-flash,
     // а там размышления нельзя выключить до нуля вообще никакими флагами.
@@ -4386,17 +4387,24 @@ const NATAL_TASK_INSTRUCTIONS = {
     "(положения планет по знакам и домам + натальные аспекты, посчитанные " +
     "по формулам, а не выдуманные). Опираясь СТРОГО на эти данные, опиши " +
     "характер, сильные и слабые стороны человека — живым языком, в своей " +
-    "обычной манере, без списков и заголовков, 4-6 предложений. Не " +
-    "добавляй ни одной планеты, знака, дома или аспекта, которых нет в " +
-    "данных ниже. Орб в градусах — техническая величина для тебя самой, " +
-    "не зачитывай её пользователю дословно, вместо этого словами передай " +
-    "силу аспекта (точно проявлен / фоново ощущается и т.п.), если вообще " +
-    "об этом упоминаешь.",
+    "обычной манере, без списков и заголовков, 4-6 предложений. Явно " +
+    "назови по имени хотя бы 3-4 конкретные планеты/знаки/аспекты из " +
+    "данных ниже, на которые опирается разбор (не обязательно все — но " +
+    "разбор должен быть прямо привязан к конкретике, а не звучать как " +
+    "общий текст под любой гороскоп). Не добавляй ни одной планеты, " +
+    "знака, дома или аспекта, которых нет в данных ниже. Орб в градусах " +
+    "— техническая величина для тебя самой, не зачитывай её пользователю " +
+    "дословно, вместо этого словами передай силу аспекта (точно проявлен " +
+    "/ фоново ощущается и т.п.), если вообще об этом упоминаешь.",
   aspects:
     "Ниже — список натальных аспектов человека (реальный расчёт углов " +
     "между планетами, не выдумка). Объясни своими словами, что эти " +
     "аспекты в целом говорят о человеке — связным текстом, а не построчным " +
-    "разбором каждого аспекта по отдельности, 3-5 предложений. Не " +
+    "разбором каждого аспекта по отдельности, 3-5 предложений. Явно " +
+    "назови по имени хотя бы 3-4 конкретных аспекта из списка ниже (какие " +
+    "именно планеты и какой тип аспекта — соединение/квадрат/трин и т.п.), " +
+    "вплетая их в связный текст — ответ не должен звучать как общее " +
+    "описание характера без привязки к конкретным парам планет. Не " +
     "добавляй никаких аспектов сверх списка ниже и не зачитывай орбы в " +
     "градусах дословно.",
   today:
@@ -4423,7 +4431,38 @@ const NATAL_TASK_INSTRUCTIONS = {
     "конкретные предсказуемые события (даты, имена, точные исходы) — " +
     "натальная карта про склонности и темы, а не про то, что буквально " +
     "случится.",
+  // years — единственная инструкция-функция в этом объекте: текст зависит
+  // от того, сколько именно лет попросили (1-10), поэтому она не строка, а
+  // функция от числа лет (см. askAstroLLM: там же и проверка typeof).
+  years: (n) => {
+    const count = n || 1;
+    const word = yearsWordRuLocal(count);
+    return (
+      `Ниже — реальные транзиты медленных планет (Юпитер, Сатурн, Уран, ` +
+      `Нептун, Плутон) сейчас и через ${count} ${word} — сравнение, куда ` +
+      `эти медленные планеты сдвинутся и с какими натальными точками ` +
+      `образуют аспект. Это НЕ гороскоп на конкретный день: не изображай ` +
+      `точные даты или события — опиши общие долгосрочные тенденции и ` +
+      `периоды на этот срок (где вероятны перемены, рост, испытания, ` +
+      `завершение старого), опираясь только на данные ниже, 4-7 ` +
+      `предложений. Быстрые планеты (Луна, Солнце, Меркурий, Венера, ` +
+      `Марс) в этих данных намеренно не участвуют — за ${count} ${word} ` +
+      `они проходят полный круг много раз, снимок на день тут бы ничего ` +
+      `не значил.`
+    );
+  },
 };
+
+// Небольшой дубль yearsWordRu из natal.js (там она не экспортирована —
+// внутренняя деталь форматирования дат, ничего страшного, что и тут своя
+// копия ради согласованных склонений в тексте промпта).
+function yearsWordRuLocal(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return "год";
+  if (mod10 >= 2 && mod10 <= 4 && !(mod100 >= 12 && mod100 <= 14)) return "года";
+  return "лет";
+}
 
 // Тематический фокус — необязательная добавка ПОВЕРХ инструкции периода
 // выше (см. askAstroLLM: base + focus). Данные остаются те же самые
@@ -4459,13 +4498,23 @@ const THEME_FOCUS_INSTRUCTIONS = {
 // как "userText" было бы нечестно по отношению к будущему контексту
 // диалога. Персонаж (SYSTEM_PROMPT) тот же, чтобы ответ звучал как Женя, а
 // не как безликий астрологический сервис.
-async function askAstroLLM(taskType, dataBlock, theme = null, timeoutMs = REQUEST_TIMEOUT_MS) {
+// Температура здесь ниже, чем дефолтные 0.9 у обычного чата Жени — та
+// живость нужна для болтовни, а не для пересказа реальных вычисленных
+// данных. При 0.9 модель иногда "уплывала" в общее описание характера
+// вместо конкретных аспектов из dataBlock (одна и та же карта — разный
+// по конкретике ответ от раза к разу). 0.5 — заметно устойчивее к теме
+// и деталям, но ещё не сухой машинный список.
+const ASTRO_TEMPERATURE = 0.5;
+
+async function askAstroLLM(taskType, dataBlock, theme = null, years = null, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const rawInstruction = NATAL_TASK_INSTRUCTIONS[taskType];
+  const baseInstruction = typeof rawInstruction === "function" ? rawInstruction(years) : rawInstruction;
   const themeFocus = theme && THEME_FOCUS_INSTRUCTIONS[theme] ? THEME_FOCUS_INSTRUCTIONS[theme] : "";
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
     {
       role: "user",
-      content: `${NATAL_TASK_INSTRUCTIONS[taskType]}${themeFocus}\n\n${dataBlock}`,
+      content: `${baseInstruction}${themeFocus}\n\n${dataBlock}`,
     },
   ];
 
@@ -4474,7 +4523,7 @@ async function askAstroLLM(taskType, dataBlock, theme = null, timeoutMs = REQUES
   for (const idx of order) {
     const target = TARGETS[idx];
     try {
-      const { reply } = await callTarget(target, messages, timeoutMs);
+      const { reply } = await callTarget(target, messages, timeoutMs, ASTRO_TEMPERATURE);
       cooldownUntil[idx] = 0;
       return reply;
     } catch (err) {
@@ -4603,6 +4652,9 @@ async function handleHoroscopeQuery(ctx, intent) {
     } else if (intent.period === "week") {
       dataBlock = buildWeekHoroscopeContext(natal);
       taskType = "week";
+    } else if (intent.period === "years") {
+      dataBlock = buildYearsHoroscopeContext(natal, intent.years || 1);
+      taskType = "years";
     } else if (intent.period === "life") {
       dataBlock = buildLifeContext(natal);
       taskType = "life";
@@ -4612,7 +4664,8 @@ async function handleHoroscopeQuery(ctx, intent) {
     }
 
     const theme = intent.theme || null;
-    const reply = await askAstroLLM(taskType, dataBlock, theme);
+    const years = intent.years || null;
+    const reply = await askAstroLLM(taskType, dataBlock, theme, years);
 
     // Шапка с адресатом, датой и темой (если была) — без неё в групповом
     // чате, где гороскоп могут спросить несколько человек подряд, непонятно,
@@ -4621,7 +4674,7 @@ async function handleHoroscopeQuery(ctx, intent) {
     // физический реплай на сообщение человека, а не просто сообщение
     // "в пустоту" рядом.
     const displayName = getDisplayName(chatId, ctx.from);
-    const dateLabel = formatHoroscopeDateLabel(natal, taskType, theme);
+    const dateLabel = formatHoroscopeDateLabel(natal, taskType, theme, years);
     const header = `${dateLabel[0].toUpperCase()}${dateLabel.slice(1)}, для ${displayName}:`;
     await ctx.reply(`${header}\n\n${reply}`, {
       reply_parameters: { message_id: ctx.message.message_id },

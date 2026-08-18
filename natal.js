@@ -149,6 +149,22 @@ const THEME_PATTERNS = [
 // не считаем это периодом "жизнь", если "жизн" идёт сразу после "личн...".
 const LIFE_PERIOD_RE = /(?<!личн[а-яёА-ЯЁ]*\s)жизн/i;
 
+// "гороскоп на год" / "на 2 года" / "на 5 лет" (макс. 10 — дальше медленные
+// транзиты почти не двигаются, точечный прогноз теряет смысл). Число
+// необязательно ("на год" = 1). Требует захвата цифр в regex ниже (см.
+// ...0-9] в horoscopeRe) — до этой фичи "хвост" после "гороскоп" ловил
+// только буквы и пробелы.
+const YEAR_PERIOD_RE = /(\d{1,2})?\s*(?:лет|года|год)(?![а-яёА-ЯЁ])/i;
+const MAX_YEARS = 10;
+
+function yearsWordRu(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return "год";
+  if (mod10 >= 2 && mod10 <= 4 && !(mod100 >= 12 && mod100 <= 14)) return "года";
+  return "лет";
+}
+
 // Если в тексте совпало сразу несколько тем — берём ту, что встретилась
 // раньше по тексту (а не первую в THEME_PATTERNS), это интуитивнее.
 function detectTheme(rest) {
@@ -169,19 +185,28 @@ export function parseHoroscopeQueryIntent(text) {
   if (!t) return null;
 
   // Раньше здесь ловился только один заранее известный период-словом; теперь
-  // забираем весь кириллический "хвост" после "гороскоп" одним куском и
-  // ищем в нём и период, и тему — так работают любые сочетания вида
-  // "гороскоп на завтра по любви" независимо от порядка слов.
-  const horoscopeRe = new RegExp(`^гороскоп${NOT_CYRILLIC_LETTER}([\\sа-яёА-ЯЁ]*)`, "i");
+  // забираем весь "хвост" после "гороскоп" одним куском (буквы, пробелы И
+  // цифры — цифры нужны для "на 3 года"/"на 5 лет") и ищем в нём и период,
+  // и тему — так работают любые сочетания вида "гороскоп на завтра по
+  // любви" или "гороскоп на 3 года по карьере" независимо от порядка слов.
+  const horoscopeRe = new RegExp(`^гороскоп${NOT_CYRILLIC_LETTER}([\\sа-яёА-ЯЁ0-9]*)`, "i");
   let m = horoscopeRe.exec(t);
   if (m) {
     const rest = (m[1] || "").toLowerCase();
     let period = "today";
+    let years = null;
     if (/завтра/.test(rest)) period = "tomorrow";
     else if (/недел/.test(rest)) period = "week";
     else if (LIFE_PERIOD_RE.test(rest)) period = "life";
+    else {
+      const yearsMatch = YEAR_PERIOD_RE.exec(rest);
+      if (yearsMatch) {
+        period = "years";
+        years = yearsMatch[1] ? Math.min(MAX_YEARS, Math.max(1, parseInt(yearsMatch[1], 10))) : 1;
+      }
+    }
     const theme = detectTheme(rest);
-    return { type: "horoscope", period, theme };
+    return { type: "horoscope", period, years, theme };
   }
 
   // [а-яёА-ЯЁ]* вместо \w* — та же причина, что и с \b выше: \w не видит
@@ -352,6 +377,12 @@ const TRANSIT_ORB = 4;
 // всегда шум (аспект либо уже был вчера, либо будет ещё месяц).
 const DAILY_TRANSIT_KEYS = ["moon", "sun", "mercury", "venus", "mars", "jupiter", "saturn"];
 
+// Для масштаба "на год"/"на N лет" — ровно наоборот: быстрые точки (Луна,
+// Солнце, Меркурий, Венера, Марс) за год успевают пройти полный круг
+// несколько раз, снимок на конкретный день ничего не скажет про "год в
+// целом" — только медленные планеты реально формируют долгосрочные темы.
+const YEARLY_TRANSIT_KEYS = ["jupiter", "saturn", "uranus", "neptune", "pluto"];
+
 function angleDiff(a, b) {
   const d = Math.abs(a - b) % 360;
   return d > 180 ? 360 - d : d;
@@ -482,6 +513,52 @@ export function buildWeekHoroscopeContext(natal) {
   );
 }
 
+// Снимок ТОЛЬКО медленных планет на конкретный день — общий кусок для
+// buildYearsHoroscopeContext (в отличие от buildDayHoroscopeContext, тут
+// намеренно не используются DAILY_TRANSIT_KEYS, см. YEARLY_TRANSIT_KEYS
+// выше).
+function buildYearlySnapshotBlock(natal, tz, dayOffset) {
+  const parts = transitSnapshotParts(tz, dayOffset, { noon: true });
+  const transitHoroscope = buildHoroscope(
+    buildOrigin({
+      year: parts.year, month: parts.month, day: parts.day,
+      hour: parts.hour, minute: parts.minute,
+      latitude: natal.profile.latitude, longitude: natal.profile.longitude,
+    })
+  );
+  const transitPoints = extractPoints(transitHoroscope);
+  const aspects = findTransitAspects(transitPoints, natal.points, YEARLY_TRANSIT_KEYS);
+
+  const lines = [];
+  lines.push(
+    YEARLY_TRANSIT_KEYS.map((k) => `${PLANET_RU[k]} — ${transitPoints[k].signRu}`).join("\n")
+  );
+  if (aspects.length) {
+    lines.push("Аспекты медленных планет к натальной карте:\n" + aspects.slice(0, 8).map(formatTransitAspectLine).join("\n"));
+  } else {
+    lines.push("Значимых аспектов медленных планет к натальной карте нет.");
+  }
+  return lines.join("\n");
+}
+
+// "гороскоп на год" / "на N лет" (1-10) — два снимка (сейчас и через N лет)
+// только по медленным планетам: за год-другой Юпитер/Сатурн успевают
+// заметно сдвинуться и сформировать/разойтись с аспектом к натальной
+// карте, а Уран/Нептун/Плутон дают более фоновый, "эпохальный" сдвиг —
+// вместе это и есть материал для долгосрочного прогноза, в отличие от
+// buildLifeContext (там вообще без транзитов, только сама натальная карта).
+export function buildYearsHoroscopeContext(natal, years) {
+  const tz = natal.profile.timezone || "UTC";
+  const dayOffset = Math.round(years * 365.25);
+  const startBlock = buildYearlySnapshotBlock(natal, tz, 0);
+  const endBlock = buildYearlySnapshotBlock(natal, tz, dayOffset);
+  const label = `${years} ${yearsWordRu(years)}`;
+  return (
+    "Транзиты медленных планет сейчас:\n" + startBlock +
+    `\n\nТранзиты медленных планет через ${label}:\n` + endBlock
+  );
+}
+
 // "гороскоп на жизнь" — намеренно БЕЗ транзитов: в астрологической традиции
 // долгосрочные темы/предназначение читаются по самой натальной карте
 // (сильные аспекты, куда попадают личные планеты), а не по положению
@@ -522,16 +599,21 @@ function formatRuDate(parts) {
 }
 
 // taskType — то же значение, что index.js передаёт в askAstroLLM:
-// "chart" | "aspects" | "today" | "tomorrow" | "week" | "life".
+// "chart" | "aspects" | "today" | "tomorrow" | "week" | "life" | "years".
 // theme — необязательно: "health" | "love" | "career" | null.
+// years — только для taskType === "years": сколько лет вперёд (1-10).
 const THEME_LABEL_RU = { health: "здоровье", love: "любовь", career: "карьера и деньги" };
 
-export function formatHoroscopeDateLabel(natal, taskType, theme = null) {
+export function formatHoroscopeDateLabel(natal, taskType, theme = null, years = null) {
   const tz = natal.profile.timezone || "UTC";
   const themeSuffix = theme && THEME_LABEL_RU[theme] ? ` — ${THEME_LABEL_RU[theme]}` : "";
   if (taskType === "chart") return "натальная карта";
   if (taskType === "aspects") return "аспекты";
   if (taskType === "life") return `гороскоп на жизнь${themeSuffix}`;
+  if (taskType === "years") {
+    const n = years || 1;
+    return `гороскоп на ${n} ${yearsWordRu(n)}${themeSuffix}`;
+  }
   if (taskType === "week") {
     const start = transitSnapshotParts(tz, 0, { noon: true });
     const end = transitSnapshotParts(tz, 7, { noon: true });
