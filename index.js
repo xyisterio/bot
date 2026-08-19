@@ -3016,7 +3016,14 @@ function formatProfileFactsBlock(profile) {
 // Фоновое, не блокирующее основной ответ бота извлечение — вызывается
 // fire-and-forget (без await) из основного обработчика сообщений. Любая
 // ошибка тут — просто лог, никогда не должна аукнуться на обычном чате.
+// Общий рубильник фичи "досье": false — бот больше не дёргает LLM для
+// извлечения фактов о участниках. Остальной код (хранение/показ уже
+// накопленных досье) не тронут, чтобы вернуть фичу — просто верни true.
+const PROFILE_EXTRACT_ENABLED = false;
+
 async function extractProfileFacts(chatId, speakerId, speakerName, text, conversationContext = null) {
+  if (!PROFILE_EXTRACT_ENABLED) return;
+
   // Фильтр минимальной длины снимаем, если есть контекст диалога — короткое
   // "розы"/"трое" само по себе бессмысленно по длине, но осмысленно вместе
   // с вопросом/предыдущими репликами (см. buildProfileExtractionContext).
