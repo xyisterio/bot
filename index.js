@@ -3932,6 +3932,17 @@ bot.on("callback_query:data", async (ctx, next) => {
 });
 
 // ==== Погода (Open-Meteo, без ключа) ====
+// Ходим не напрямую в api.open-meteo.com/geocoding-api.open-meteo.com, а
+// через свой Cloudflare Worker-проксик — у Render общий IP-пул на бесплатном
+// тарифе, и публичный (без ключа) лимит open-meteo на него быстро ловит 429.
+// Воркер шлёт запрос с IP Cloudflare, так что лимит по IP не бьётся с
+// остальными Render-клиентами. См. воркер: openmeteo.xyisterio.workers.dev
+const METEO_PROXY_BASE = "https://openmeteo.xyisterio.workers.dev/";
+
+async function fetchViaMeteoProxy(targetUrl) {
+  return fetch(`${METEO_PROXY_BASE}?url=${encodeURIComponent(targetUrl)}`);
+}
+
 // Триггер — слово "погода"/"погоды" в сообщении, адресованном боту (та же
 // гейтовая логика, что и у остального: в личке всегда, в группе — после
 // имени/реплая/упоминания, см. ниже перед основным блоком). Понимает и
@@ -4122,7 +4133,7 @@ async function geocodeCity(rawCity) {
       const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
         candidate
       )}&count=10&language=ru&format=json`;
-      const res = await fetch(url);
+      const res = await fetchViaMeteoProxy(url);
       if (!res.ok) continue;
       const data = await res.json();
       const hits = data?.results;
@@ -4176,7 +4187,7 @@ async function fetchCurrentWeatherText(place) {
     `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
     `&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m` +
     `&timezone=${encodeURIComponent(place.timezone)}`;
-  const res = await fetch(url);
+  const res = await fetchViaMeteoProxy(url);
   if (!res.ok) throw new Error(`open-meteo forecast: ${res.status}`);
   const data = await res.json();
   const c = data.current;
@@ -4196,7 +4207,7 @@ async function fetchForecastWeatherText(place, days) {
     `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
     `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
     `&forecast_days=${days}&timezone=${encodeURIComponent(place.timezone)}`;
-  const res = await fetch(url);
+  const res = await fetchViaMeteoProxy(url);
   if (!res.ok) throw new Error(`open-meteo forecast: ${res.status}`);
   const data = await res.json();
   const d = data.daily;
@@ -4225,7 +4236,7 @@ async function fetchDaySummaryWeatherText(place, dayOffset) {
     `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
     `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max` +
     `&forecast_days=${dayOffset + 1}&timezone=${encodeURIComponent(place.timezone)}`;
-  const res = await fetch(url);
+  const res = await fetchViaMeteoProxy(url);
   if (!res.ok) throw new Error(`open-meteo forecast: ${res.status}`);
   const data = await res.json();
   const d = data.daily;
@@ -4256,7 +4267,7 @@ async function fetchHourlyWeatherText(place, dayOffset) {
     `&hourly=temperature_2m,precipitation_probability,weather_code` +
     `&current=temperature_2m` +
     `&forecast_days=${dayOffset + 1}&timezone=${encodeURIComponent(place.timezone)}`;
-  const res = await fetch(url);
+  const res = await fetchViaMeteoProxy(url);
   if (!res.ok) throw new Error(`open-meteo forecast: ${res.status}`);
   const data = await res.json();
   const h = data.hourly;
