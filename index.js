@@ -6602,6 +6602,38 @@ const DEEZER_TRACK_NOUN_REGEX = /(песн|трек|музык|мелоди|ко
 // или начало/конец строки".
 const DEEZER_BARE_PRONOUN_REGEX = /(?:^|[^а-яёa-z])(её|ее|его|их)(?:[^а-яёa-z]|$)/i;
 
+// Голое подтверждение без всякого объекта - "Кидай", "Давай", "Го", "Ну
+// ещё раз пришли значит" - т.е. просто повелительное "дай/присылай" без
+// названия трека, местоимения или слова-носителя ("трек"/"хит") рядом.
+// Само по себе оно ничего не значит, но если последний ответ бота в
+// истории уже называл конкретный трек (см. resolveTrackQuery ниже,
+// который смотрит на getHistory), это однозначно "пришли именно его".
+// ВАЖНО: это САМОДОСТАТОЧНЫЙ триггер, который не должен идти через общий
+// DEEZER_REQUEST_VERB_REGEX-гейт ниже - некоторые формы туда не проходят.
+// Например "Давай" не матчится по стему "дай": буквы д-а-й в "Давай" не
+// стоят подряд, между ними "в" (Д-а-В-а-й), поэтому DEEZER_REQUEST_VERB_REGEX
+// его не ловит, хотя как голое подтверждение оно ровно то же самое, что
+// "Кидай" или "Дай".
+const DEEZER_CONFIRM_FILLER_LEAD_REGEX = /^(?:ну|да|ладно|ок(?:ей|ай)?|хорошо|ага)[,\s]+/i;
+const DEEZER_CONFIRM_FILLER_TRAIL_REGEX = /[,\s]+(?:значит|тогда|же|давай|пожалуйста|плиз|ладно)$/i;
+const DEEZER_BARE_CONFIRM_CORE_REGEX =
+  /^(?:дав[ае]й(?:те)?|дай|дашь|кидай|кинь|скинь|пришли|отправь|включи|поставь|го|жми|повтори(?:те)?|ещ[её]\s*раз(?:ик)?(?:\s+пришли)?)$/i;
+
+function isDeezerBareConfirmation(text) {
+  if (!text) return false;
+  let t = text.trim().replace(/[.!]+$/, "");
+  // Срезаем окружающие слова-заполнители ("ну", "значит", "тогда"...) с
+  // обоих концов, по кругу - в "Ну ещё раз пришли значит" их сразу два.
+  let prev;
+  do {
+    prev = t;
+    t = t.replace(DEEZER_CONFIRM_FILLER_LEAD_REGEX, "").trim();
+    t = t.replace(DEEZER_CONFIRM_FILLER_TRAIL_REGEX, "").trim();
+  } while (t !== prev && t.length > 0);
+  if (!t) return false;
+  return DEEZER_BARE_CONFIRM_CORE_REGEX.test(t);
+}
+
 function isDeezerAmbiguousMusicRequest(text) {
   if (!text) return false;
   const t = text.trim();
@@ -6609,6 +6641,9 @@ function isDeezerAmbiguousMusicRequest(text) {
   // Если уже есть явное название трека в формате "трек X"/"песню X" - это
   // не двусмысленный случай, им займётся обычный parseDeezerIntent.
   if (parseDeezerIntent(t)) return false;
+  // Голое подтверждение - самостоятельный триггер, см. комментарий выше.
+  // Проверяем его ДО общего гейта на DEEZER_REQUEST_VERB_REGEX.
+  if (isDeezerBareConfirmation(t)) return true;
   if (!DEEZER_REQUEST_VERB_REGEX.test(t)) return false;
   // Глагол-просьба + слово "трек/песня/хит/сингл/..." рядом - уже
   // достаточный сигнал, что человек просит музыку, независимо от того,
