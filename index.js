@@ -314,7 +314,23 @@ const STICKERS = {
   praise: [
     "CAACAgIAAxkBAAFRKspqdIUsDKtUaVl60tYa2DdtJyHu6QACoa4AAhpboEsfl8WMJ0-yuT0E",
     "CAACAgIAAxkBAAFRKtZqdIV67uv3N6KprCHgXReYGifQ3wACyKIAAj2kqUslvM99D7mTlT0E",
-    "CAACAgIAAxkBAAFSX3FqiJjCAAEGL8WwLGU6N75BNqcnzpsAAouqAAIvKqFL_Bo3QNJUfEc9BA",
+    "CAACAgIAAxkBAAFRKt5qdIWs1dV67TxHyTXDaR9-CRiTdwAC7qcAAhBKoUtF_7Gqj7YTFT0E",
+  ],
+  // Реакция на реально смешную шутку собеседника (не флирт, не про самого бота).
+  joke: [
+    "CAACAgIAAxkBAAFSX9dqiJ9j4d8ZdilAgHw3VwuvhWhxGwACraUAAs6FqUtwM82bTdAtrz0E",
+    "CAACAgIAAxkBAAFSX9JqiJ8-GfCZ6Um0N9uZm83SO3eyJgACrqwAArSKqUtGJVCLmaJthz0E",
+  ],
+  // Реакция на грубость/оскорбление в адрес самого бота.
+  insult: [
+    "CAACAgIAAxkBAAFSX9tqiJ_RNhOL036yPLvbMT5Iv8q4OQACeasAAov-oEsMGSS1ZzpAUj0E",
+    "CAACAgIAAxkBAAFSX8xqiJ8lS_iAsp2_6LveTXUR_yrifwACgagAAgJMqEs6U65pbtvD3D0E",
+  ],
+  // Реакция на очень странный/непонятный запрос собеседника.
+  confused: [
+    "CAACAgQAAxkBAAFSX-VqiKA85q6nU3QSSnRUn8Q0B_5ShAAC2xUAAiPx4FIzAZDOwyuyvj0E",
+    "CAACAgIAAxkBAAFSX-NqiKA6JfO693P6leMSDd4lkPUbKQAC7BkAAmrrIUt0wIL8LjGOfD0E",
+    "CAACAgIAAxkBAAFSX-FqiKA2hRYOfbyZ0SN2sCv0dHIYsAACmLEAAh8koEuihPf23V0eHj0E",
   ],
 };
 
@@ -322,6 +338,37 @@ function pickSticker(key) {
   const pool = STICKERS[key];
   if (!pool || pool.length === 0) return null;
   return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ==== Анти-спам повторных стикер-реакций от одного и того же человека ====
+// Если один и тот же человек подряд вызывает одну и ту же категорию реакции
+// (например, хвалит бота третий раз подряд, или подряд грубит) — не шлём
+// стикер на КАЖДОЕ такое сообщение, иначе это превращается в спам
+// одинаковыми стикерами. Вместо этого просто отвечаем обычным текстом, как
+// в любой другой ситуации. Как только человек сменил категорию (похвалил,
+// потом пошутил) или прошло достаточно времени — реакция снова доступна.
+// Действует только на теговые реакции модели ([sticker: ключ] —
+// praise/insult/joke/confused/banter_*), а не на отдельные механики вроде
+// приветствия по /start или сопровождения присланного трека.
+const STICKER_REPEAT_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 часа
+const STICKER_REPEAT_TRACK_LIMIT = 500;
+const lastStickerByUser = new Map(); // `${chatId}:${userId}` -> { key, ts }
+
+// Возвращает true, если категорию key можно сейчас отправить стикером этому
+// человеку (и в этом случае запоминает её как последнюю), и false, если это
+// повтор той же категории в пределах STICKER_REPEAT_WINDOW_MS — тогда нужно
+// просто ответить текстом, без стикера.
+function canSendStickerReaction(chatId, userId, key) {
+  const mapKey = `${chatId}:${userId}`;
+  const prev = lastStickerByUser.get(mapKey);
+  const now = Date.now();
+  const isRepeat = !!prev && prev.key === key && now - prev.ts < STICKER_REPEAT_WINDOW_MS;
+  lastStickerByUser.set(mapKey, { key, ts: now });
+  if (lastStickerByUser.size > STICKER_REPEAT_TRACK_LIMIT) {
+    const oldestKey = lastStickerByUser.keys().next().value;
+    lastStickerByUser.delete(oldestKey);
+  }
+  return !isRepeat;
 }
 
 // ==== Триггерные фразы для стикер-стёба (по полу отправителя) ====
@@ -433,6 +480,9 @@ const SYSTEM_PROMPT = `
   - banter_male / banter_female — собеседник заигрывает с тобой, намекает на секс, пытается разыграть романтическую/любовную сцену или шутит на эту тему именно В ТВОЮ СТОРОНУ (не когда просто обсуждают отношения/любовь в целом как тему разговора, а когда это направлено на тебя). Выбирай ключ по метке "[пол собеседника: ...]" в начале сообщения — мужской пол -> banter_male, женский -> banter_female. Если метки пола нет — тег не ставь, ключ угадывать не нужно.
   Используй banter-теги нечасто и только когда реально в тему, не в каждом подходящем по смыслу ответе — это не должно ощущаться как автоматическая реакция на каждый флирт.
   - praise — собеседник хвалит или льстит именно ТЕБЕ. Примеры, которые ДОЛЖНЫ срабатывать: "ты умный", "ты молодец", "ты умничка", "красава", "реально помог", "ты лучший", "офигенно ответил", "спасибо, ты крутой". В отличие от banter-тегов, этот тег НЕ нужно придерживать "для редкости" — ставь его каждый раз, когда тебя прямо хвалят, это нормальная частая реакция, а не что-то, что должно ощущаться редким сюрпризом.
+  - joke — собеседник рассказал/написал что-то реально смешное (анекдот, шутка, забавная история, остроумная реплика) — именно то, над чем стоит посмеяться, а не просто позитивное сообщение. Не путай с banter-тегами (флирт в твою сторону) и с praise (хвалят тебя) — joke ставь, когда смешно само содержание сказанного, независимо от того, касается это тебя или нет. Не ставь этот тег, если собеседник просто пошутил мимоходом одним словом без реального юмористического эффекта — только когда действительно смешно.
+  - insult — собеседник грубит или оскорбляет именно ТЕБЯ (не кого-то другого, не ситуацию в целом). Примеры: "ты тупой", "бесполезный кусок кода", "заткнись", маты в твой адрес, откровенное хамство. Не путай с обычным раздражением на что-то постороннее (плохая погода, чужие люди, обстоятельства) — только когда грубость направлена конкретно на тебя. Не ставь этот тег на лёгкий беззлобный стёб/подколки в игривом тоне — только на реально грубое обращение.
+  - confused — запрос собеседника настолько странный, бессвязный или непонятный, что ты реально не понимаешь, что от тебя хотят (набор случайных слов, обрывок мысли без контекста, абсурдный вопрос в стиле "почему трава пахнет вторником"). Не ставь этот тег просто на сложный или редкий вопрос, который ты можешь разобрать по смыслу — только когда сообщение реально ставит в тупик.
   Если ситуация не подходит ни под один из доступных ключей — тег не ставь.
 `.trim();
 
@@ -6501,7 +6551,10 @@ bot.on("message:photo", async (ctx) => {
     });
 
     const threadId = getThreadId(ctx);
-    const stickerId = stickerKey && pickSticker(stickerKey);
+    // Анти-спам: та же проверка, что и в основном текстовом хендлере —
+    // не повторяем стикер той же категории подряд одному человеку.
+    const stickerId =
+      stickerKey && canSendStickerReaction(chatId, ctx.from.id, stickerKey) && pickSticker(stickerKey);
     if (stickerId) {
       const sentMsg = await ctx.replyWithSticker(stickerId, {
         reply_parameters: { message_id: ctx.message.message_id },
@@ -8413,8 +8466,14 @@ bot.on("message:text", async (ctx) => {
     });
 
     // Если явная фраза уже вызвала стикер по regex выше — не дублируем
-    // ещё одним стикером от тега модели на то же сообщение.
-    const stickerId = !regexStickerFired && stickerKey && pickSticker(stickerKey);
+    // ещё одним стикером от тега модели на то же сообщение. Плюс анти-спам:
+    // если этому человеку только что уже слали стикер той же категории —
+    // не повторяем, отвечаем текстом (см. canSendStickerReaction выше).
+    const stickerId =
+      !regexStickerFired &&
+      stickerKey &&
+      canSendStickerReaction(chatId, ctx.from.id, stickerKey) &&
+      pickSticker(stickerKey);
 
     const senderDisplayName = getDisplayName(chatId, ctx.from);
 
