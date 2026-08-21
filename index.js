@@ -111,7 +111,7 @@ const PROVIDER_ORDER = (process.env.PROVIDER_ORDER || "gemini,groq,huggingface,o
   .map((p) => p.trim().toLowerCase())
   .filter(Boolean);
 
-const GROQ_MODELS = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile,openai/gpt-oss-120b")
+const GROQ_MODELS = (process.env.GROQ_MODEL || "openai/gpt-oss-120b,qwen/qwen3.6-27b")
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
@@ -6585,12 +6585,38 @@ const DEEZER_INTENT_REGEX = /^(?:скинь|найди|включи|постав
 const DEEZER_COMMAND_REGEX = /^\/(?:song|deezer|music|track)(?:@\w+)?\s+(.+)$/i;
 
 // Референциальный запрос без явного названия — "скинь этот трек", "пришли
-// эту песню", "скинь её" и т.п. DEEZER_INTENT_REGEX такое не ловит: между
-// глаголом и словом "трек"/"песню" стоит местоимение, а не название.
-// Название в этом случае неизвестно из самого текста — его нужно достать
-// из контекста переписки через resolveTrackFromContext (см. ниже).
-const DEEZER_REFERENTIAL_REGEX =
-  /^(?:скинь|найди|включи|поставь|отправь|пришли)\s+(?:мне\s+)?(?:это|эту|этот|её|ее|его|той\s+же|той|тот\s+же|той\s+самой|ту\s+же|ту)\s*(?:песню|трек|музыку|мелодию|композицию)?\s*$/i;
+// эту песню", "пришлёшь её?", "кинешь эту песню" и т.п. DEEZER_INTENT_REGEX
+// такое не ловит (между глаголом и словом "трек"/"песню" стоит
+// местоимение, а не название) — распознаём по наличию глагола-просьбы +
+// (при наличии слова "трек/песня/...") референциального местоимения, без
+// привязки к точной форме глагола или позиции в строке (чтобы ловить и
+// "пришлёшь", и "кинешь", и вопросительные "?" в конце).
+const DEEZER_REQUEST_VERB_REGEX = /(скин|кин|найд|включ|постав|отправ|пришл|дай|дашь)/i;
+const DEEZER_TRACK_NOUN_REGEX = /(песн|трек|музык|мелоди|композици)/i;
+// ВАЖНО: \b в JS работает только по ASCII \w и не распознаёт кириллицу как
+// "словесные" символы — с кириллическим текстом границы \b просто нигде не
+// находятся, и любой regex вида \b(эту|его)\b молча никогда не совпадёт.
+// Поэтому границы слова эмулируем вручную через "не-кириллический символ
+// или начало/конец строки".
+const DEEZER_REFERENTIAL_PRONOUN_REGEX =
+  /(?:^|[^а-яёa-z])(эт[ауо]й?|этот|её|ее|его|та\s+же|тот\s+же|ту\s+же|той\s+же)(?:[^а-яёa-z]|$)/i;
+const DEEZER_BARE_PRONOUN_REGEX = /(?:^|[^а-яёa-z])(её|ее|его)(?:[^а-яёa-z]|$)/i;
+
+function isDeezerReferentialRequest(text) {
+  if (!text) return false;
+  const t = text.trim();
+  if (!t) return false;
+  // Если уже есть явное название трека - это не референциальный случай,
+  // им займётся обычный parseDeezerIntent.
+  if (parseDeezerIntent(t)) return false;
+  if (!DEEZER_REQUEST_VERB_REGEX.test(t)) return false;
+  if (DEEZER_TRACK_NOUN_REGEX.test(t)) {
+    return DEEZER_REFERENTIAL_PRONOUN_REGEX.test(t);
+  }
+  // Без слова "трек"/"песня" рядом - смотрим на голое "её"/"его"
+  // ("скинь её", "пришли его").
+  return DEEZER_BARE_PRONOUN_REGEX.test(t);
+}
 
 // Сколько последних сообщений диалога смотрим, пытаясь понять, о каком
 // треке речь (см. resolveTrackFromContext).
@@ -6617,22 +6643,24 @@ const TRACK_QUERY_NORMALIZE_SYSTEM_PROMPT =
   "уверен на 100% — всё равно дай наиболее вероятный вариант, не отказывайся " +
   "отвечать. Ответь только самим запросом, ничего больше.";
 
-// Общий хелпер: разовый (без истории) запрос к пулу Groq-целей — по тому же
-// принципу фолбэка по ключам/моделям, что и в других узких задачах в этом
-// файле. Не годится для тяжёлых промптов, только для маленьких
+// Общий хелпер: разовый (без истории чата) запрос к общему пулу целей
+// (TARGETS) с фолбэком по провайдерам/моделям — переиспользует тот же
+// computeTargetOrder(), что и askLLM, поэтому уважает основной провайдер
+// пользователя (напр. Gemini) и не завязан жёстко на Groq. Раньше это было
+// захардкожено только на Groq-цели — из-за этого при мёртвой/недоступной
+// модели на Groq функция возвращала null, даже если Gemini прекрасно
+// работал. Не годится для тяжёлых промптов, только для маленьких
 // классификационных/нормализующих задач.
-async function askGroqOnceForTrack(systemPrompt, userContent, timeoutMs) {
-  const now = Date.now();
-  const groqTargetIndices = TARGETS.map((t, idx) => (t.provider === "groq" ? idx : -1)).filter((idx) => idx !== -1);
-  const availableGroqIndices = groqTargetIndices.filter((idx) => cooldownUntil[idx] <= now);
-  if (availableGroqIndices.length === 0) return null;
+async function askOnceForTrack(systemPrompt, userContent, timeoutMs) {
+  const order = computeTargetOrder();
+  if (order.length === 0) return null;
 
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userContent },
   ];
 
-  for (const idx of availableGroqIndices) {
+  for (const idx of order) {
     const target = TARGETS[idx];
     try {
       const { reply } = await callTarget(target, messages, timeoutMs, 0.2);
@@ -6641,7 +6669,7 @@ async function askGroqOnceForTrack(systemPrompt, userContent, timeoutMs) {
       return cleaned || null;
     } catch (err) {
       console.error(
-        `askGroqOnceForTrack: ошибка у ${targetLabel(target)}:`,
+        `askOnceForTrack: ошибка у ${targetLabel(target)}:`,
         err.status ?? "-",
         err.body ?? err.message
       );
@@ -6664,7 +6692,7 @@ async function resolveTrackFromContext(chatId) {
     .map((m) => `${m.role === "user" ? "Пользователь" : "Бот"}: ${m.content}`)
     .join("\n");
 
-  const result = await askGroqOnceForTrack(TRACK_CONTEXT_SYSTEM_PROMPT, transcript, TRACK_CONTEXT_RESOLVE_TIMEOUT_MS);
+  const result = await askOnceForTrack(TRACK_CONTEXT_SYSTEM_PROMPT, transcript, TRACK_CONTEXT_RESOLVE_TIMEOUT_MS);
   if (!result || /^none$/i.test(result)) return null;
   return result;
 }
@@ -6673,7 +6701,7 @@ async function resolveTrackFromContext(chatId) {
 // (опечатки, фонетическая транслитерация кириллицей и т.п.) — используется
 // как фолбэк, когда прямой поиск по Deezer вернул пустой результат.
 async function normalizeTrackQueryViaLLM(rawQuery) {
-  return askGroqOnceForTrack(TRACK_QUERY_NORMALIZE_SYSTEM_PROMPT, rawQuery, TRACK_CONTEXT_RESOLVE_TIMEOUT_MS);
+  return askOnceForTrack(TRACK_QUERY_NORMALIZE_SYSTEM_PROMPT, rawQuery, TRACK_CONTEXT_RESOLVE_TIMEOUT_MS);
 }
 
 // Вопросы/комментарии о самой песне (реплай на сообщение бота с треком),
@@ -7387,12 +7415,23 @@ bot.on("message:text", async (ctx) => {
   // если получилось — ведём себя так же, как при обычном intent-запросе.
   // Если понять не удалось, просто идём дальше обычным потоком (LLM сама
   // разберётся, что ответить — например, переспросит название).
-  if (DEEZER_REFERENTIAL_REGEX.test(strippedText)) {
+  if (isDeezerReferentialRequest(strippedText)) {
     const resolvedTrack = await resolveTrackFromContext(chatId);
     if (resolvedTrack) {
       await handleDeezerQuery(ctx, resolvedTrack);
       return;
     }
+    // Явно даём знать, что не поняли, о каком треке речь — вместо того,
+    // чтобы молча падать в обычный чат, где LLM может выдать
+    // правдоподобный, но по факту придуманный ответ вместо честного
+    // "не понял". Так же сюда попадаем, если распознали референциальный
+    // запрос, но у всех целей сейчас cooldown/ошибка (см. askOnceForTrack).
+    console.log(`Deezer: референциальный запрос "${strippedText}" в чате ${chatId} - не удалось определить трек по контексту`);
+    const clarifyMsg = await ctx.reply(
+      "Не понял, о каком треке речь — напиши название явно, например: «скинь трек Radio Company - Sounds of Someday»."
+    );
+    markDeezerFlowMessage(ctx.chat.id, clarifyMsg.message_id);
+    return;
   }
 
   const deezerQuery = parseDeezerIntent(strippedText);
