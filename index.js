@@ -3464,10 +3464,40 @@ function isAllowedChat(ctx) {
 bot.use(async (ctx, next) => {
   if (!ctx.chat) return next();
   if (!isAllowedChat(ctx)) {
+    const senderName =
+      ctx.from?.username
+        ? `@${ctx.from.username}`
+        : [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(" ") || "неизвестно";
+    // Ссылка на отправителя: если есть username — обычная t.me-ссылка (кликабельна
+    // отовсюду), иначе tg://user?id= — открывается только в самом Telegram, но
+    // работает даже без username.
+    const senderLink = ctx.from?.username
+      ? `https://t.me/${ctx.from.username}`
+      : ctx.from?.id
+      ? `tg://user?id=${ctx.from.id}`
+      : null;
+    // Ссылка на чат возможна только если у группы есть публичный username —
+    // Bot API не даёт invite-ссылку на приватную группу без прав администратора там.
+    const chatLink = ctx.chat.username ? `https://t.me/${ctx.chat.username}` : null;
+    const preview = ctx.message ? watchMessagePreview(ctx.message) : "[не текстовое обновление]";
     console.warn(
-      `Сообщение из неразрешённой группы (id: ${ctx.chat.id}, название: "${ctx.chat.title}") — игнорирую. ` +
+      `Сообщение из неразрешённой группы (id: ${ctx.chat.id}, название: "${ctx.chat.title}"` +
+        `${chatLink ? `, ${chatLink}` : ""}) ` +
+        `от ${senderName}${senderLink ? ` (${senderLink})` : ""} (id: ${ctx.from?.id}): ${preview} — игнорирую. ` +
         `Чтобы разрешить, добавь ${ctx.chat.id} в ALLOWED_GROUP_IDS.`
     );
+    if (OWNER_ID) {
+      bot.api
+        .sendMessage(
+          OWNER_ID,
+          `🚫 сообщение из чужой группы "${ctx.chat.title}" (id: ${ctx.chat.id})\n` +
+            `${chatLink ? `чат: ${chatLink}\n` : "чат: приватный, ссылки нет\n"}` +
+            `от: ${senderName} (id: ${ctx.from?.id})\n` +
+            `${senderLink ? `${senderLink}\n` : ""}` +
+            `\n${preview}`
+        )
+        .catch((err) => console.error("Не удалось отправить уведомление о чужой группе:", err));
+    }
     return;
   }
   await next();
