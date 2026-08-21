@@ -496,6 +496,16 @@ function isOwner(ctx) {
   return !!username && username.toLowerCase() === OWNER_USERNAME.toLowerCase();
 }
 
+// Telegram user id владельца — нужен отдельно от OWNER_USERNAME для
+// проактивных уведомлений в ЛС (см. блок "Уведомления о новых сообщениях"
+// ниже). Юзернейма недостаточно: sendMessage требует числовой chat_id,
+// а бот не может его "угадать" по нику — узнать id можно, например,
+// написав боту /start в ЛС и посмотрев лог, либо через @userinfobot.
+const OWNER_ID = Number(process.env.OWNER_ID) || null;
+if (!OWNER_ID) {
+  console.warn("OWNER_ID не задан в переменных окружения — уведомления о новых сообщениях (/watch) работать не будут");
+}
+
 // ==== Утилиты для отправки статуса "печатает..." ====
 // Возвращает ID темы (message_thread_id), если сообщение отправлено в топик форум-группы.
 // НЕ использует fallback на reply_to_message, так как в обычных чатах/дискуссиях
@@ -3175,6 +3185,7 @@ async function loadPersistedState() {
       memberNameKeys,
       savedIdx,
       savedPinnedIdx,
+      savedWatchDisabledChats,
     ] = await Promise.all([
       redis.keys("history:*"),
       redis.keys("chatlog:*"),
@@ -3189,6 +3200,7 @@ async function loadPersistedState() {
       redis.keys("members:*"),
       redis.get("activeTargetIndex"),
       redis.get("pinnedTargetIndex"),
+      redis.get("watchDisabledChats"),
     ]);
 
     await Promise.all(
@@ -3326,13 +3338,20 @@ async function loadPersistedState() {
       pinnedTargetIndex = savedPinnedIdx;
     }
 
+    if (Array.isArray(savedWatchDisabledChats)) {
+      for (const chatId of savedWatchDisabledChats) {
+        if (Number.isInteger(chatId)) watchDisabledChats.add(chatId);
+      }
+    }
+
     console.log(
       `Восстановлено из Redis: истории — ${historyKeys.length}, логи чатов — ${chatLogKeys.length}, алиасы — ${aliasKeys.length}, ` +
         `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}, шахматные партии — ${chessKeys.length}, ` +
         `шашечные партии — ${checkersKeys.length}, раунды крокодила — ${krokodilKeys.length}, ` +
         `счёт крокодила — ${krokodilScoreKeys.length} чатов, досье — ${profileKeys.length}, имена участников — ${memberNameKeys.length} чатов` +
         (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "") +
-        (pinnedTargetIndex !== null ? `, закреплена вручную — индекс ${pinnedTargetIndex}` : "")
+        (pinnedTargetIndex !== null ? `, закреплена вручную — индекс ${pinnedTargetIndex}` : "") +
+        `, чатов с выключенной слежкой (watch) — ${watchDisabledChats.size}`
     );
   } catch (err) {
     console.error("Не удалось восстановить состояние из Redis, стартую с чистой памятью:", err);
@@ -3454,12 +3473,147 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
+// ==== Уведомления владельцу о новых сообщениях в "тихих" чатах ====
+// Идея: по умолчанию слежка включена сразу для ВСЕХ разрешённых групповых
+// чатов (см. ALLOWED_GROUP_IDS/isAllowedChat выше — сюда мы попадаем уже
+// только с разрешённым чатом). На ПЕРВОЕ новое сообщение в чате бот шлёт
+// хозяину уведомление в ЛС и на час "замолкает" по этому чату — дальнейшие
+// сообщения в течение часа уведомлений не вызывают. Если за час никто
+// больше не написал — бот просто продолжает ждать; если написал — цикл
+// повторяется. Командой /watch хозяин может выключить слежку за конкретным
+// чатом (и обратно включить тем же /watch) — см. хендлер ниже.
+//
+// Храним не "кого отслеживаем" (по умолчанию — все), а "кого ИСКЛЮЧИЛИ" —
+// id чатов, персистится в Redis одним массивом под ключом
+// "watchDisabledChats" (тем же паттерном, что activeTargetIndex/
+// pinnedTargetIndex выше — см. loadPersistedState).
+const watchDisabledChats = new Set();
+
+const WATCH_COOLDOWN_MS = 60 * 60 * 1000; // час
+
+// Кулдаун "чат сейчас не уведомляем" храним в Redis как ключ с TTL —
+// сам по себе факт существования ключа и есть кулдаун, отдельный таймер
+// не нужен, Redis сам удалит ключ через час. Если Redis не настроен —
+// запасной вариант в памяти процесса (chatId -> unix ms окончания
+// кулдауна), переживёт только до рестарта.
+const watchCooldownMemory = new Map();
+
+async function isWatchCooldownActive(chatId) {
+  if (redis) {
+    try {
+      const marker = await redis.get(`watchCooldown:${chatId}`);
+      return !!marker;
+    } catch (err) {
+      console.error("Не удалось проверить кулдаун уведомлений в Redis:", err);
+    }
+  }
+  const until = watchCooldownMemory.get(chatId);
+  return typeof until === "number" && Date.now() < until;
+}
+
+async function startWatchCooldown(chatId) {
+  watchCooldownMemory.set(chatId, Date.now() + WATCH_COOLDOWN_MS);
+  if (redis) {
+    try {
+      await redis.set(`watchCooldown:${chatId}`, "1", { ex: Math.round(WATCH_COOLDOWN_MS / 1000) });
+    } catch (err) {
+      console.error("Не удалось выставить кулдаун уведомлений в Redis:", err);
+    }
+  }
+}
+
+async function saveWatchDisabledChats() {
+  if (!redis) return;
+  try {
+    await redis.set("watchDisabledChats", Array.from(watchDisabledChats));
+  } catch (err) {
+    console.error("Не удалось сохранить список исключённых из слежки чатов:", err);
+  }
+}
+
+// Слежка включена по умолчанию для любого группового/супергруппового чата
+// (личка и каналы не считаются — уведомлять там не о чем), если только
+// хозяин явно не выключил её через /watch.
+function isWatchedChat(ctx) {
+  const isGroup = ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
+  if (!isGroup) return false;
+  return !watchDisabledChats.has(ctx.chat.id);
+}
+
+// Короткое текстовое превью сообщения любого типа — используется в тексте
+// уведомления. Полноценный forwardMessage был бы точнее, но простой текст
+// проще читать вперемешку с остальной перепиской в ЛС у хозяина.
+function watchMessagePreview(msg) {
+  if (msg.text) return msg.text.length > 300 ? `${msg.text.slice(0, 300)}…` : msg.text;
+  if (msg.caption) return `[подпись к медиа] ${msg.caption}`;
+  if (msg.photo) return "[фото]";
+  if (msg.video) return "[видео]";
+  if (msg.video_note) return "[видео-кружок]";
+  if (msg.voice) return "[голосовое]";
+  if (msg.audio) return "[аудио]";
+  if (msg.document) return "[файл]";
+  if (msg.sticker) return `[стикер${msg.sticker.emoji ? " " + msg.sticker.emoji : ""}]`;
+  if (msg.animation) return "[гифка]";
+  if (msg.poll) return "[опрос]";
+  if (msg.location) return "[геолокация]";
+  return "[сообщение]";
+}
+
+// Сам хук — стоит после фильтра разрешённых групп, но до всех остальных
+// command/on-хендлеров, чтобы отлавливать вообще любое сообщение (текст,
+// фото, стикер и т.п.), а не только текстовые. Не мешает остальной
+// обработке — всегда зовёт next().
+bot.use(async (ctx, next) => {
+  if (
+    OWNER_ID &&
+    ctx.message &&
+    isWatchedChat(ctx) &&
+    !ctx.from?.is_bot &&
+    ctx.from?.id !== OWNER_ID
+  ) {
+    isWatchCooldownActive(ctx.chat.id)
+      .then(async (onCooldown) => {
+        if (onCooldown) return;
+        await startWatchCooldown(ctx.chat.id);
+        const chatTitle = ctx.chat.title || ctx.chat.username || "чат";
+        const senderName = getDisplayName(ctx.chat.id, ctx.from) || ctx.from?.first_name || "кто-то";
+        const preview = watchMessagePreview(ctx.message);
+        await bot.api.sendMessage(OWNER_ID, `🔔 новое сообщение в "${chatTitle}"\nот: ${senderName}\n\n${preview}`);
+      })
+      .catch((err) => console.error("Не удалось отправить уведомление о новом сообщении:", err));
+  }
+  await next();
+});
+
 bot.command("start", async (ctx) => {
   const chatId = ctx.chat.id;
   await clearHistory(chatId); // сброс истории при /start
   await ctx.reply("йо");
   const stickerId = pickSticker("greeting");
   if (stickerId) await ctx.replyWithSticker(stickerId);
+});
+
+// Выключает/обратно включает уведомления в ЛС хозяину о новых сообщениях
+// в ЭТОМ чате — см. блок watchDisabledChats/WATCH_COOLDOWN_MS выше.
+// Слежка по умолчанию включена для всех разрешённых групп, эта команда
+// нужна только чтобы точечно исключить (или вернуть) конкретный чат.
+// Только владелец, вызывать прямо в том чате, который нужно исключить.
+bot.command("watch", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  if (!OWNER_ID) {
+    await ctx.reply("не задан OWNER_ID в переменных окружения — некому слать уведомления в ЛС");
+    return;
+  }
+  const chatId = ctx.chat.id;
+  if (watchDisabledChats.has(chatId)) {
+    watchDisabledChats.delete(chatId);
+    await saveWatchDisabledChats();
+    await ctx.reply("слежку за этим чатом снова включил");
+  } else {
+    watchDisabledChats.add(chatId);
+    await saveWatchDisabledChats();
+    await ctx.reply("слежку за этим чатом выключил");
+  }
 });
 
 // Доступна только владельцу — сброс контекста диалога влияет на всех
