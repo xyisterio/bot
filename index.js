@@ -6584,6 +6584,98 @@ bot.on("message:photo", async (ctx) => {
 const DEEZER_INTENT_REGEX = /^(?:скинь|найди|включи|поставь|отправь|пришли)?\s*(?:песню|трек|музыку|мелодию|композицию)\s+["«]?(.*?)["»]?$/i;
 const DEEZER_COMMAND_REGEX = /^\/(?:song|deezer|music|track)(?:@\w+)?\s+(.+)$/i;
 
+// Референциальный запрос без явного названия — "скинь этот трек", "пришли
+// эту песню", "скинь её" и т.п. DEEZER_INTENT_REGEX такое не ловит: между
+// глаголом и словом "трек"/"песню" стоит местоимение, а не название.
+// Название в этом случае неизвестно из самого текста — его нужно достать
+// из контекста переписки через resolveTrackFromContext (см. ниже).
+const DEEZER_REFERENTIAL_REGEX =
+  /^(?:скинь|найди|включи|поставь|отправь|пришли)\s+(?:мне\s+)?(?:это|эту|этот|её|ее|его|той\s+же|той|тот\s+же|той\s+самой|ту\s+же|ту)\s*(?:песню|трек|музыку|мелодию|композицию)?\s*$/i;
+
+// Сколько последних сообщений диалога смотрим, пытаясь понять, о каком
+// треке речь (см. resolveTrackFromContext).
+const TRACK_CONTEXT_LOOKBACK = 8;
+const TRACK_CONTEXT_RESOLVE_TIMEOUT_MS = 12000;
+
+const TRACK_CONTEXT_SYSTEM_PROMPT =
+  "Тебе дана последняя переписка в чате. Пользователь просит прислать трек, но " +
+  "сослался на него местоимением (\"этот трек\", \"эту песню\", \"её\" и т.п.), не " +
+  "назвав его явно в своём сообщении. Определи по контексту переписки, какую " +
+  "именно песню (исполнитель и название) он имеет в виду — например, трек, " +
+  "который недавно упоминался или обсуждался в разговоре (не обязательно тот, " +
+  "что уже был прислан файлом). Ответь СТРОГО в формате \"Исполнитель - Название\" " +
+  "в оригинальном написании (латиницей, если оригинал на латинице), без кавычек " +
+  "и пояснений. Если по контексту невозможно понять, о какой песне речь, ответь " +
+  "ровно словом NONE.";
+
+const TRACK_QUERY_NORMALIZE_SYSTEM_PROMPT =
+  "Тебе дан поисковый запрос трека для Deezer, который мог быть написан с " +
+  "ошибками, кириллицей вместо оригинального написания (фонетическая " +
+  "транслитерация вроде \"Даугтри ИТС нот овер\") или неточно. Верни ИСПРАВЛЕННЫЙ " +
+  "запрос в формате \"Исполнитель - Название\" в оригинальном написании " +
+  "(латиницей, если оригинал на латинице), без кавычек и пояснений. Если не " +
+  "уверен на 100% — всё равно дай наиболее вероятный вариант, не отказывайся " +
+  "отвечать. Ответь только самим запросом, ничего больше.";
+
+// Общий хелпер: разовый (без истории) запрос к пулу Groq-целей — по тому же
+// принципу фолбэка по ключам/моделям, что и в других узких задачах в этом
+// файле. Не годится для тяжёлых промптов, только для маленьких
+// классификационных/нормализующих задач.
+async function askGroqOnceForTrack(systemPrompt, userContent, timeoutMs) {
+  const now = Date.now();
+  const groqTargetIndices = TARGETS.map((t, idx) => (t.provider === "groq" ? idx : -1)).filter((idx) => idx !== -1);
+  const availableGroqIndices = groqTargetIndices.filter((idx) => cooldownUntil[idx] <= now);
+  if (availableGroqIndices.length === 0) return null;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userContent },
+  ];
+
+  for (const idx of availableGroqIndices) {
+    const target = TARGETS[idx];
+    try {
+      const { reply } = await callTarget(target, messages, timeoutMs, 0.2);
+      const cleaned = reply.trim().replace(/^["«]+|["»]+$/g, "");
+      cooldownUntil[idx] = 0;
+      return cleaned || null;
+    } catch (err) {
+      console.error(
+        `askGroqOnceForTrack: ошибка у ${targetLabel(target)}:`,
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+      if (err.status && !isFallbackWorthy(err.status)) break;
+      cooldownUntil[idx] = Date.now() + MODEL_COOLDOWN_MS;
+    }
+  }
+  return null;
+}
+
+// Пытается понять, о каком треке речь, когда пользователь сослался на него
+// местоимением ("скинь этот трек") — смотрит на последние сообщения
+// диалога с ботом (та же история, что видит askLLM) и просит модель назвать
+// исполнителя и название. Возвращает null, если не удалось определить.
+async function resolveTrackFromContext(chatId) {
+  const history = getHistory(chatId).slice(-TRACK_CONTEXT_LOOKBACK);
+  if (!history.length) return null;
+
+  const transcript = history
+    .map((m) => `${m.role === "user" ? "Пользователь" : "Бот"}: ${m.content}`)
+    .join("\n");
+
+  const result = await askGroqOnceForTrack(TRACK_CONTEXT_SYSTEM_PROMPT, transcript, TRACK_CONTEXT_RESOLVE_TIMEOUT_MS);
+  if (!result || /^none$/i.test(result)) return null;
+  return result;
+}
+
+// Пытается восстановить нормальное написание трека из "шумного" запроса
+// (опечатки, фонетическая транслитерация кириллицей и т.п.) — используется
+// как фолбэк, когда прямой поиск по Deezer вернул пустой результат.
+async function normalizeTrackQueryViaLLM(rawQuery) {
+  return askGroqOnceForTrack(TRACK_QUERY_NORMALIZE_SYSTEM_PROMPT, rawQuery, TRACK_CONTEXT_RESOLVE_TIMEOUT_MS);
+}
+
 // Вопросы/комментарии о самой песне (реплай на сообщение бота с треком),
 // НЕ являющиеся новым явным поисковым запросом ("найди трек X" уже ловится
 // DEEZER_INTENT_REGEX выше) — такой текст не должен запускать повторный
@@ -6885,7 +6977,27 @@ async function handleDeezerLinkQuery(ctx, trackId) {
 
 async function handleDeezerQuery(ctx, query) {
   try {
-    const tracks = await searchDeezerTracks(query, 5);
+    let tracks = await searchDeezerTracks(query, 5);
+
+    // Прямой поиск ничего не дал — возможно, запрос "шумный" (опечатки,
+    // фонетическая транслитерация кириллицей вроде "Даугтри ИТС нот
+    // овер" и т.п.). Просим LLM восстановить нормальное написание и
+    // пробуем ещё раз, прежде чем сдаваться/уходить на SoundCloud.
+    if (!tracks || tracks.length === 0) {
+      try {
+        const normalized = await normalizeTrackQueryViaLLM(query);
+        if (normalized && normalized.toLowerCase() !== query.trim().toLowerCase()) {
+          const retryTracks = await searchDeezerTracks(normalized, 5);
+          if (retryTracks && retryTracks.length > 0) {
+            console.log(`Deezer: запрос "${query}" переформулирован как "${normalized}" и найден`);
+            tracks = retryTracks;
+          }
+        }
+      } catch (normErr) {
+        console.error("Ошибка нормализации запроса трека:", normErr.message || normErr);
+      }
+    }
+
     if (!tracks || tracks.length === 0) {
       // Если на Deezer не найдено и настроен SoundCloud - пробуем там
       if (SOUNDCLOUD_SERVER_URL) {
@@ -7269,6 +7381,20 @@ bot.on("message:text", async (ctx) => {
 
   // 1. Прямой intent-запрос ("скинь песню X", "найди трек X")
   const strippedText = stripBotAddressing(rawText, ctx);
+
+  // 1b. Референциальный запрос без названия ("скинь этот трек", "пришли
+  // её") — пытаемся понять из контекста переписки, о каком треке речь, и
+  // если получилось — ведём себя так же, как при обычном intent-запросе.
+  // Если понять не удалось, просто идём дальше обычным потоком (LLM сама
+  // разберётся, что ответить — например, переспросит название).
+  if (DEEZER_REFERENTIAL_REGEX.test(strippedText)) {
+    const resolvedTrack = await resolveTrackFromContext(chatId);
+    if (resolvedTrack) {
+      await handleDeezerQuery(ctx, resolvedTrack);
+      return;
+    }
+  }
+
   const deezerQuery = parseDeezerIntent(strippedText);
   if (deezerQuery) {
     // Проверяем, есть ли явное указание на SoundCloud
