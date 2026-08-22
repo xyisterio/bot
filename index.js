@@ -6711,7 +6711,15 @@ const TRACK_CONTEXT_SYSTEM_PROMPT =
   "шла речь) — определи, какую именно песню он имеет в виду. Ответь СТРОГО " +
   "в формате \"Исполнитель - Название\" в оригинальном написании (латиницей, " +
   "если оригинал на латинице), без кавычек и пояснений. Если невозможно " +
-  "понять, о какой песне речь, ответь ровно словом NONE.";
+  "понять, о какой песне речь, ответь ровно словом NONE. ВАЖНО: если " +
+  "исполнитель/трек в текущем сообщении похож на фонетическую " +
+  "транслитерацию кириллицей иностранного названия (например, \"трития " +
+  "рикошет\"), но ты НЕ уверен, что это конкретное известное " +
+  "исполнитель+название - не пытайся сам её \"причесать\" или досочинить " +
+  "правдоподобно выглядящее имя. Это отдельная задача другого шага " +
+  "распознавания. Вместо этого верни исходный текст как есть, без " +
+  "изменений (транслитерацией займутся позже) - или NONE, если это явно " +
+  "не про музыку вообще.";
 
 const TRACK_QUERY_NORMALIZE_SYSTEM_PROMPT =
   "Тебе дан поисковый запрос трека для Deezer, который мог быть написан с " +
@@ -7093,7 +7101,7 @@ async function handleDeezerLinkQuery(ctx, trackId) {
   }
 }
 
-async function handleDeezerQuery(ctx, query) {
+async function handleDeezerQuery(ctx, query, originalQuery) {
   try {
     let tracks = await searchDeezerTracks(query, 5);
 
@@ -7103,7 +7111,19 @@ async function handleDeezerQuery(ctx, query) {
     // пробуем ещё раз, прежде чем сдаваться/уходить на SoundCloud.
     if (!tracks || tracks.length === 0) {
       try {
-        const normalized = await normalizeTrackQueryViaLLM(query);
+        // Нормализуем по возможности ПОДЛИННЫЙ сырой текст пользователя
+        // (originalQuery), а не уже "причёсанный" resolveTrackQuery результат
+        // (query) - если он был передан и отличается от query. Иначе
+        // получается испорченный телефон: resolveTrackQuery не умеет сама
+        // расшифровывать фонетическую транслитерацию (это работа именно
+        // normalizeTrackQueryViaLLM) и иногда просто слегка причёсывает
+        // "шумный" текст во что-то похожее на имя ("трития рикошет" →
+        // "Трий Ю — Рикошет"), а normalizeTrackQueryViaLLM потом угадывает
+        // уже по этому вторично исказившемуся тексту, теряя всякую связь с
+        // оригиналом и уезжая в случайного артиста ещё дальше.
+        const sourceForNormalize =
+          originalQuery && originalQuery.trim() ? originalQuery : query;
+        const normalized = await normalizeTrackQueryViaLLM(sourceForNormalize);
         // "NONE" - модель явно отказалась гадать по нечитаемой
         // транслитерации (см. TRACK_QUERY_NORMALIZE_SYSTEM_PROMPT) - это
         // такой же честный отказ, как и null/пустая строка, и не должен
@@ -7111,7 +7131,7 @@ async function handleDeezerQuery(ctx, query) {
         if (normalized && !/^none$/i.test(normalized) && normalized.toLowerCase() !== query.trim().toLowerCase()) {
           const retryTracks = await searchDeezerTracks(normalized, 5);
           if (retryTracks && retryTracks.length > 0) {
-            console.log(`Deezer: запрос "${query}" переформулирован как "${normalized}" и найден`);
+            console.log(`Deezer: запрос "${query}" (исходный текст: "${sourceForNormalize}") переформулирован как "${normalized}" и найден`);
             tracks = retryTracks;
           }
         }
@@ -7512,7 +7532,7 @@ bot.on("message:text", async (ctx) => {
   if (isDeezerAmbiguousMusicRequest(strippedText)) {
     const resolvedTrack = await resolveTrackQuery(chatId, strippedText);
     if (resolvedTrack) {
-      await handleDeezerQuery(ctx, resolvedTrack);
+      await handleDeezerQuery(ctx, resolvedTrack, strippedText);
       return;
     }
     // Явно даём знать, что не поняли, о каком треке речь — вместо того,
