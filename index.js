@@ -7192,7 +7192,7 @@ function rememberSentDeezerTrack(chatId, track) {
   lastSentDeezerTrack.set(chatId, { id: track.id, artistId: track.artist?.id });
 }
 
-function normalizeForMatch(text) {
+function normalizeArtistMatchWords(text) {
   return (text || "")
     .toLowerCase()
     .replace(/[^a-zа-яё0-9\s]/gi, " ")
@@ -7201,11 +7201,11 @@ function normalizeForMatch(text) {
 }
 
 function reorderByArtistRelevance(query, tracks) {
-  const queryWords = new Set(normalizeForMatch(query));
+  const queryWords = new Set(normalizeArtistMatchWords(query));
   if (queryWords.size === 0) return tracks;
 
   const scored = tracks.map((t, i) => {
-    const artistWords = normalizeForMatch(t.artist?.name);
+    const artistWords = normalizeArtistMatchWords(t.artist?.name);
     const matches = artistWords.some((w) => w.length > 2 && queryWords.has(w));
     return { t, i, matches };
   });
