@@ -55,6 +55,13 @@ const PORT = process.env.PORT || 3000;
 const GIGAAM_SPACE = process.env.GIGAAM_SPACE || null;
 const GIGAAM_TIMEOUT_MS = Number(process.env.GIGAAM_TIMEOUT_MS) || 60000;
 
+// Свой Gradio Space с F5-TTS_RUSSIAN (озвучка ответов бота — см. /voice и
+// триггер "скажи голосом" ниже, а также app.py в инструкции по деплою).
+// Тот же принцип, что и GIGAAM_SPACE выше: своя переменная, свой контейнер,
+// без неё команда /voice и триггер просто вежливо скажут, что не настроено.
+const TTS_SPACE = process.env.TTS_SPACE || null;
+const TTS_TIMEOUT_MS = Number(process.env.TTS_TIMEOUT_MS) || 90000;
+
 // TMDB (themoviedb.org) — для поиска фильмов по команде "фильм <название>"
 // (см. блок "Поиск фильмов (TMDB)" ниже). Опционально: без ключа бот просто
 // вежливо ответит, что поиск фильмов не настроен, а не упадёт при старте.
@@ -2962,20 +2969,50 @@ async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS, temp
   return { reply, actualModel, systemFingerprint };
 }
 
+// Триггер для подключения BOT_SKILLS_PROMPT (см. skills.js). Раньше этот
+// блок (~28 КБ текста) подмешивался в системный промпт КАЖДОГО сообщения
+// в чате, хотя реально нужен только когда человек спрашивает про сам
+// функционал бота — "что ты умеешь", "как сделать чтобы ты...", "как
+// этим пользоваться" и т.п. Для подавляющего большинства обычных реплик
+// это чистый балласт: лишние токены на каждый запрос (TPM-лимиты Groq и
+// объём контекста на Gemini), без всякой пользы для ответа. Подключаем
+// блок только при совпадении с этим паттерном — сознательно с запасом
+// (лучше иногда подключить зря, чем не подключить, когда реально нужно).
+// ВАЖНО: \w в JS-регекспах без /u матчит только ASCII, кириллицу НЕ ловит —
+// поэтому ниже везде конкретные окончания или \S* вместо \w*.
+const SKILLS_PROMPT_TRIGGER_REGEX = new RegExp(
+  [
+    "умеешь",
+    "умеет\\s*ли",
+    "можешь\\s*ли",
+    "ты\\s*(?:вообще\\s*)?можешь",
+    "способн\\S*\\s*ли",
+    "что\\s*за\\s*бот",
+    "как(?:ие|ой|ая)?\\s*у\\s*тебя\\s*функци",
+    "тво\\S+\\s*функци",
+    "тво\\S+\\s*возможност",
+    "как\\s*(?:мне\\s*)?(?:тебя\\s*|этим\\s*)?(?:сделать|пользоваться|воспользоваться|играть|начать\\s*играть|запустить|включить|активировать|вызвать|начать)",
+  ].join("|"),
+  "i"
+);
+
+function shouldIncludeSkillsPrompt(userText) {
+  return SKILLS_PROMPT_TRIGGER_REGEX.test(userText);
+}
+
 // ==== Запрос к LLM с фолбэком по провайдерам и моделям ====
 async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
   const history = getHistory(chatId);
 
+  // BOT_SKILLS_PROMPT — только когда похоже, что реально спрашивают про
+  // функционал (см. SKILLS_PROMPT_TRIGGER_REGEX выше). buildMemoryPromptBlock —
+  // пункты, которые явно попросили запомнить именно в этом чате командой
+  // "запомни: ..." (см. память чата выше); пустая строка, если ничего не
+  // запоминали — SYSTEM_PROMPT/промпт не меняется.
+  const skillsBlock = shouldIncludeSkillsPrompt(userText) ? "\n\n" + BOT_SKILLS_PROMPT : "";
+
   const messages = [
-    // BOT_SKILLS_PROMPT (см. skills.js) подмешан отдельным блоком в конец
-    // системного промпта — это знания бота о собственном функционале
-    // (погода/шахматы/фильмы/музыка/крокодил/пересказ и т.п.), нужны,
-    // чтобы модель могла осмысленно отвечать на вопросы вида "что ты
-    // умеешь"/"как сделать чтобы ты..." своим языком, а не сухим списком.
-    // buildMemoryPromptBlock — пункты, которые явно попросили запомнить
-    // именно в этом чате командой "запомни: ..." (см. память чата выше);
-    // пустая строка, если ничего не запоминали — SYSTEM_PROMPT/промпт не меняется.
-    { role: "system", content: SYSTEM_PROMPT + buildMemoryPromptBlock(chatId) + "\n\n" + BOT_SKILLS_PROMPT },
+    { role: "system", content: SYSTEM_PROMPT + buildMemoryPromptBlock(chatId) + skillsBlock },
     ...history,
     { role: "user", content: userText },
   ];
@@ -3374,6 +3411,7 @@ async function loadPersistedState() {
       savedIdx,
       savedPinnedIdx,
       savedWatchDisabledChats,
+      savedVoiceEnabledChats,
     ] = await Promise.all([
       redis.keys("history:*"),
       redis.keys("chatlog:*"),
@@ -3391,6 +3429,7 @@ async function loadPersistedState() {
       redis.get("activeTargetIndex"),
       redis.get("pinnedTargetIndex"),
       redis.get("watchDisabledChats"),
+      redis.get("voiceEnabledChats"),
     ]);
 
     await Promise.all(
@@ -3548,6 +3587,12 @@ async function loadPersistedState() {
       }
     }
 
+    if (Array.isArray(savedVoiceEnabledChats)) {
+      for (const chatId of savedVoiceEnabledChats) {
+        if (Number.isInteger(chatId)) voiceEnabledChats.add(chatId);
+      }
+    }
+
     console.log(
       `Восстановлено из Redis: истории — ${historyKeys.length}, логи чатов — ${chatLogKeys.length}, алиасы — ${aliasKeys.length}, ` +
         `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}, шахматные партии — ${chessKeys.length}, ` +
@@ -3556,7 +3601,8 @@ async function loadPersistedState() {
         `память чатов — ${memoryKeys.length} чатов, реестр чатов — ${knownChats.size}` +
         (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "") +
         (pinnedTargetIndex !== null ? `, закреплена вручную — индекс ${pinnedTargetIndex}` : "") +
-        `, чатов с выключенной слежкой (watch) — ${watchDisabledChats.size}`
+        `, чатов с выключенной слежкой (watch) — ${watchDisabledChats.size}` +
+        `, чатов с включённым голосом — ${voiceEnabledChats.size}`
     );
   } catch (err) {
     console.error("Не удалось восстановить состояние из Redis, стартую с чистой памятью:", err);
@@ -3770,6 +3816,26 @@ async function saveWatchDisabledChats() {
   }
 }
 
+// ==== Режим голоса ("/voice") ====
+// Чаты, где ответы бота ДОПОЛНИТЕЛЬНО озвучиваются голосовым сообщением
+// (см. хук в самом конце bot.on("message:text") — рядом с обычной
+// отправкой текстового reply, и триггер "скажи голосом"/"озвучь" ниже для
+// разового вызова без включения режима на весь чат). По умолчанию
+// выключено везде — список ВКЛЮЧЁННЫХ чатов, персистится в Redis одним
+// массивом под ключом "voiceEnabledChats" (тот же паттерн, что
+// watchDisabledChats выше, только с обратным смыслом — там список
+// исключений, тут список включений).
+const voiceEnabledChats = new Set();
+
+async function saveVoiceEnabledChats() {
+  if (!redis) return;
+  try {
+    await redis.set("voiceEnabledChats", Array.from(voiceEnabledChats));
+  } catch (err) {
+    console.error("Не удалось сохранить список чатов с включённым голосом:", err);
+  }
+}
+
 // Слежка включена по умолчанию для любого группового/супергруппового чата
 // (личка и каналы не считаются — уведомлять там не о чем), если только
 // хозяин явно не выключил её через /watch.
@@ -3852,6 +3918,31 @@ bot.command("watch", async (ctx) => {
     watchDisabledChats.add(chatId);
     await saveWatchDisabledChats();
     await ctx.reply("слежку за этим чатом выключил");
+  }
+});
+
+// Включает/выключает режим голоса в ЭТОМ чате — пока включён, каждый
+// обычный текстовый ответ бота (через askLLM, см. хук в конце
+// message:text) ДОПОЛНИТЕЛЬНО дублируется голосовым сообщением через
+// synthesizeSpeech. Влияет на всех участников чата, поэтому — как и
+// /watch/reset — только владелец. Разовая озвучка отдельного ответа без
+// включения режима на весь чат — см. триггер "скажи голосом"/"озвучь"
+// ниже, он работает независимо от этого тумблера.
+bot.command("voice", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  if (!TTS_SPACE) {
+    await ctx.reply("озвучка не настроена — не задан TTS_SPACE в переменных окружения");
+    return;
+  }
+  const chatId = ctx.chat.id;
+  if (voiceEnabledChats.has(chatId)) {
+    voiceEnabledChats.delete(chatId);
+    await saveVoiceEnabledChats();
+    await ctx.reply("режим голоса в этом чате выключил — дальше отвечаю только текстом");
+  } else {
+    voiceEnabledChats.add(chatId);
+    await saveVoiceEnabledChats();
+    await ctx.reply("режим голоса в этом чате включил — теперь буду дублировать ответы голосом");
   }
 });
 
@@ -6237,6 +6328,87 @@ async function transcribeViaGigaAM(buffer, ext, forceGiga = false) {
   }
 }
 
+// ==== Озвучка текста через свой F5-TTS_RUSSIAN Space (см. /voice и
+// триггер "скажи голосом" ниже) ====
+// Тот же принцип, что и GigaAM выше: отдельное соединение (свой Space,
+// свой контейнер), холодный старт после простоя может идти долго —
+// TTS_TIMEOUT_MS с тем же запасом. Если TTS_SPACE не задан, Space не
+// ответил вовремя или упал — synthesizeSpeech просто возвращает null,
+// вызывающий код сам решает, как об этом сказать пользователю.
+let ttsGradioClientPromise = null;
+function getTtsGradioClient() {
+  if (!ttsGradioClientPromise) {
+    ttsGradioClientPromise = GradioClient.connect(TTS_SPACE).catch((err) => {
+      ttsGradioClientPromise = null; // при неудаче — пробуем переподключиться в следующий раз
+      throw err;
+    });
+  }
+  return ttsGradioClientPromise;
+}
+
+// Убирает то, что вслух звучит криво или вообще не должно озвучиваться —
+// блоки кода, инлайн-код, голые ссылки, служебные [теги] вроде
+// [sticker: ...] (если вдруг долетят необрезанными). Не идеально, но
+// заметно улучшает результат на обычных бытовых ответах бота.
+function stripForVoice(text) {
+  return (text || "")
+    .replace(/```[\s\S]*?```/g, " код прилагается текстом ")
+    .replace(/`[^`]+`/g, " ")
+    .replace(/https?:\/\/\S+/g, " ссылка ")
+    .replace(/\[[a-z_]+:[^\]]*\]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Возвращает Buffer с аудио или null. text уже должен быть прогнан через
+// stripForVoice вызывающим кодом — эта функция ничего не чистит сама,
+// просто честно озвучивает то, что ей дали.
+async function synthesizeSpeech(text) {
+  if (!TTS_SPACE || !text) return null;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), TTS_TIMEOUT_MS);
+  try {
+    const client = await getTtsGradioClient();
+    // /tts — эндпоинт из своего app.py (см. деплой-инструкцию), единственный
+    // обязательный вход "text"; референсный голос для клонирования зашит
+    // в сам Space, чтобы не гонять аудио-файл на каждый вызов.
+    const result = await client.predict("/tts", { text });
+    const audioUrl = result?.data?.[0]?.url;
+    if (!audioUrl) return null;
+    const resp = await fetch(audioUrl, { signal: controller.signal });
+    if (!resp.ok) return null;
+    return Buffer.from(await resp.arrayBuffer());
+  } catch (err) {
+    console.error("TTS-Space: не удалось озвучить:", err.message || err);
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// Хук для режима /voice (см. voiceEnabledChats выше) — вызывается ПОСЛЕ
+// того, как обычный текстовый ответ уже реально ушёл в чат (не раньше:
+// если синтез зависнет/упадёт, текстовый ответ пользователь всё равно
+// получит вовремя, голос — это всегда ДОПОЛНЕНИЕ, а не замена и не
+// блокировка обычного ответа). Тихо ничего не делает, если режим в этом
+// чате выключен, TTS не настроен или синтез не удался — никаких сообщений
+// об ошибке сюда специально не шлём, чтобы не спамить при регулярных
+// осечках Space (в отличие от разового "скажи голосом" выше, где ошибку
+// озвучки уместно показать явно).
+async function maybeSendVoiceReply(ctx, chatId, replyText) {
+  if (!TTS_SPACE || !voiceEnabledChats.has(chatId)) return;
+  try {
+    const audioBuffer = await synthesizeSpeech(stripForVoice(replyText));
+    if (audioBuffer) {
+      await ctx.replyWithVoice(new InputFile(audioBuffer, "voice.ogg"), {
+        message_thread_id: ctx.message.message_thread_id,
+      });
+    }
+  } catch (err) {
+    console.error(`Режим голоса: не удалось озвучить ответ в чате ${chatId}:`, err.message || err);
+  }
+}
+
 // Ручной выбор движка распознавания из текста команды — "Жень текст
 // Whisper" / "Жень расшифруй через гигу" и т.п. Нужен на случай, когда
 // GigaAM (или, наоборот, авто-язык) ошибается — например, языковая
@@ -8478,6 +8650,46 @@ bot.on("message:text", async (ctx) => {
     }
   }
 
+  // ==== "Скажи голосом: ..." / "озвучь ..." — разовая озвучка текста ====
+  // Работает независимо от режима /voice на весь чат (см. voiceEnabledChats
+  // выше) — это разовый вызов, ничего не переключает и не персистится.
+  // Два варианта: 1) с текстом сразу в команде ("Жень, скажи голосом:
+  // купи молока") — озвучиваем именно этот текст; 2) реплаем на
+  // предыдущее сообщение бота, без текста после самой команды ("озвучь" /
+  // "скажи голосом" реплаем на ответ бота) — берём текст того сообщения
+  // через getBotReply (тот же кэш, что использует "Трейлер"/"как он
+  // тебе?" ниже).
+  if (TTS_SPACE) {
+    const voiceCommandText = stripBotAddressing(rawText, ctx);
+    const voiceMatch = voiceCommandText.match(/^(?:скажи\s+голосом|озвучь)[,:]?\s*([\s\S]*)$/i);
+    if (voiceMatch) {
+      const replyOpts = {
+        reply_parameters: { message_id: ctx.message.message_id },
+        message_thread_id: ctx.message.message_thread_id,
+      };
+      let textToVoice = voiceMatch[1].trim();
+      if (!textToVoice && isReplyToBot(ctx)) {
+        const repliedBotMsg = getBotReply(chatId, ctx.message.reply_to_message.message_id);
+        if (repliedBotMsg) textToVoice = repliedBotMsg.text;
+      }
+      if (!textToVoice) {
+        await ctx.reply(
+          "озвучить что? напиши текст после команды, либо реплайни этим на моё сообщение",
+          replyOpts
+        );
+        return;
+      }
+      sendTypingAction(ctx);
+      const audioBuffer = await synthesizeSpeech(stripForVoice(textToVoice));
+      if (audioBuffer) {
+        await ctx.replyWithVoice(new InputFile(audioBuffer, "voice.ogg"), replyOpts);
+      } else {
+        await ctx.reply("не получилось озвучить — Space не ответил или недоступен", replyOpts);
+      }
+      return;
+    }
+  }
+
   // ==== "Трейлер" реплаем на карточку фильма/сериала ====
   // Отдельно от блока ниже ("как он тебе?"), потому что тут нужен не
   // текст для LLM, а прямое действие в обход модели — сходить на TMDB за
@@ -9250,9 +9462,11 @@ bot.on("message:text", async (ctx) => {
         message_thread_id: ctx.message.message_thread_id,
       });
       rememberBotReply(chatId, sentMsg.message_id, senderDisplayName, reply);
+      await maybeSendVoiceReply(ctx, chatId, reply);
     } else {
       const sentMsg = await ctx.reply(reply);
       rememberBotReply(chatId, sentMsg.message_id, senderDisplayName, reply);
+      await maybeSendVoiceReply(ctx, chatId, reply);
     }
   } catch (err) {
     console.error("Ошибка обработки сообщения:", err);
