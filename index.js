@@ -3017,6 +3017,25 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
     { role: "user", content: userText },
   ];
 
+  // Урезанный вариант ТОЛЬКО для Groq: даже без BOT_SKILLS_PROMPT полный
+  // контекст (SYSTEM_PROMPT + память чата + вся HISTORY_LIMIT) стабильно
+  // превышает 8000 TPM free tier у gpt-oss-120b/qwen на Groq (см.
+  // isFallbackWorthy выше) — это структурный потолок конкретно этих
+  // моделей, а не что-то лечащееся точечно. Резать HISTORY_LIMIT глобально
+  // ради этого не вариант — это ударит по памяти диалога в основном
+  // провайдере (Gemini), а Groq и так дёргается только как редкий
+  // аварийный фолбэк. Поэтому урезаем контекст ТОЛЬКО в момент обращения
+  // к Groq: без блока памяти чата, с последними 4 репликами истории
+  // (2 обмена) вместо полных 12 — Gemini и другие провайдеры этого не
+  // видят вообще, получают messages как обычно.
+  const groqMessages = [
+    { role: "system", content: SYSTEM_PROMPT + skillsBlock },
+    ...history.slice(-4),
+    { role: "user", content: userText },
+  ];
+
+  const messagesForTarget = (target) => (target.provider === "groq" ? groqMessages : messages);
+
   let lastErr;
 
   const order = computeTargetOrder();
@@ -3025,7 +3044,11 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
     const target = TARGETS[idx];
 
     try {
-      const { reply: rawReply, actualModel, systemFingerprint } = await callTarget(target, messages, timeoutMs);
+      const { reply: rawReply, actualModel, systemFingerprint } = await callTarget(
+        target,
+        messagesForTarget(target),
+        timeoutMs
+      );
       // ВРЕМЕННЫЙ DEBUG-ЛОГ — убрать после проверки тегов [sticker: ...].
       // Показывает сырой ответ модели ДО вырезания тега, чтобы понять,
       // ставит ли модель тег вообще, и если ставит — с правильным ли ключом.
