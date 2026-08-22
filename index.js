@@ -595,6 +595,23 @@ function isReplyToBot(ctx) {
   return false;
 }
 
+// Адресовано ли сообщение боту тем же набором сигналов, что и общий
+// чат-триггер в группе (обращение по имени "Женя", реплай на сообщение
+// бота, упоминание через @username) — используется, чтобы двусмысленные
+// интенты вроде isDeezerAmbiguousMusicRequest не разбирали вообще любое
+// сообщение в группе (см. баг с "запчасти пришли" / "предашь"), а только
+// те, что реально обращены к боту.
+function isBotAddressed(ctx, text) {
+  if (nameTriggerRegex.test(text)) return true;
+  if (isReplyToBot(ctx)) return true;
+  const mentioned = ctx.message?.entities?.some(
+    (e) =>
+      e.type === "mention" &&
+      text.substring(e.offset, e.offset + e.length).toLowerCase() === `@${ctx.me.username?.toLowerCase()}`
+  );
+  return !!mentioned;
+}
+
 // Отправляет статус "печатает..." в нужный тред чата
 function sendTypingAction(ctx) {
   if (!ctx.chat?.id) return Promise.resolve();
@@ -7556,7 +7573,18 @@ bot.on("message:text", async (ctx) => {
   // сообщения и контекста переписки, о каком треке речь, и если
   // получилось — ведём себя так же, как при обычном intent-запросе.
   // Если понять не удалось, явно сообщаем об этом (см. ниже).
-  if (isDeezerAmbiguousMusicRequest(strippedText)) {
+  //
+  // ВАЖНО: в группе гоняем через этот разбор только сообщения, реально
+  // адресованные боту (обращение по имени "Женя", реплай на сообщение
+  // бота, упоминание через @username) — см. isBotAddressed. Без этого
+  // гейта широкие regex'ы внутри isDeezerAmbiguousMusicRequest (ловящие
+  // подстроки вроде "пришл"/"дашь" где угодно в тексте) разбирали вообще
+  // любую реплику в чате, включая не адресованные боту вовсе — например
+  // "запчасти пришли" (прошедшее время "прийти", а не просьба прислать
+  // трек) или "предашь" (подстрока "дашь" внутри не связанного слова).
+  // В личке (isGroup === false) это ограничение не нужно — там боту
+  // адресовано вообще всё.
+  if ((!isGroup || isBotAddressed(ctx, rawText)) && isDeezerAmbiguousMusicRequest(strippedText)) {
     const resolvedTrack = await resolveTrackQuery(chatId, strippedText);
     if (resolvedTrack) {
       await handleDeezerQuery(ctx, resolvedTrack, strippedText);
