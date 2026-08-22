@@ -7167,6 +7167,65 @@ function getSoundCloudTrackMeta(track = {}) {
   };
 }
 
+// ==== Выбор конкретного трека из списка кандидатов Deezer ====
+// Deezer /search сам ранжирует по релевантности, но у этого два практических
+// последствия, с которыми сталкивается пользователь:
+// 1) иногда в топ проскакивает совсем левый исполнитель — например по
+//    запросу "сектор газа частушки" вторым результатом может оказаться
+//    ремикс/нарезка совсем другого автора, просто из-за совпадения слов в
+//    названии трека. Такие подвигаем в конец, если хотя бы у одного из
+//    кандидатов имя исполнителя явно встречается в запросе (см.
+//    reorderByArtistRelevance) — но не трогаем порядок вообще, если в
+//    запросе нет узнаваемого имени исполнителя ни у кого (обычные запросы
+//    без исполнителя не должны из-за этого ломаться).
+// 2) на повторный похожий запрос в том же чате ("а других нету?", "ещё
+//    разок" и т.п.) resolveTrackQuery сводит текст к тому же самому
+//    "Исполнитель - Название", Deezer возвращает тот же список, и без этой
+//    логики handleDeezerQuery всегда брал бы tracks[0] — тот же самый
+//    трек, что уже отправляли. Поэтому запоминаем id последнего реально
+//    отправленного в чате трека (см. lastSentDeezerTrack/
+//    rememberSentDeezerTrack) и при следующем выборе пропускаем его,
+//    беря следующего по релевантности кандидата.
+const lastSentDeezerTrack = new Map(); // chatId -> { id, artistId }
+
+function rememberSentDeezerTrack(chatId, track) {
+  lastSentDeezerTrack.set(chatId, { id: track.id, artistId: track.artist?.id });
+}
+
+function normalizeForMatch(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^a-zа-яё0-9\s]/gi, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function reorderByArtistRelevance(query, tracks) {
+  const queryWords = new Set(normalizeForMatch(query));
+  if (queryWords.size === 0) return tracks;
+
+  const scored = tracks.map((t, i) => {
+    const artistWords = normalizeForMatch(t.artist?.name);
+    const matches = artistWords.some((w) => w.length > 2 && queryWords.has(w));
+    return { t, i, matches };
+  });
+
+  const anyMatch = scored.some((s) => s.matches);
+  if (!anyMatch) return tracks; // в запросе нет узнаваемого имени исполнителя вообще — не мешаем
+
+  return scored.sort((a, b) => Number(b.matches) - Number(a.matches) || a.i - b.i).map((s) => s.t);
+}
+
+function chooseDeezerTrack(chatId, query, tracks) {
+  const ordered = reorderByArtistRelevance(query, tracks);
+  const last = lastSentDeezerTrack.get(chatId);
+  if (last) {
+    const alternative = ordered.find((t) => t.id !== last.id);
+    if (alternative) return alternative;
+  }
+  return ordered[0];
+}
+
 async function searchDeezerTracks(query, limit = 10) {
   const url = `https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=${limit}`;
   const res = await fetch(url);
@@ -7442,7 +7501,7 @@ async function handleDeezerQuery(ctx, query, originalQuery) {
       markDeezerFlowMessage(ctx.chat.id, notFoundMsg.message_id);
       return;
     }
-    await handleDeezerTrackObject(ctx, tracks[0]);
+    await handleDeezerTrackObject(ctx, chooseDeezerTrack(ctx.chat.id, query, tracks));
   } catch (err) {
     console.error("Ошибка при получении трека Deezer:", err.message || err);
     const errMsg = await ctx.reply("⚠️ Не удалось загрузить трек с Deezer. Попробуй позже.");
@@ -7457,6 +7516,11 @@ async function handleDeezerQuery(ctx, query, originalQuery) {
 async function handleDeezerTrackObject(ctx, bestTrack) {
   try {
     const trackMeta = getDeezerTrackMeta(bestTrack);
+    // Запоминаем ДО отправки (а не после) — даже если дальше по каким-то
+    // причинам отправка не удастся, при следующем запросе в этом чате всё
+    // равно не должны сразу же снова предложить именно этот трек как
+    // первый кандидат (см. chooseDeezerTrack/lastSentDeezerTrack выше).
+    rememberSentDeezerTrack(ctx.chat.id, bestTrack);
     const statusMsg = await ctx.reply(`🎵 Загружаю «${bestTrack.artist?.name || ""} — ${bestTrack.title}»...`);
     markDeezerFlowMessage(ctx.chat.id, statusMsg.message_id);
 
