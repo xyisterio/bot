@@ -6736,16 +6736,43 @@ const TRACK_QUERY_NORMALIZE_SYSTEM_PROMPT =
   "ровно словом NONE. Лучше честно не найти, чем прислать заведомо другую " +
   "песню. Ответь только самим запросом или словом NONE, ничего больше.";
 
+// Порядок целей "с нуля": как computeTargetOrder (cooldown-цели в конец,
+// пин через /model — первым), но БЕЗ ротации от activeTargetIndex — всегда
+// начинаем с начала TARGETS (обычно это основной провайдер/аккаунт, напр.
+// gemini/gemini-flash-latest аккаунт 1), а не с той цели, на которой сейчас
+// "застрял" общий разговорный поток. Используется там, где нужен разовый,
+// не завязанный на текущее состояние ротации запрос (см. askOnceForTrack) —
+// иначе такой запрос стартовал бы с того же места, где случайно остановилась
+// ротация обычного чата (см. activeTargetIndex/computeTargetOrder), и мог бы
+// сходу упереться в аккаунт/модель, которые сейчас не отвечают, хотя основной
+// провайдер прекрасно доступен.
+function computeStaticTargetOrder() {
+  const now = Date.now();
+  let order = [...TARGETS.keys()].sort((a, b) => {
+    const aCold = cooldownUntil[a] > now ? 1 : 0;
+    const bCold = cooldownUntil[b] > now ? 1 : 0;
+    return aCold - bCold || a - b;
+  });
+
+  if (pinnedTargetIndex !== null && cooldownUntil[pinnedTargetIndex] <= now) {
+    order = [pinnedTargetIndex, ...order.filter((idx) => idx !== pinnedTargetIndex)];
+  }
+
+  return order;
+}
+
 // Общий хелпер: разовый (без истории чата) запрос к общему пулу целей
-// (TARGETS) с фолбэком по провайдерам/моделям — переиспользует тот же
-// computeTargetOrder(), что и askLLM, поэтому уважает основной провайдер
-// пользователя (напр. Gemini) и не завязан жёстко на Groq. Раньше это было
-// захардкожено только на Groq-цели — из-за этого при мёртвой/недоступной
-// модели на Groq функция возвращала null, даже если Gemini прекрасно
-// работал. Не годится для тяжёлых промптов, только для маленьких
-// классификационных/нормализующих задач.
+// (TARGETS) с фолбэком по провайдерам/моделям — переиспользует тот же пул
+// TARGETS, что и askLLM (поэтому уважает основной провайдер пользователя,
+// напр. Gemini, и не завязан жёстко на Groq), но со СВОИМ порядком через
+// computeStaticTargetOrder() — всегда от начала списка, а не с текущей
+// точки ротации обычного чата (см. комментарий над computeStaticTargetOrder).
+// Раньше это было захардкожено только на Groq-цели — из-за этого при
+// мёртвой/недоступной модели на Groq функция возвращала null, даже если
+// Gemini прекрасно работал. Не годится для тяжёлых промптов, только для
+// маленьких классификационных/нормализующих задач.
 async function askOnceForTrack(systemPrompt, userContent, timeoutMs) {
-  const order = computeTargetOrder();
+  const order = computeStaticTargetOrder();
   if (order.length === 0) return null;
 
   const messages = [
