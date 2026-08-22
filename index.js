@@ -2972,7 +2972,10 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
     // (погода/шахматы/фильмы/музыка/крокодил/пересказ и т.п.), нужны,
     // чтобы модель могла осмысленно отвечать на вопросы вида "что ты
     // умеешь"/"как сделать чтобы ты..." своим языком, а не сухим списком.
-    { role: "system", content: SYSTEM_PROMPT + "\n\n" + BOT_SKILLS_PROMPT },
+    // buildMemoryPromptBlock — пункты, которые явно попросили запомнить
+    // именно в этом чате командой "запомни: ..." (см. память чата выше);
+    // пустая строка, если ничего не запоминали — SYSTEM_PROMPT/промпт не меняется.
+    { role: "system", content: SYSTEM_PROMPT + buildMemoryPromptBlock(chatId) + "\n\n" + BOT_SKILLS_PROMPT },
     ...history,
     { role: "user", content: userText },
   ];
@@ -3230,6 +3233,122 @@ function typingDelayMs(replyLength) {
   return base + jitter;
 }
 
+// ==== Память чата ("запомни: ..." / "забудь ...") ====
+// Отдельные факты/правила, которые бот должен постоянно учитывать именно
+// в этом чате (например "цены указывай в долларах"). В отличие от
+// истории диалога (см. histories выше) не устаревает и не чистится
+// командой /reset — подмешивается отдельным блоком в системный промпт
+// на каждый запрос (см. buildMemoryPromptBlock в askLLM). Живёт в памяти
+// как кэш, зеркалится в Redis (ключ memory:{chatId}) — см.
+// loadPersistedState() при старте.
+const chatMemory = new Map(); // chatId -> [{ text, addedBy, addedAt }]
+
+function getMemoryList(chatId) {
+  if (!chatMemory.has(chatId)) chatMemory.set(chatId, []);
+  return chatMemory.get(chatId);
+}
+
+async function saveMemory(chatId) {
+  if (!redis) return true; // персистентности нет, но в оперативной памяти всё равно уже лежит
+  try {
+    const list = getMemoryList(chatId);
+    if (list.length === 0) await redis.del(`memory:${chatId}`);
+    else await redis.set(`memory:${chatId}`, list);
+    return true;
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить память чата ${chatId}:`, err);
+    return false;
+  }
+}
+
+// Возвращает { position, saved }: position — номер (1-based) только что
+// добавленного пункта, saved — реально ли запись улетела в Redis (а не
+// просто повисла в оперативной памяти процесса). saved нужен вызывающему
+// коду, чтобы стикер-подтверждение (см. MEMORY_CONFIRM_STICKER_FILE_ID)
+// слался только когда запоминание действительно произошло, а не по факту
+// вызова функции.
+async function addMemoryItem(chatId, text, addedBy) {
+  const list = getMemoryList(chatId);
+  list.push({ text, addedBy: addedBy || null, addedAt: Date.now() });
+  const saved = await saveMemory(chatId);
+  return { position: list.length, saved };
+}
+
+// index — 1-based номер пункта, как показывается в /memory и в ответах бота.
+function removeMemoryItem(chatId, index) {
+  const list = getMemoryList(chatId);
+  if (!Number.isInteger(index) || index < 1 || index > list.length) return false;
+  list.splice(index - 1, 1);
+  saveMemory(chatId);
+  return true;
+}
+
+function clearMemory(chatId) {
+  chatMemory.set(chatId, []);
+  saveMemory(chatId);
+}
+
+// Блок для системного промпта — пустая строка, если в чате ничего не запомнено.
+function buildMemoryPromptBlock(chatId) {
+  const list = getMemoryList(chatId);
+  if (list.length === 0) return "";
+  const lines = list.map((item, i) => `${i + 1}. ${item.text}`);
+  return (
+    "\n\nВ этом чате тебя явно попросили запомнить и всегда учитывать следующее " +
+    "(это обязательные правила именно для этого чата, а не просто пожелания):\n" +
+    lines.join("\n")
+  );
+}
+
+// Ожидание текста для /memory -> "➕ добавить": ownerId -> chatId, куда
+// добавить следующее текстовое сообщение владельца бота (откуда угодно,
+// хоть из личных сообщений — см. кнопку memadd в callback_query ниже).
+const pendingMemoryAdd = new Map();
+
+// Стикер-подтверждение "реально запомнил" — шлётся ТОЛЬКО кодом, и только
+// после того как addMemoryItem() подтвердил (saved === true), что запись
+// действительно улетела в Redis, а не просто оказалась в оперативной
+// памяти процесса. Никогда не отдаётся LLM как тег для самостоятельной
+// вставки (в отличие от extractSticker/[sticker: ...] у обычных
+// бантер-стикеров) — именно поэтому не может вылететь "для вида", когда
+// на самом деле ничего не сохранилось.
+const MEMORY_CONFIRM_STICKER_FILE_ID =
+  process.env.MEMORY_CONFIRM_STICKER_FILE_ID ||
+  "CAACAgIAAxkBAAFSbOBqiY9OESVr-0fcYfsQsXwg0DlNAgACc6YAAqyooUvZTPmNIYlDWz0E";
+
+// ==== Реестр чатов, где бот хоть раз получил сообщение (для /memory —
+// выбор чата кнопками) ====
+// chatId -> человекочитаемое название (title группы либо имя/юзернейм в
+// личке). Зеркалится в Redis одним ключом "known_chats". Обновляется на
+// каждое входящее сообщение (см. rememberKnownChat в глобальном
+// bot.use middleware выше).
+const knownChats = new Map(); // chatId -> title
+
+async function saveKnownChats() {
+  if (!redis) return;
+  try {
+    await redis.set("known_chats", Object.fromEntries(knownChats));
+  } catch (err) {
+    console.error("Redis: не удалось сохранить реестр чатов:", err);
+  }
+}
+
+function chatDisplayTitle(ctx) {
+  if (ctx.chat.type === "private") {
+    const c = ctx.chat;
+    return c.username ? `@${c.username} (личка)` : `${[c.first_name, c.last_name].filter(Boolean).join(" ") || "личка"}`;
+  }
+  return ctx.chat.title || String(ctx.chat.id);
+}
+
+function rememberKnownChat(ctx) {
+  if (!ctx.chat) return;
+  const title = chatDisplayTitle(ctx);
+  if (knownChats.get(ctx.chat.id) === title) return; // не изменилось — незачем писать в Redis
+  knownChats.set(ctx.chat.id, title);
+  saveKnownChats();
+}
+
 // ==== Восстановление состояния из Redis при старте ====
 // Читает всё, что успели сохранить save*-хелперы выше, обратно в
 // оперативные Map'ы, чтобы после рестарта бот "помнил" контекст диалогов,
@@ -3250,6 +3369,8 @@ async function loadPersistedState() {
       krokodilScoreKeys,
       profileKeys,
       memberNameKeys,
+      memoryKeys,
+      savedKnownChats,
       savedIdx,
       savedPinnedIdx,
       savedWatchDisabledChats,
@@ -3265,6 +3386,8 @@ async function loadPersistedState() {
       redis.keys("krokodil_scores:*"),
       redis.keys("profiles:*"),
       redis.keys("members:*"),
+      redis.keys("memory:*"),
+      redis.get("known_chats"),
       redis.get("activeTargetIndex"),
       redis.get("pinnedTargetIndex"),
       redis.get("watchDisabledChats"),
@@ -3392,6 +3515,20 @@ async function loadPersistedState() {
       })
     );
 
+    await Promise.all(
+      memoryKeys.map(async (key) => {
+        const chatId = Number(key.slice("memory:".length));
+        const data = await redis.get(key);
+        if (Array.isArray(data)) chatMemory.set(chatId, data);
+      })
+    );
+
+    if (savedKnownChats && typeof savedKnownChats === "object") {
+      for (const [chatIdRaw, title] of Object.entries(savedKnownChats)) {
+        knownChats.set(Number(chatIdRaw), title);
+      }
+    }
+
     if (typeof savedIdx === "number" && Number.isInteger(savedIdx) && savedIdx >= 0 && savedIdx < TARGETS.length) {
       activeTargetIndex = savedIdx;
     }
@@ -3415,7 +3552,8 @@ async function loadPersistedState() {
       `Восстановлено из Redis: истории — ${historyKeys.length}, логи чатов — ${chatLogKeys.length}, алиасы — ${aliasKeys.length}, ` +
         `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}, шахматные партии — ${chessKeys.length}, ` +
         `шашечные партии — ${checkersKeys.length}, раунды крокодила — ${krokodilKeys.length}, ` +
-        `счёт крокодила — ${krokodilScoreKeys.length} чатов, досье — ${profileKeys.length}, имена участников — ${memberNameKeys.length} чатов` +
+        `счёт крокодила — ${krokodilScoreKeys.length} чатов, досье — ${profileKeys.length}, имена участников — ${memberNameKeys.length} чатов, ` +
+        `память чатов — ${memoryKeys.length} чатов, реестр чатов — ${knownChats.size}` +
         (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "") +
         (pinnedTargetIndex !== null ? `, закреплена вручную — индекс ${pinnedTargetIndex}` : "") +
         `, чатов с выключенной слежкой (watch) — ${watchDisabledChats.size}`
@@ -3567,6 +3705,10 @@ bot.use(async (ctx, next) => {
     }
     return;
   }
+  // Реестр чатов для /memory — см. rememberKnownChat выше. Ставим уже
+  // после фильтра неразрешённых групп, чтобы в списке не всплывали чаты,
+  // куда бота добавили чужие люди без ведома хозяина.
+  rememberKnownChat(ctx);
   await next();
 });
 
@@ -3934,6 +4076,112 @@ bot.on("callback_query:data", async (ctx, next) => {
     // Например "message is not modified", если состояние не изменилось — не страшно.
     console.error("Не удалось обновить сообщение /model после нажатия кнопки:", err.message);
   }
+});
+
+// ==== /memory — память чата по чатам, кнопками ====
+// Скрыта из списка команд (не добавлена в setMyCommands ниже) и доступна
+// только владельцу — см. isOwner. Работает из любого чата, включая личку
+// с ботом: показывает список всех чатов, где бот хоть раз получил
+// сообщение (см. knownChats/rememberKnownChat), по каждому — пункты
+// памяти с кнопками удаления и кнопкой добавления нового пункта. Добавить
+// пункт можно из ЛЮБОГО места — после нажатия "➕ добавить" следующее
+// текстовое сообщение владельца (в любом чате) уйдёт в память выбранного
+// чата (см. pendingMemoryAdd и перехват в самом начале message:text).
+function buildMemoryChatsKeyboard() {
+  const rows = [...knownChats.entries()]
+    .sort((a, b) => a[1].localeCompare(b[1], "ru"))
+    .map(([chatId, title]) => {
+      const count = getMemoryList(chatId).length;
+      const label = `${title}${count ? ` (${count})` : ""}`.slice(0, 64);
+      return [{ text: label, callback_data: `memview:${chatId}` }];
+    });
+  return { inline_keyboard: rows };
+}
+
+function buildMemoryItemsText(chatId) {
+  const title = knownChats.get(chatId) || String(chatId);
+  const list = getMemoryList(chatId);
+  if (list.length === 0) return `«${title}» — память пока пуста`;
+  const lines = list.map(
+    (item, i) => `${i + 1}. ${item.text}${item.addedBy ? ` (добавил: ${item.addedBy})` : ""}`
+  );
+  return `«${title}»:\n${lines.join("\n")}`;
+}
+
+function buildMemoryItemsKeyboard(chatId) {
+  const list = getMemoryList(chatId);
+  const rows = list.map((item, i) => [
+    { text: `❌ ${i + 1}. ${item.text}`.slice(0, 64), callback_data: `memdel:${chatId}:${i + 1}` },
+  ]);
+  rows.push([{ text: "➕ добавить", callback_data: `memadd:${chatId}` }]);
+  rows.push([{ text: "← к списку чатов", callback_data: "memback" }]);
+  return { inline_keyboard: rows };
+}
+
+bot.command("memory", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  if (knownChats.size === 0) {
+    await ctx.reply("пока не знаю ни одного чата — бот должен хотя бы раз получить в нём сообщение");
+    return;
+  }
+  await ctx.reply("память по чатам — выбери чат:", { reply_markup: buildMemoryChatsKeyboard() });
+});
+
+// Обработка кнопок /memory. Отдельный обработчик callback_query (grammY
+// цепочкой прогоняет несколько таких через next() — см. пояснение у
+// setmodel: выше), закрыт владельцем так же, как и сама команда.
+bot.on("callback_query:data", async (ctx, next) => {
+  const data = ctx.callbackQuery.data;
+  if (!data.startsWith("mem")) return next();
+
+  if (!isOwner(ctx)) {
+    await ctx.answerCallbackQuery({ text: "это только для хозяина", show_alert: true });
+    return;
+  }
+
+  if (data === "memback") {
+    pendingMemoryAdd.delete(ctx.from.id);
+    await ctx.editMessageText("память по чатам — выбери чат:", { reply_markup: buildMemoryChatsKeyboard() });
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data.startsWith("memview:")) {
+    const chatId = Number(data.slice("memview:".length));
+    await ctx.editMessageText(buildMemoryItemsText(chatId), { reply_markup: buildMemoryItemsKeyboard(chatId) });
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data.startsWith("memdel:")) {
+    const [, chatIdRaw, idxRaw] = data.split(":");
+    const chatId = Number(chatIdRaw);
+    const idx = Number(idxRaw);
+    removeMemoryItem(chatId, idx);
+    await ctx.editMessageText(buildMemoryItemsText(chatId), { reply_markup: buildMemoryItemsKeyboard(chatId) });
+    await ctx.answerCallbackQuery({ text: "убрал" });
+    return;
+  }
+
+  if (data.startsWith("memadd:")) {
+    const chatId = Number(data.slice("memadd:".length));
+    pendingMemoryAdd.set(ctx.from.id, chatId);
+    const title = knownChats.get(chatId) || String(chatId);
+    await ctx.answerCallbackQuery();
+    await ctx.reply(`пришли текст, что запомнить для «${title}» — следующим сообщением, откуда угодно`, {
+      reply_markup: { inline_keyboard: [[{ text: "❌ отмена", callback_data: "memaddcancel" }]] },
+    });
+    return;
+  }
+
+  if (data === "memaddcancel") {
+    pendingMemoryAdd.delete(ctx.from.id);
+    await ctx.editMessageText("отменил, ничего не добавил");
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  return next();
 });
 
 bot.command("gender", async (ctx) => {
@@ -7545,6 +7793,35 @@ bot.on("inline_query", async (ctx) => {
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const isGroup = ctx.chat.type === "group" || ctx.chat.type === "supergroup";
+
+  // ==== Перехват текста для /memory -> "➕ добавить" ====
+  // Должен идти РАНЬШЕ вообще всего остального в этом хендлере: пока
+  // владелец в режиме "жду текст для памяти чата X" (см. кнопку memadd в
+  // callback_query выше), следующее его текстовое сообщение ИЗ ЛЮБОГО
+  // ЧАТА — это не обычная реплика боту, а содержимое нового пункта
+  // памяти. Разовый режим — сбрасывается сразу после использования.
+  if (isOwner(ctx) && pendingMemoryAdd.has(ctx.from.id)) {
+    const targetChatId = pendingMemoryAdd.get(ctx.from.id);
+    pendingMemoryAdd.delete(ctx.from.id);
+    const text = ctx.message.text.trim();
+    if (text) {
+      const addedBy = getDisplayName(targetChatId, ctx.from);
+      const { position, saved } = await addMemoryItem(targetChatId, text, addedBy);
+      const title = knownChats.get(targetChatId) || String(targetChatId);
+      if (saved) {
+        await ctx
+          .replyWithSticker(MEMORY_CONFIRM_STICKER_FILE_ID)
+          .catch((err) => console.error("Не удалось отправить стикер-подтверждение памяти:", err.message));
+        await ctx.reply(`пункт ${position} для «${title}»: «${text}»`);
+      } else {
+        await ctx.reply(
+          `пункт ${position} для «${title}» добавил, но сохранить в Redis не получилось — переживёт только до рестарта`
+        );
+      }
+    }
+    return;
+  }
+
   let userText = ctx.message.text;
   // Ставим true при успешном веб-поиске (см. ниже оба места вызова
   // searchWeb) — используется, чтобы дать финальному askLLM больше
@@ -8053,6 +8330,87 @@ bot.on("message:text", async (ctx) => {
         const photoCaption = (match && match[1]) || photoEntry.text.replace(/^\[фото\]\s*/, "");
         userText = `[в чате недавно было фото от ${photoEntry.name}: ${photoCaption}] ${userText}`;
       }
+    }
+  }
+
+  // ==== "Запомни: ..." / "забудь ..." — память чата голосом ====
+  // Сюда попадаем уже только с сообщением, точно адресованным боту (для
+  // групп — см. return выше по isAddressedToBot; в личке адресовано всё).
+  // Работает и обращением по имени ("Женя, запомни ..."), и реплаем на
+  // сообщение бота, и упоминанием через @username — как обычное
+  // обращение (см. stripBotAddressing). "Запомни" может любой участник
+  // чата, "забудь" — только владелец бота (см. isOwner).
+  {
+    const memCommandText = stripBotAddressing(rawText, ctx);
+    const replyOpts = {
+      reply_parameters: { message_id: ctx.message.message_id },
+      message_thread_id: ctx.message.message_thread_id,
+    };
+
+    const rememberMatch = memCommandText.match(/^запомни[,:]?\s+([\s\S]+)/i);
+    if (rememberMatch) {
+      const text = rememberMatch[1].trim();
+      if (text) {
+        const addedBy = getDisplayName(chatId, ctx.from);
+        const { position, saved } = await addMemoryItem(chatId, text, addedBy);
+        if (saved) {
+          // Стикер — единственное подтверждение "запомнил", которое реально
+          // означает, что запись улетела в Redis (см. MEMORY_CONFIRM_STICKER_FILE_ID).
+          await ctx
+            .replyWithSticker(MEMORY_CONFIRM_STICKER_FILE_ID, replyOpts)
+            .catch((err) => console.error("Не удалось отправить стикер-подтверждение памяти:", err.message));
+        } else {
+          // Redis недоступен/упал — пункт всё равно добавлен в оперативную
+          // память процесса и будет использоваться до рестарта, но
+          // стикер-подтверждение НЕ шлём, чтобы не создавать ложного
+          // впечатления, что запоминание точно переживёт рестарт.
+          await ctx.reply(
+            `пункт ${position} добавил, но сохранить в Redis не получилось — переживёт только до рестарта`,
+            replyOpts
+          );
+        }
+      }
+      return;
+    }
+
+    const forgetMatch = memCommandText.match(/^забудь(?:\s+([\s\S]+))?$/i);
+    if (forgetMatch) {
+      if (!isOwner(ctx)) {
+        await ctx.reply("забывать могу только по команде хозяина", replyOpts);
+        return;
+      }
+      const arg = (forgetMatch[1] || "").trim();
+      const list = getMemoryList(chatId);
+
+      if (!arg || /^вс[её]$/i.test(arg)) {
+        clearMemory(chatId);
+        await ctx.reply("почистил всю память этого чата", replyOpts);
+        return;
+      }
+
+      const pointMatch = arg.match(/^пункт\s*(\d+)$/i) || arg.match(/^(\d+)$/);
+      if (pointMatch) {
+        const idx = Number(pointMatch[1]);
+        const removedText = list[idx - 1]?.text;
+        if (removeMemoryItem(chatId, idx)) {
+          await ctx.reply(`забыл пункт ${idx}${removedText ? `: «${removedText}»` : ""}`, replyOpts);
+        } else {
+          await ctx.reply(`нет пункта ${idx} — в этом чате всего ${list.length}`, replyOpts);
+        }
+        return;
+      }
+
+      // Без явного номера — ищем пункт по частичному совпадению текста.
+      const lower = arg.toLowerCase();
+      const foundIdx = list.findIndex((item) => item.text.toLowerCase().includes(lower));
+      if (foundIdx === -1) {
+        await ctx.reply("не нашёл такого пункта в памяти этого чата — гляну /memory", replyOpts);
+        return;
+      }
+      const removedText = list[foundIdx].text;
+      removeMemoryItem(chatId, foundIdx + 1);
+      await ctx.reply(`забыл: «${removedText}»`, replyOpts);
+      return;
     }
   }
 
