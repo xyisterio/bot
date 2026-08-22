@@ -2877,6 +2877,47 @@ function looksLikeReasoningLeak(text) {
   return yesNoCount >= 2;
 }
 
+// Страховка от протёкших CJK-иероглифов посреди русского текста —
+// замечено у qwen3.6-27b на Groq (китайская модель, огромная доля
+// китайских данных в обучении, периодически "проливает" случайный
+// китайский/японский/корейский токен в несвязанный контекст, особенно
+// при урезанном reasoning). У Gemini/gpt-oss такое не характерно (не
+// китайские модели), но раз персонаж Женя в принципе говорит только на
+// русском — чистим безусловно для всех моделей, не только для Groq/qwen.
+//
+// ВАЖНО: резать ВСЕ иероглифы подряд нельзя — если человек спросит
+// что-то с легитимным CJK (название на китайском/японском, конкретный
+// иероглиф и его значение и т.п.), модель имеет право процитировать его
+// в ответе, и молча вырезать это — сломать ответ незаметно для себя.
+// Реальная утечка токена отличается от осмысленного упоминания одним
+// признаком: она ПРИКЛЕЕНА вплотную к русскому/латинскому слову без
+// пробела (см. реальный пример: "раз器械 нет" — иероглифы прямо внутри
+// слова), тогда как осмысленное упоминание почти всегда стоит отдельным
+// "словом", окружённым пробелами/пунктуацией ("название 成龙", "иероглиф
+// 龍"). Поэтому режем только те CJK-последовательности, что вплотную
+// (без пробела) примыкают к букве/цифре с любой стороны — это и есть
+// сигнатура утечки, а изолированные оставляем как есть.
+function stripCJKLeak(text) {
+  const CJK_RUN = /[\u4e00-\u9fff\u3040-\u30ff\u30a0-\u30ff\uac00-\ud7af]+/g;
+  const isWordChar = (ch) => ch !== undefined && /[a-zA-Zа-яёА-ЯЁ0-9]/.test(ch);
+
+  let result = "";
+  let lastIndex = 0;
+  for (const match of text.matchAll(CJK_RUN)) {
+    const start = match.index;
+    const end = start + match[0].length;
+    const gluedToWord = isWordChar(text[start - 1]) || isWordChar(text[end]);
+
+    result += text.slice(lastIndex, start);
+    if (!gluedToWord) result += match[0]; // изолированное — вероятно осмысленное, оставляем
+    lastIndex = end;
+  }
+  result += text.slice(lastIndex);
+
+  const cleaned = result.replace(/[ \t]{2,}/g, " ").trim();
+  return cleaned || text; // на всякий случай не отдаём пустую строку, если вдруг вычистили всё
+}
+
 async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS, temperature = 0.9) {
   const body = {
     model: target.model,
@@ -2995,6 +3036,9 @@ async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS, temp
   // чтобы в чат не улетал внутренний монолог модели.
   reply = reply.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
   if (!reply) throw new Error(`Пустой ответ от ${target.provider} после очистки <think>`);
+
+  reply = stripCJKLeak(reply);
+  if (!reply) throw new Error(`Пустой ответ от ${target.provider} после очистки CJK-мусора`);
 
   reply = stripDraftVariants(reply);
   if (!reply) throw new Error(`Пустой ответ от ${target.provider} после очистки вариантов`);
