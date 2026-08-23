@@ -715,6 +715,126 @@ function removeAlias(chatId, userId) {
   saveAliases(chatId);
 }
 
+// ==== Игнор-лист (по chatId -> Set<userId>) ====
+// Задаётся ТОЛЬКО хозяином бота (см. isOwner), в отличие от обычной
+// "запомни: ..." — это не пожелание для LLM, а жёсткое программное
+// правило: пока userId в этом сете, бот вообще не отвечает ему текстом
+// в группе (см. проверку isAddressedToBot ниже), независимо от того,
+// позвали бота по имени/реплаем/тегом. Живёт в памяти как кэш, зеркалится
+// в Redis (ключ ignored:{chatId}) — см. loadPersistedState() при старте.
+const chatIgnored = new Map(); // chatId -> Set<userId>
+
+function getIgnoredSet(chatId) {
+  if (!chatIgnored.has(chatId)) chatIgnored.set(chatId, new Set());
+  return chatIgnored.get(chatId);
+}
+
+async function saveIgnored(chatId) {
+  if (!redis) return;
+  try {
+    const set = getIgnoredSet(chatId);
+    if (set.size === 0) await redis.del(`ignored:${chatId}`);
+    else await redis.set(`ignored:${chatId}`, [...set]);
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить игнор-лист чата ${chatId}:`, err);
+  }
+}
+
+function isUserIgnored(chatId, userId) {
+  return getIgnoredSet(chatId).has(userId);
+}
+
+function ignoreUser(chatId, userId) {
+  const set = getIgnoredSet(chatId);
+  if (set.has(userId)) return false; // уже в игноре
+  set.add(userId);
+  saveIgnored(chatId);
+  return true;
+}
+
+function unignoreUser(chatId, userId) {
+  const set = getIgnoredSet(chatId);
+  if (!set.has(userId)) return false;
+  set.delete(userId);
+  saveIgnored(chatId);
+  return true;
+}
+
+// Пытаемся понять, о ком речь ("игнорируй @lays" / "игнорируй Васю" /
+// "игнорируй 123456789" / реплаем на человека без явного указания) —
+// возвращает userId или null, если распознать не вышло. Порядок
+// приоритета: реплай на сообщение человека (самый надёжный сигнал) >
+// явный numeric id > @username из индекса (см. rememberUsername) >
+// имя из уже виденных в чате (см. resolveUserIdByName).
+function resolveIgnoreTargetId(chatId, arg, ctx) {
+  const replyTarget = ctx.message.reply_to_message?.from;
+  if (replyTarget && !replyTarget.is_bot) return replyTarget.id;
+
+  const cleaned = (arg || "").trim();
+  if (!cleaned) return null;
+
+  if (/^\d+$/.test(cleaned)) return Number(cleaned);
+
+  const usernameMatch = cleaned.match(/^@?(\w{3,})$/);
+  if (usernameMatch) {
+    const byUsername = getUsernameIndex(chatId).get(usernameMatch[1].toLowerCase());
+    if (byUsername) return byUsername;
+  }
+
+  return resolveUserIdByName(chatId, cleaned);
+}
+
+// ==== Директивы хозяина внутри "запомни" ====
+// В отличие от обычного пункта памяти (см. addMemoryItem — это просто
+// текст-пожелание, которое ПОДМЕШИВАЕТСЯ в промпт и работает только
+// если LLM решит его учесть), директивы хозяина исполняются программно
+// и сразу, без участия модели. Поэтому у них ВСЕГДА приоритет: даже
+// если фраза внешне похожа на обычное "запомни ...", но match'ится под
+// один из паттернов ниже — в общий список памяти она не попадает.
+// Доступно только хозяину (см. isOwner) — вызывающий код обязан
+// проверить это ДО вызова. Возвращает true, если команду распознали и
+// обработали (в этом случае вызывающий код должен просто return,
+// ничего больше не делая); false — если это не директива, и текст
+// нужно обработать как обычный пункт памяти.
+// Понимает любые формулировки вида "игнорируй X" / "игнорируй
+// пользователя X" (и зеркально — "не игнорируй" / "разигнорь" /
+// "перестань игнорировать" для отмены), где X — это @ник, numeric id,
+// имя уже знакомого боту человека, либо вообще ничего (тогда берём
+// автора сообщения, на которое сделан реплай) — см. resolveIgnoreTargetId.
+async function tryHandleOwnerIgnoreDirective(chatId, text, ctx, replyOpts) {
+  const unignoreMatch = text.match(
+    /^(?:не\s+игнориру\S*|разигнор\S*|переста\S+\s+игнориров\S+)(?:\s+пользователя)?\s*([\s\S]*)$/i
+  );
+  if (unignoreMatch) {
+    const targetId = resolveIgnoreTargetId(chatId, unignoreMatch[1], ctx);
+    if (!targetId) {
+      await ctx.reply("не понял, кого разигнорить — реплаем на его сообщение или укажи @ник", replyOpts);
+      return true;
+    }
+    const removed = unignoreUser(chatId, targetId);
+    await ctx.reply(removed ? "разигнорил — снова отвечаю ему" : "он и так не в игноре", replyOpts);
+    return true;
+  }
+
+  const ignoreMatch = text.match(/^игнориру\S*(?:\s+пользователя)?\s*([\s\S]*)$/i);
+  if (ignoreMatch) {
+    const targetId = resolveIgnoreTargetId(chatId, ignoreMatch[1], ctx);
+    if (!targetId) {
+      await ctx.reply("не понял, кого игнорить — реплаем на его сообщение или укажи @ник", replyOpts);
+      return true;
+    }
+    if (targetId === ctx.from.id) {
+      await ctx.reply("сам себя игнорить не проси", replyOpts);
+      return true;
+    }
+    const added = ignoreUser(chatId, targetId);
+    await ctx.reply(added ? "готово, больше ему не отвечаю в этом чате" : "он и так уже в игноре", replyOpts);
+    return true;
+  }
+
+  return false;
+}
+
 function getUsernameIndex(chatId) {
   if (!chatUsernameIndex.has(chatId)) chatUsernameIndex.set(chatId, new Map());
   return chatUsernameIndex.get(chatId);
@@ -976,6 +1096,53 @@ function resolveUserIdByName(chatId, name) {
     if (displayName?.toLowerCase() === normalized) return userId;
   }
   return null;
+}
+
+// ==== Прямой вопрос "кто такой/такая Х" — про участника ЭТОГО чата ====
+// Точечный интент, без похода в LLM (та же логика, что у "кто зашёл/
+// вышел" ниже, см. handleJoinLeaveQuery): если Х — это кто-то из уже
+// знакомых боту людей (алиас или просто виденное имя, см.
+// resolveUserIdByName), отвечаем сразу готовой ссылкой на аккаунт —
+// именно то, что LLM в принципе не может сделать сама, у неё нет
+// доступа к реальным Telegram user id для генерации рабочей ссылки.
+// Если Х не резолвится ни в кого — НЕ отвечаем и не return'имся, просто
+// сигнализируем "не наш случай" (см. handleWhoIsQuery ниже), чтобы
+// вопрос спокойно ушёл в обычный LLM-чат: "кто такой Наполеон" не
+// должен упираться в эту проверку молча.
+const WHO_IS_INTENT_REGEX = /^кто\s+(?:так(?:ой|ая|ое|ие)|это)\s+(.+?)\s*[?!.]*$/i;
+
+// Возвращает true, если вопрос был про знакомого человека и бот уже
+// ответил (вызывающий код должен сделать return); false — если имя не
+// распознано, вопрос нужно обработать как обычно.
+async function handleWhoIsQuery(ctx, chatId, name) {
+  const userId = resolveUserIdByName(chatId, name);
+  if (!userId) return false;
+
+  const displayName = getAliasMap(chatId).get(userId)?.name || getMemberNameMap(chatId).get(userId) || name;
+  const username = getKnownUsername(chatId, userId);
+  // Ссылка на профиль: если известен @username — обычная t.me-ссылка;
+  // если нет — tg://user?id= (это ровно тот же механизм, которым сам
+  // Telegram делает "упоминание по имени" без @ника — text_mention).
+  // В обоих случаях оборачиваем в <a href="...">Имя</a> (parse_mode:
+  // "HTML"), а НЕ отдаём голый URI текстом — иначе вместо кликабельного
+  // имени человек увидит некрасивую сырую ссылку "tg://user?id=123...".
+  const href = username ? `https://t.me/${username}` : `tg://user?id=${userId}`;
+  const linkHtml = `<a href="${href}">${escapeHtml(displayName)}</a>`;
+
+  const profile = normalizeProfile(getProfileMap(chatId).get(userId) || { facts: {} });
+  const factLines = Object.values(profile.facts).map((f) => f.text);
+
+  let reply = `это ${linkHtml}`;
+  if (factLines.length > 0) {
+    reply += `\n\nчто знаю: ${escapeHtml(factLines.join("; "))}`;
+  }
+
+  await ctx.reply(reply, {
+    parse_mode: "HTML",
+    reply_parameters: { message_id: ctx.message.message_id },
+    message_thread_id: ctx.message.message_thread_id,
+  });
+  return true;
 }
 
 // Ищем среди уже известных людей чата тех, кого сообщение вероятно
@@ -3514,6 +3681,7 @@ async function loadPersistedState() {
       profileKeys,
       memberNameKeys,
       memoryKeys,
+      ignoredKeys,
       savedKnownChats,
       savedIdx,
       savedPinnedIdx,
@@ -3532,6 +3700,7 @@ async function loadPersistedState() {
       redis.keys("profiles:*"),
       redis.keys("members:*"),
       redis.keys("memory:*"),
+      redis.keys("ignored:*"),
       redis.get("known_chats"),
       redis.get("activeTargetIndex"),
       redis.get("pinnedTargetIndex"),
@@ -3666,6 +3835,14 @@ async function loadPersistedState() {
         const chatId = Number(key.slice("memory:".length));
         const data = await redis.get(key);
         if (Array.isArray(data)) chatMemory.set(chatId, data);
+      })
+    );
+
+    await Promise.all(
+      ignoredKeys.map(async (key) => {
+        const chatId = Number(key.slice("ignored:".length));
+        const data = await redis.get(key);
+        if (Array.isArray(data)) chatIgnored.set(chatId, new Set(data.map(Number)));
       })
     );
 
@@ -4155,6 +4332,27 @@ bot.command("aliases", async (ctx) => {
   }
   const lines = [...aliases.values()].map((a) => `- ${a.label} → ${a.name}`);
   await ctx.reply(`текущие алиасы:\n${lines.join("\n")}`);
+});
+
+// /ignored — посмотреть, кого сейчас игнорирует бот в этом чате (см.
+// ignoreUser/unignoreUser, задаётся через "запомни игнорируй ...").
+// Только владелец — как и сама возможность игнорировать/разигнорить.
+bot.command("ignored", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const chatId = ctx.chat.id;
+  const set = getIgnoredSet(chatId);
+  if (set.size === 0) {
+    await ctx.reply("сейчас никого не игнорирую в этом чате");
+    return;
+  }
+  const lines = [...set].map((userId) => {
+    const name =
+      getAliasMap(chatId).get(userId)?.name || getMemberNameMap(chatId).get(userId) || null;
+    const username = getKnownUsername(chatId, userId);
+    const label = [name, username ? `@${username}` : null].filter(Boolean).join(", ");
+    return `- ${userId}${label ? ` (${label})` : ""}`;
+  });
+  await ctx.reply(`сейчас в игноре:\n${lines.join("\n")}`);
 });
 
 // /gender — посмотреть или задать пол вручную (перекрывает эвристику навсегда).
@@ -8394,7 +8592,13 @@ bot.on("message:text", async (ctx) => {
             .toLowerCase() === `@${ctx.me.username?.toLowerCase()}`
       ) ?? false;
     const isOwnerMentioned = ownerMentionRegex.test(userText);
-    const isAddressedToBot = startsWithName || isReply || isMentioned || isOwnerMentioned;
+    // Игнор-лист (см. tryHandleOwnerIgnoreDirective / ignoreUser) — если
+    // хозяин попросил игнорировать этого человека, бот молчит ему в ответ
+    // ВООБЩЕ, даже если позвали по имени/реплаем/тегом. Самого хозяина
+    // так заглушить нельзя (targetId === ctx.from.id уже отсекается при
+    // установке игнора, но на всякий случай не даём это обойти и тут).
+    const isIgnored = !isOwner(ctx) && isUserIgnored(chatId, ctx.from.id);
+    const isAddressedToBot = !isIgnored && (startsWithName || isReply || isMentioned || isOwnerMentioned);
 
     // Пишем сообщение в лог чата (см. pushChatLog) ДО фильтра "не наше
     // сообщение — молчим" ниже — иначе в лог попадали бы только реплики,
@@ -8694,6 +8898,38 @@ bot.on("message:text", async (ctx) => {
     if (rememberMatch) {
       const text = rememberMatch[1].trim();
       if (text) {
+        // Директивы хозяина (сейчас — игнор/разигнор участника) всегда
+        // приоритетны и работают программно, а не через обычный пункт
+        // памяти (см. tryHandleOwnerIgnoreDirective) — проверяем ДО
+        // addMemoryItem, чтобы такая фраза не осела просто текстом,
+        // который LLM может выполнить, а может и нет.
+        if (isOwner(ctx) && (await tryHandleOwnerIgnoreDirective(chatId, text, ctx, replyOpts))) {
+          return;
+        }
+
+        // Короткая форма задать алиас прямо через "запомни" — "запомни
+        // пользователь 123456789 это Вася" (с/без скобок вокруг id).
+        // Раньше такая фраза просто оседала как непрозрачный текст в
+        // общей памяти чата (см. addMemoryItem ниже) — LLM видела текст
+        // "пользователь 123456789 это Вася", но это НЕ давало боту
+        // возможности сослаться на реального человека (ссылку/степень
+        // на профиль LLM сама сгенерировать не может, у неё нет доступа
+        // к id). Ловим этот паттерн отдельно и сразу заводим настоящий
+        // алиас (см. setAlias/resolveUserIdByName) — тогда, например,
+        // "кто такой Вася" (см. WHO_IS_INTENT_REGEX выше) сможет отдать
+        // рабочую ссылку на аккаунт.
+        const aliasShortcutMatch = text.match(/^пользовател[ья]\s*\(?\s*(\d+)\s*\)?\s*[-—]?\s*это\s+(.+)$/i);
+        if (aliasShortcutMatch) {
+          const targetId = Number(aliasShortcutMatch[1]);
+          const aliasName = aliasShortcutMatch[2].trim();
+          if (aliasName) {
+            setAlias(chatId, targetId, aliasName, `id:${targetId}`);
+            rememberMemberName(chatId, targetId, aliasName);
+            await ctx.reply(`понял, пользователь ${targetId} — это ${aliasName}`, replyOpts);
+            return;
+          }
+        }
+
         const addedBy = getDisplayName(chatId, ctx.from);
         const { position, saved } = await addMemoryItem(chatId, text, addedBy);
         if (saved) {
@@ -9090,6 +9326,19 @@ bot.on("message:text", async (ctx) => {
   // "ушёл"/"зашёл"), но порядок всё равно важен принципиально — это более
   // узкий и точный интент, и он не должен зависеть от того, что происходит
   // ниже по цепочке проверок.
+  // ==== "Кто такой/такая Х" (точечный вопрос про участника чата) ====
+  // Перед join/leave и вообще всем остальным — тот же принцип, что и у
+  // соседних точечных интентов ниже: узкий и надёжный кейс не должен
+  // зависеть от порядка более общих проверок. Если Х не резолвится ни в
+  // кого знакомого — handleWhoIsQuery вернёт false, и мы просто идём
+  // дальше по обычной цепочке (в итоге в LLM), ничего не потеряв.
+  if (isGroup && !repliedToHandled) {
+    const whoIsMatch = WHO_IS_INTENT_REGEX.exec(stripBotAddressing(rawText, ctx));
+    if (whoIsMatch && (await handleWhoIsQuery(ctx, chatId, whoIsMatch[1]))) {
+      return;
+    }
+  }
+
   if (isGroup && !repliedToHandled) {
     const strippedForJoinLeave = stripBotAddressing(rawText, ctx);
     if (JOIN_LEAVE_INTENT_REGEX.test(strippedForJoinLeave)) {
