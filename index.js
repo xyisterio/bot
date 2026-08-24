@@ -3006,15 +3006,30 @@ function computeTargetOrder() {
   const n = TARGETS.length;
   const rotationPos = (idx) => (idx - activeTargetIndex + n) % n;
 
+  // Если сейчас активен ручной пин (и он не в cooldown) — фолбэк ПОСЛЕ его
+  // провала должен идти по естественному порядку TARGETS (как задано в
+  // GEMINI_MODEL/PROVIDER_ORDER, т.е. по убыванию качества: 3.7 → 3.6 →
+  // 3.5 → 3.5-lite → groq → ...), а НЕ по ротации от activeTargetIndex.
+  // Раньше тут всегда работала ротация — из-за этого при ручном
+  // тестировании через /model бот после провала пина "прыгал" не на
+  // следующую по качеству модель, а на ту, что последний раз случайно
+  // ответила (activeTargetIndex), даже если она была в конце списка и
+  // где-то между ней и пином оставались вполне живые модели получше.
+  // В обычном авто-режиме (без пина) ротация от activeTargetIndex
+  // сохраняется как раньше — там она осмысленна: не скакать между
+  // моделями зря, а держаться уже рабочей.
+  const usePin = pinnedTargetIndex !== null && cooldownUntil[pinnedTargetIndex] <= now;
+
   let order = [...TARGETS.keys()].sort((a, b) => {
     const aCold = cooldownUntil[a] > now ? 1 : 0;
     const bCold = cooldownUntil[b] > now ? 1 : 0;
-    return aCold - bCold || rotationPos(a) - rotationPos(b);
+    if (aCold !== bCold) return aCold - bCold;
+    return usePin ? a - b : rotationPos(a) - rotationPos(b);
   });
 
   // Ручной пин через /model — пробуем первой (если не в cooldown), поверх
-  // ротации, как и раньше.
-  if (pinnedTargetIndex !== null && cooldownUntil[pinnedTargetIndex] <= now) {
+  // естественного порядка.
+  if (usePin) {
     order = [pinnedTargetIndex, ...order.filter((idx) => idx !== pinnedTargetIndex)];
   }
 
