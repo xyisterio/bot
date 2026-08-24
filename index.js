@@ -188,7 +188,7 @@ const OPENROUTER_MODELS = (
 // REQUEST_TIMEOUT_MS — сколько максимум ждём ответа от одной модели, прежде
 // чем считать её недоступной и уйти на фолбэк (вместо того чтобы зависать
 // на несколько минут, если провайдер просто не отвечает).
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 20000;
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 10000;
 // SEARCH_TIMEOUT_MS — отдельный, более щедрый таймаут для веб-поиска
 // (Groq Compound реально ходит в интернет и может думать 20-60+ секунд —
 // REQUEST_TIMEOUT_MS для обычного чата был слишком тесным и обрубал поиск
@@ -214,6 +214,17 @@ const POST_SEARCH_ASK_TIMEOUT_MS = Number(process.env.POST_SEARCH_ASK_TIMEOUT_MS
 // есть (см. README) — фолбэк на остальных провайдеров работает исправно,
 // просто в логах будут повторяющиеся 429 от gemini весь день.
 const MODEL_COOLDOWN_MS = Number(process.env.MODEL_COOLDOWN_MS) || 5 * 60 * 1000;
+// GEMINI_RACE_STAGGER_MS — гонка нескольких аккаунтов ОДНОЙ модели Gemini
+// вместо строго последовательного перебора. Первый аккаунт стартует сразу;
+// если он не ответил за GEMINI_RACE_STAGGER_MS — параллельно подключается
+// следующий (не заменяя первого, а добавляясь к гонке), и так далее по
+// всем доступным (не в cooldown) аккаунтам этой модели. Побеждает первый
+// успешный ответ — остальные тут же отменяются через AbortSignal.
+// В здоровом случае (первый аккаунт отвечает быстро) лишние запросы вообще
+// не уходят — квота остальных ключей не тратится. В случае как в логе
+// 24.08 (несколько аккаунтов подряд не отвечают/503) это резко сокращает
+// суммарное ожидание вместо REQUEST_TIMEOUT_MS × keyCount.
+const GEMINI_RACE_STAGGER_MS = Number(process.env.GEMINI_RACE_STAGGER_MS) || 3000;
 
 // Единый список целей для фолбэка: [{ provider, model, baseUrl, apiKey, keyIndex, keyCount }, ...]
 // Порядок провайдеров — из PROVIDER_ORDER, порядок моделей внутри — как задано в env.
@@ -3010,6 +3021,97 @@ function computeTargetOrder() {
   return order;
 }
 
+// Группирует order на подряд идущие блоки одной и той же модели (напр. все
+// аккаунты gemini-3.7-flash подряд) — TARGETS строится так, что аккаунты
+// одной модели изначально соседние, и сортировка в computeTargetOrder
+// (cooldown-цели в конец) эту соседность не ломает внутри одной группы
+// cooldown/не-cooldown. Каждая такая группа — кандидат на гонку вместо
+// последовательного перебора.
+function groupConsecutiveTargets(order) {
+  const groups = [];
+  for (const idx of order) {
+    const t = TARGETS[idx];
+    const last = groups[groups.length - 1];
+    if (last && TARGETS[last[0]].provider === t.provider && TARGETS[last[0]].model === t.model) {
+      last.push(idx);
+    } else {
+      groups.push([idx]);
+    }
+  }
+  return groups;
+}
+
+// Гонка нескольких аккаунтов ОДНОЙ модели (см. GEMINI_RACE_STAGGER_MS выше).
+// indices — все аккаунты этой модели из текущей группы (могут включать и те,
+// что в cooldown, — их просто пропускаем). Возвращает { idx, reply,
+// actualModel, systemFingerprint } от первого успешного аккаунта.
+async function raceTargetGroup(indices, messagesForTarget, timeoutMs, temperature) {
+  const now = Date.now();
+  const available = indices.filter((idx) => cooldownUntil[idx] <= now);
+  if (available.length === 0) {
+    const err = new Error("Все аккаунты этой модели сейчас в cooldown");
+    err.status = 503;
+    throw err;
+  }
+
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    const timers = [];
+    let settled = false;
+    let launched = 0;
+    let pending = 0;
+    let lastErr = null;
+
+    function finishSuccess(idx, result) {
+      if (settled) return;
+      settled = true;
+      controller.abort(); // отменяем всех остальных гонщиков этой модели
+      timers.forEach(clearTimeout);
+      cooldownUntil[idx] = 0;
+      resolve({ idx, ...result });
+    }
+
+    function finishFailureIfDone() {
+      if (settled) return;
+      if (pending === 0 && launched >= available.length) {
+        settled = true;
+        timers.forEach(clearTimeout);
+        reject(lastErr ?? new Error("Все аккаунты этой модели не ответили"));
+      }
+    }
+
+    function launchNext() {
+      if (settled || launched >= available.length) return;
+      const idx = available[launched++];
+      pending++;
+      const target = TARGETS[idx];
+
+      callTarget(target, messagesForTarget(target), timeoutMs, temperature, controller.signal)
+        .then((result) => {
+          pending--;
+          finishSuccess(idx, result);
+        })
+        .catch((err) => {
+          pending--;
+          if (!err.raceCancelled) {
+            lastErr = err;
+            console.error(`Ошибка [${targetLabel(target)}] (гонка):`, err.status ?? "-", err.body ?? err.message);
+            if (err.status && isFallbackWorthy(err.status)) {
+              cooldownUntil[idx] = Date.now() + MODEL_COOLDOWN_MS;
+            }
+          }
+          finishFailureIfDone();
+        });
+
+      if (launched < available.length) {
+        timers.push(setTimeout(launchNext, GEMINI_RACE_STAGGER_MS));
+      }
+    }
+
+    launchNext();
+  });
+}
+
 // Страховка от бага некоторых reasoning-моделей (замечено у gpt-oss на Groq):
 // вместо одного финального ответа модель иногда присылает черновик вида
 // `"Привет!" or "Привет, чё как?"` — несколько вариантов реплики в кавычках
@@ -3085,7 +3187,7 @@ function stripCJKLeak(text) {
   return cleaned || text; // на всякий случай не отдаём пустую строку, если вдруг вычистили всё
 }
 
-async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS, temperature = 0.9) {
+async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS, temperature = 0.9, externalSignal = null) {
   const body = {
     model: target.model,
     messages,
@@ -3141,6 +3243,19 @@ async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS, temp
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
+  // externalSignal — для гонки нескольких аккаунтов одной модели (см.
+  // raceGeminiAccounts): если параллельный "гонщик" уже победил, снаружи
+  // дёргают abort() на этом сигнале, и текущий запрос обрывается ДО
+  // timeoutMs, а не ждёт его целиком.
+  let onExternalAbort = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else {
+      onExternalAbort = () => controller.abort();
+      externalSignal.addEventListener("abort", onExternalAbort);
+    }
+  }
+
   let res, data;
   try {
     res = await fetch(target.baseUrl, {
@@ -3164,6 +3279,14 @@ async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS, temp
     data = await res.json();
   } catch (err) {
     if (err.name === "AbortError") {
+      // Отменён гонкой (другой аккаунт уже ответил первым) — это НЕ
+      // реальный таймаут провайдера, помечаем отдельно, чтобы вызывающий
+      // код не логировал это как ошибку и не ставил cooldown этому аккаунту.
+      if (externalSignal && externalSignal.aborted) {
+        const cancelledErr = new Error(`${targetLabel(target)} отменён — гонку выиграл другой аккаунт`);
+        cancelledErr.raceCancelled = true;
+        throw cancelledErr;
+      }
       const timeoutErr = new Error(
         `${targetLabel(target)} не ответил за ${timeoutMs}мс — таймаут`
       );
@@ -3173,6 +3296,7 @@ async function callTarget(target, messages, timeoutMs = REQUEST_TIMEOUT_MS, temp
     throw err;
   } finally {
     clearTimeout(timeoutId);
+    if (externalSignal && onExternalAbort) externalSignal.removeEventListener("abort", onExternalAbort);
   }
 
   const choice = data.choices?.[0];
@@ -3290,16 +3414,23 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
   let lastErr;
 
   const order = computeTargetOrder();
+  // Группируем по модели: несколько аккаунтов одной модели (напр. 5 ключей
+  // gemini-3.7-flash) пробуем гонкой (см. raceTargetGroup) вместо строгой
+  // очереди — так не ждём timeoutMs на каждом по очереди, если модель
+  // объективно не в духе у Google. Группа из одного аккаунта (или другой
+  // провайдер) ведёт себя ровно как раньше — просто один вызов callTarget.
+  const groups = groupConsecutiveTargets(order);
 
-  for (const idx of order) {
-    const target = TARGETS[idx];
+  for (const groupIndices of groups) {
+    const isRace = groupIndices.length > 1;
 
     try {
-      const { reply: rawReply, actualModel, systemFingerprint } = await callTarget(
-        target,
-        messagesForTarget(target),
-        timeoutMs
-      );
+      const { idx, reply: rawReply, actualModel, systemFingerprint } = isRace
+        ? await raceTargetGroup(groupIndices, messagesForTarget, timeoutMs, 0.9)
+        : { idx: groupIndices[0], ...(await callTarget(TARGETS[groupIndices[0]], messagesForTarget(TARGETS[groupIndices[0]]), timeoutMs)) };
+
+      const target = TARGETS[idx];
+
       // ВРЕМЕННЫЙ DEBUG-ЛОГ — убрать после проверки тегов [sticker: ...].
       // Показывает сырой ответ модели ДО вырезания тега, чтобы понять,
       // ставит ли модель тег вообще, и если ставит — с правильным ли ключом.
@@ -3307,7 +3438,7 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
       // самого API (важно для роутеров HF/OpenRouter: реальный бэкенд может
       // отличаться от target.model, который мы запросили).
       console.log(
-        `[DEBUG rawReply от ${targetLabel(target)}` +
+        `[DEBUG rawReply от ${targetLabel(target)}${isRace ? " (выиграл гонку)" : ""}` +
           (actualModel && actualModel !== target.model ? ` → фактически ответил: ${actualModel}` : "") +
           (systemFingerprint ? ` | fingerprint: ${systemFingerprint}` : "") +
           `]:`,
@@ -3331,6 +3462,18 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
       return { text: reply, stickerKey };
     } catch (err) {
       lastErr = err;
+
+      if (isRace) {
+        // raceTargetGroup уже залогировал ошибки каждого гонщика и
+        // расставил cooldown там, где нужно — здесь просто решаем, идти ли
+        // дальше по фолбэку.
+        console.error(`Группа [${targetLabel(TARGETS[groupIndices[0]])} × ${groupIndices.length}] вся не ответила:`, err.status ?? "-", err.message);
+        if (err.status && !isFallbackWorthy(err.status)) break;
+        continue;
+      }
+
+      const idx = groupIndices[0];
+      const target = TARGETS[idx];
       console.error(
         `Ошибка [${targetLabel(target)}]:`,
         err.status ?? "-",
