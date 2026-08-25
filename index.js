@@ -423,6 +423,28 @@ function extractSticker(text) {
   return { text: clean || text, stickerKey: STICKERS[key] ? key : null };
 }
 
+// ==== Настроение озвучки (см. EMOTION_REFS в app.py TTS-Space) ====
+// Та же категория реакции, что модель уже проставляет тегом [sticker: ключ]
+// (см. extractSticker выше), переиспользуем и для выбора интонации голоса —
+// не заводить же для этого второй, дублирующий набор тегов. Категорий-стикеров
+// больше, чем реально записанных настроений в Space — это нормально: любой
+// незнакомый или ещё не записанный ключ Space сам сведёт к "neutral"
+// (см. _resolve_ref в app.py), тут можно грубо мапить с запасом.
+const STICKER_TO_VOICE_MOOD = {
+  joke: "cheerful",
+  praise: "cheerful",
+  greeting: "cheerful",
+  music: "cheerful",
+  insult: "sarcastic",
+  banter_male: "sarcastic",
+  banter_female: "sarcastic",
+  confused: "confused",
+};
+
+function moodFromStickerKey(stickerKey) {
+  return STICKER_TO_VOICE_MOOD[stickerKey] || "neutral";
+}
+
 // ==== Персонаж — меняешь только этот текст, остального не трогаешь ====
 const SYSTEM_PROMPT = `
 Ты не играешь роль Жени — ты воспроизводишь его стиль общения и мышления. Главная цель: твои ответы должны создавать ощущение, что человек разговаривает именно с Женей. Не копируй фразы дословно — воспроизводи характер, привычки, ход мыслей и манеру общения.
@@ -668,22 +690,28 @@ function isBotAddressed(ctx, text) {
   return !!mentioned;
 }
 
-// Отправляет статус "печатает..." в нужный тред чата
-function sendTypingAction(ctx) {
+// Отправляет статус "печатает..." (или другой chat action, например
+// "record_voice" для режима /voice — см. ниже) в нужный тред чата.
+// action по умолчанию "typing" — все существующие вызовы без второго
+// аргумента ведут себя как раньше.
+function sendTypingAction(ctx, action = "typing") {
   if (!ctx.chat?.id) return Promise.resolve();
   const threadId = getThreadId(ctx);
   const opts = threadId ? { message_thread_id: threadId } : {};
-  console.log(`[typing] Sending action 'typing' to chat=${ctx.chat.id} (is_forum=${!!ctx.chat?.is_forum}) threadId=${threadId}`);
-  return ctx.api.sendChatAction(ctx.chat.id, "typing", opts).catch((err) =>
-    console.error("[typing] FAILED:", err.description ?? err.message ?? err)
+  console.log(`[chatAction] Sending action '${action}' to chat=${ctx.chat.id} (is_forum=${!!ctx.chat?.is_forum}) threadId=${threadId}`);
+  return ctx.api.sendChatAction(ctx.chat.id, action, opts).catch((err) =>
+    console.error(`[chatAction:${action}] FAILED:`, err.description ?? err.message ?? err)
   );
 }
 
-// Выполняет асинхронное действие, непрерывно продлевая статус "печатает..." каждые 4 секунды
-async function withTyping(ctx, actionFn) {
-  await sendTypingAction(ctx);
+// Выполняет асинхронное действие, непрерывно продлевая статус чат-экшена
+// каждые 4 секунды. action — какой именно статус показывать ("typing" по
+// умолчанию, "record_voice" — когда ответ уйдёт голосовым, см. режим
+// /voice ниже).
+async function withTyping(ctx, actionFn, action = "typing") {
+  await sendTypingAction(ctx, action);
   const interval = setInterval(() => {
-    sendTypingAction(ctx);
+    sendTypingAction(ctx, action);
   }, 4000);
   try {
     return await actionFn();
@@ -4259,13 +4287,16 @@ async function saveWatchDisabledChats() {
 }
 
 // ==== Режим голоса ("/voice") ====
-// Чаты, где ответы бота ДОПОЛНИТЕЛЬНО озвучиваются голосовым сообщением
-// (см. хук в самом конце bot.on("message:text") — рядом с обычной
-// отправкой текстового reply, и триггер "скажи голосом"/"озвучь" ниже для
-// разового вызова без включения режима на весь чат). По умолчанию
-// выключено везде — список ВКЛЮЧЁННЫХ чатов, персистится в Redis одним
-// массивом под ключом "voiceEnabledChats" (тот же паттерн, что
-// watchDisabledChats выше, только с обратным смыслом — там список
+// Чаты, где обычные ответы бота уходят ТОЛЬКО голосовым сообщением, без
+// текстового дубля (см. основной хук в конце bot.on("message:text"), где
+// это разруливается через переменную voiceOnly, и триггер "скажи
+// голосом"/"озвучь" ниже для разовой озвучки конкретного текста без
+// включения режима на весь чат — он работает независимо от этого
+// тумблера). Если синтез речи не удался (Space не ответил/упал) — ответ
+// всё равно уходит текстом, чтобы человек не остался без ответа вовсе.
+// По умолчанию выключено везде — список ВКЛЮЧЁННЫХ чатов, персистится в
+// Redis одним массивом под ключом "voiceEnabledChats" (тот же паттерн,
+// что watchDisabledChats выше, только с обратным смыслом — там список
 // исключений, тут список включений).
 const voiceEnabledChats = new Set();
 
@@ -4364,12 +4395,14 @@ bot.command("watch", async (ctx) => {
 });
 
 // Включает/выключает режим голоса в ЭТОМ чате — пока включён, каждый
-// обычный текстовый ответ бота (через askLLM, см. хук в конце
-// message:text) ДОПОЛНИТЕЛЬНО дублируется голосовым сообщением через
-// synthesizeSpeech. Влияет на всех участников чата, поэтому — как и
-// /watch/reset — только владелец. Разовая озвучка отдельного ответа без
-// включения режима на весь чат — см. триггер "скажи голосом"/"озвучь"
-// ниже, он работает независимо от этого тумблера.
+// обычный ответ бота (через askLLM, см. переменную voiceOnly в хуке в
+// конце message:text) уходит ТОЛЬКО голосовым сообщением через
+// synthesizeSpeech, без текстового дубля. Если синтез не удастся — ответ
+// всё равно уйдёт текстом (см. тот же хук). Влияет на всех участников
+// чата, поэтому — как и /watch/reset — только владелец. Разовая озвучка
+// отдельного ответа без включения режима на весь чат — см. триггер
+// "скажи голосом"/"озвучь" ниже, он работает независимо от этого
+// тумблера.
 bot.command("voice", async (ctx) => {
   if (!isOwner(ctx)) return;
   if (!TTS_SPACE) {
@@ -4380,11 +4413,11 @@ bot.command("voice", async (ctx) => {
   if (voiceEnabledChats.has(chatId)) {
     voiceEnabledChats.delete(chatId);
     await saveVoiceEnabledChats();
-    await ctx.reply("режим голоса в этом чате выключил — дальше отвечаю только текстом");
+    await ctx.reply("режим голоса в этом чате выключил — дальше отвечаю текстом");
   } else {
     voiceEnabledChats.add(chatId);
     await saveVoiceEnabledChats();
-    await ctx.reply("режим голоса в этом чате включил — теперь буду дублировать ответы голосом");
+    await ctx.reply("режим голоса в этом чате включил — теперь отвечаю только голосовыми (если озвучка не удастся — пришлю текст)");
   }
 });
 
@@ -6825,17 +6858,21 @@ function stripForVoice(text) {
 
 // Возвращает Buffer с аудио или null. text уже должен быть прогнан через
 // stripForVoice вызывающим кодом — эта функция ничего не чистит сама,
-// просто честно озвучивает то, что ей дали.
-async function synthesizeSpeech(text) {
+// просто честно озвучивает то, что ей дали. emotion — необязательный ключ
+// настроения (см. EMOTION_REFS в app.py Space'а, moodFromStickerKey ниже),
+// по умолчанию "neutral"; если под настроение ещё не записан референс —
+// Space сам молча упадёт обратно на neutral, тут ничего разруливать не
+// нужно.
+async function synthesizeSpeech(text, emotion = "neutral") {
   if (!TTS_SPACE || !text) return null;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TTS_TIMEOUT_MS);
   try {
     const client = await getTtsGradioClient();
-    // /tts — эндпоинт из своего app.py (см. деплой-инструкцию), единственный
-    // обязательный вход "text"; референсный голос для клонирования зашит
-    // в сам Space, чтобы не гонять аудио-файл на каждый вызов.
-    const result = await client.predict("/tts", { text });
+    // /tts — эндпоинт из своего app.py (см. деплой-инструкцию); референсный
+    // голос для клонирования зашит в сам Space (см. EMOTION_REFS), поэтому
+    // тут гоняем только текст и ключ настроения, а не аудио-файл.
+    const result = await client.predict("/tts", { text, emotion });
     const audioUrl = result?.data?.[0]?.url;
     if (!audioUrl) return null;
     const resp = await fetch(audioUrl, { signal: controller.signal });
@@ -6846,29 +6883,6 @@ async function synthesizeSpeech(text) {
     return null;
   } finally {
     clearTimeout(timeoutId);
-  }
-}
-
-// Хук для режима /voice (см. voiceEnabledChats выше) — вызывается ПОСЛЕ
-// того, как обычный текстовый ответ уже реально ушёл в чат (не раньше:
-// если синтез зависнет/упадёт, текстовый ответ пользователь всё равно
-// получит вовремя, голос — это всегда ДОПОЛНЕНИЕ, а не замена и не
-// блокировка обычного ответа). Тихо ничего не делает, если режим в этом
-// чате выключен, TTS не настроен или синтез не удался — никаких сообщений
-// об ошибке сюда специально не шлём, чтобы не спамить при регулярных
-// осечках Space (в отличие от разового "скажи голосом" выше, где ошибку
-// озвучки уместно показать явно).
-async function maybeSendVoiceReply(ctx, chatId, replyText) {
-  if (!TTS_SPACE || !voiceEnabledChats.has(chatId)) return;
-  try {
-    const audioBuffer = await synthesizeSpeech(stripForVoice(replyText));
-    if (audioBuffer) {
-      await ctx.replyWithVoice(new InputFile(audioBuffer, "voice.ogg"), {
-        message_thread_id: ctx.message.message_thread_id,
-      });
-    }
-  } catch (err) {
-    console.error(`Режим голоса: не удалось озвучить ответ в чате ${chatId}:`, err.message || err);
   }
 }
 
@@ -9180,7 +9194,7 @@ bot.on("message:text", async (ctx) => {
         );
         return;
       }
-      sendTypingAction(ctx);
+      sendTypingAction(ctx, "record_voice");
       const audioBuffer = await synthesizeSpeech(stripForVoice(textToVoice));
       if (audioBuffer) {
         await ctx.replyWithVoice(new InputFile(audioBuffer, "voice.ogg"), replyOpts);
@@ -9935,17 +9949,29 @@ bot.on("message:text", async (ctx) => {
   }
 
   try {
-    let reply, stickerKey;
-    await withTyping(ctx, async () => {
-      const res = await askLLM(
-        chatId,
-        userText,
-        searchUsedThisMessage ? POST_SEARCH_ASK_TIMEOUT_MS : undefined
-      );
-      reply = res.text;
-      stickerKey = res.stickerKey;
-      await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
-    });
+    let reply, stickerKey, voiceBuffer;
+    // Режим /voice (см. voiceEnabledChats выше) — если включён и TTS
+    // настроен, вместо "печатает..." показываем "записывает голосовое
+    // сообщение", и синтез речи делаем сразу тут же, под тем же
+    // индикатором, чтобы он не пропадал между "подумал" и "озвучил".
+    const voiceOnly = !!TTS_SPACE && voiceEnabledChats.has(chatId);
+    await withTyping(
+      ctx,
+      async () => {
+        const res = await askLLM(
+          chatId,
+          userText,
+          searchUsedThisMessage ? POST_SEARCH_ASK_TIMEOUT_MS : undefined
+        );
+        reply = res.text;
+        stickerKey = res.stickerKey;
+        await new Promise((r) => setTimeout(r, typingDelayMs(reply.length)));
+        if (voiceOnly) {
+          voiceBuffer = await synthesizeSpeech(stripForVoice(reply), moodFromStickerKey(stickerKey));
+        }
+      },
+      voiceOnly ? "record_voice" : "typing"
+    );
 
     // Если явная фраза уже вызвала стикер по regex выше — не дублируем
     // ещё одним стикером от тега модели на то же сообщение. Плюс анти-спам:
@@ -9960,27 +9986,37 @@ bot.on("message:text", async (ctx) => {
     const senderDisplayName = getDisplayName(chatId, ctx.from);
 
     if (stickerId) {
-      // Стикер реально есть чем отправить — шлём ТОЛЬКО его, без текста.
-      // Текст модели в этом случае был просто реакцией ("спасибо" и т.п.),
-      // дублировать её текстом не нужно. В историю (см. askLLM) уже
-      // положен полный текст с вырезанным тегом — бот всё равно будет
-      // помнить, что "ответил", даже если пользователю ушёл только стикер.
+      // Стикер реально есть чем отправить — шлём ТОЛЬКО его, без текста
+      // и без голоса. Текст модели в этом случае был просто реакцией
+      // ("спасибо" и т.п.), дублировать её не нужно. В историю (см.
+      // askLLM) уже положен полный текст с вырезанным тегом — бот всё
+      // равно будет помнить, что "ответил", даже если пользователю ушёл
+      // только стикер.
       const sentMsg = await ctx.replyWithSticker(stickerId, {
         reply_parameters: isGroup ? { message_id: ctx.message.message_id } : undefined,
         message_thread_id: ctx.message.message_thread_id,
       });
       rememberBotReply(chatId, sentMsg.message_id, senderDisplayName, reply);
+    } else if (voiceOnly && voiceBuffer) {
+      // Режим /voice сработал — шлём ТОЛЬКО голосовое, без текстового
+      // дубля.
+      const sentMsg = await ctx.replyWithVoice(new InputFile(voiceBuffer, "voice.ogg"), {
+        reply_parameters: isGroup ? { message_id: ctx.message.message_id } : undefined,
+        message_thread_id: ctx.message.message_thread_id,
+      });
+      rememberBotReply(chatId, sentMsg.message_id, senderDisplayName, reply);
     } else if (isGroup) {
+      // Обычный текстовый ответ — либо режим /voice выключен, либо
+      // синтез не удался (Space не ответил/упал) и мы не хотим оставлять
+      // человека без ответа вовсе.
       const sentMsg = await ctx.reply(reply, {
         reply_parameters: { message_id: ctx.message.message_id },
         message_thread_id: ctx.message.message_thread_id,
       });
       rememberBotReply(chatId, sentMsg.message_id, senderDisplayName, reply);
-      await maybeSendVoiceReply(ctx, chatId, reply);
     } else {
       const sentMsg = await ctx.reply(reply);
       rememberBotReply(chatId, sentMsg.message_id, senderDisplayName, reply);
-      await maybeSendVoiceReply(ctx, chatId, reply);
     }
   } catch (err) {
     console.error("Ошибка обработки сообщения:", err);
