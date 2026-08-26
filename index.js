@@ -5666,14 +5666,62 @@ async function askAstroLLM(taskType, dataBlock, theme = null, years = null, time
   throw lastErr ?? new Error("Все провайдеры и модели недоступны");
 }
 
+// ==== Перевод и адаптация промпта для генерации картинки ====
+// Pollinations (Flux/turbo и т.п.) заметно лучше понимает подробные
+// промпты на английском — на русском часто получается мимо темы или
+// хуже по композиции. Прогоняем промпт пользователя через тот же пул
+// TARGETS/фолбэк, что и askAstroLLM выше (не сам askLLM — это разовая
+// техническая задача, а не часть диалога, класть в HISTORY её не нужно).
+// Системный промпт намеренно сухой, без персоны Жени — модель тут просто
+// инструмент перевода+адаптации, а не собеседник. Температура выше, чем
+// у askAstroLLM (0.5) — тут наоборот полезно немного "дорисовать"
+// детали (свет, стиль, композицию), а не сухо переводить слово в слово.
+const IMAGE_PROMPT_ADAPT_SYSTEM =
+  "Ты — инструмент подготовки промптов для text-to-image модели (Flux). " +
+  "Тебе дают описание картинки на любом языке (часто на русском, иногда " +
+  "с опечатками и сленгом). Переведи и адаптируй его в качественный " +
+  "промпт на английском для генерации изображения: сохрани исходный " +
+  "смысл и все детали, но при необходимости дополни конкретикой — стиль, " +
+  "освещение, композиция, ракурс, — если это поможет лучше передать " +
+  "задумку. Ответь ТОЛЬКО готовым промптом на английском, без кавычек, " +
+  "без пояснений, без markdown, без вступительных фраз.";
+const IMAGE_PROMPT_ADAPT_TIMEOUT_MS = Number(process.env.IMAGE_PROMPT_ADAPT_TIMEOUT_MS) || 20000;
+
+async function translatePromptForImage(prompt) {
+  const messages = [
+    { role: "system", content: IMAGE_PROMPT_ADAPT_SYSTEM },
+    { role: "user", content: prompt },
+  ];
+
+  const order = computeTargetOrder();
+  for (const idx of order) {
+    const target = TARGETS[idx];
+    try {
+      const { reply } = await callTarget(target, messages, IMAGE_PROMPT_ADAPT_TIMEOUT_MS, 0.8);
+      const cleaned = (reply || "").trim().replace(/^["'«]+|["'»]+$/g, "");
+      if (cleaned) return cleaned;
+    } catch (err) {
+      console.error(`translatePromptForImage: ошибка [${targetLabel(target)}]:`, err.status ?? "-", err.body ?? err.message);
+      // пробуем следующую цель из TARGETS, cooldown тут не выставляем —
+      // это вспомогательная задача, не стоит из-за неё гасить основную
+      // модель для обычного чата
+    }
+  }
+  // Если перевод не удался вообще нигде — рисуем по исходному промпту,
+  // а не роняем всю генерацию картинки из-за вспомогательного шага.
+  return prompt;
+}
+
 // "/imggen <промпт>" — сгенерировать картинку с нуля через Pollinations.ai
-// (см. generateImagePollinations ниже). Без ключей, без дневной квоты.
-// Раньше здесь была генерация через Gemini (Nano Banana) с поддержкой
-// редактирования референсного фото по реплаю, но free tier Gemini на
-// картиночные модели стал ненадёжным (все аккаунты разом улетали в 429),
-// поэтому Gemini-ветку убрали целиком. Pollinations не поддерживает
-// conversational image editing — только text-to-image, так что реплай на
-// фото больше ничего не даёт.
+// (см. generateImagePollinations ниже). Промпт сначала переводится и
+// адаптируется под текст-в-картинку модель (см. translatePromptForImage
+// выше) — без ключей, без дневной квоты. Раньше здесь была генерация
+// через Gemini (Nano Banana) с поддержкой редактирования референсного
+// фото по реплаю, но free tier Gemini на картиночные модели стал
+// ненадёжным (все аккаунты разом улетали в 429), поэтому Gemini-ветку
+// убрали целиком. Pollinations не поддерживает conversational image
+// editing — только text-to-image, так что реплай на фото больше ничего
+// не даёт.
 bot.command("imggen", async (ctx) => {
   const prompt = (ctx.match || "").trim();
   if (!prompt) {
@@ -5683,7 +5731,8 @@ bot.command("imggen", async (ctx) => {
 
   await sendTypingAction(ctx, "upload_photo");
   try {
-    const { buffer, mime } = await generateImagePollinations(prompt);
+    const adaptedPrompt = await translatePromptForImage(prompt);
+    const { buffer, mime } = await generateImagePollinations(adaptedPrompt);
     const ext = mime.includes("png") ? "png" : "jpg";
     await ctx.replyWithPhoto(new InputFile(buffer, `imggen.${ext}`), {
       reply_parameters: { message_id: ctx.message.message_id },
