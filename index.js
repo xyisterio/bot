@@ -7098,11 +7098,21 @@ function hasSearchIntent(text) {
 // сообщений диалога (тот же формат, что и в основной истории для askLLM) и
 // просим её самой решить, нужен ли поиск, и если да — сформулировать
 // самодостаточный запрос (без "загугли", с уточнениями типа "Украина"/
-// "НБУ", если это следует из переписки). Дешёвая быстрая модель, отдельным
-// точечным вызовом, в обход основного TARGETS-фолбэка — как и с vision/
-// search выше, это узкоспециальная задача, а не общий чат.
+// "НБУ", если это следует из переписки).
+// Раньше тут был захардкожен ОДИН конкретный провайдер/модель/ключ
+// (GROQ_API_KEYS[0] + одна groq-модель) без вообще какого-либо фолбэка —
+// на практике это привело к тому, что классификация молча падала целиком,
+// стоило именно этой конкретной модели стать недоступной (напр. снятой с
+// доступа у Groq, см. "model_not_found" в логах), даже если остальные
+// 10+ моделей/аккаунтов в TARGETS работали нормально. Теперь используем
+// тот же устойчивый паттерн полного перебора пула TARGETS с cooldown, что
+// и в askAstroLLM/askLLM — одна неисправная цель просто уходит в cooldown
+// и подхватывается следующая по порядку (см. computeTargetOrder).
 const SEARCH_INTENT_TIMEOUT_MS = Number(process.env.SEARCH_INTENT_TIMEOUT_MS) || 8000;
-const GROQ_SEARCH_INTENT_MODEL = process.env.GROQ_SEARCH_INTENT_MODEL || GROQ_MODELS[0];
+// Температура ниже дефолтной (0.9) — это классификация/извлечение факта из
+// диалога, а не творческая болтовня в персоне; нужна стабильность
+// формата (либо голый запрос, либо ровно "NONE"), а не разнообразие.
+const SEARCH_INTENT_TEMPERATURE = 0.2;
 
 const SEARCH_INTENT_SYSTEM_PROMPT =
   "Ты определяешь, нужен ли для ответа на ПОСЛЕДНЕЕ сообщение пользователя " +
@@ -7124,21 +7134,34 @@ const SEARCH_INTENT_SYSTEM_PROMPT =
   "Ничего кроме поискового запроса или NONE в ответе быть не должно.";
 
 async function classifySearchIntent(chatId, rawText) {
-  const intentTarget = {
-    provider: "groq",
-    model: GROQ_SEARCH_INTENT_MODEL,
-    baseUrl: PROVIDER_CONFIGS.groq.baseUrl,
-    apiKey: GROQ_API_KEYS[0],
-  };
   const messages = [
     { role: "system", content: SEARCH_INTENT_SYSTEM_PROMPT },
     ...getHistory(chatId),
     { role: "user", content: rawText },
   ];
-  const { reply } = await callTarget(intentTarget, messages, SEARCH_INTENT_TIMEOUT_MS);
-  const trimmed = (reply || "").trim().replace(/^["«]+|["»]+$/g, "");
-  if (!trimmed || /^NONE$/i.test(trimmed)) return null;
-  return trimmed;
+
+  let lastErr;
+  const order = computeTargetOrder();
+  for (const idx of order) {
+    const target = TARGETS[idx];
+    try {
+      const { reply } = await callTarget(target, messages, SEARCH_INTENT_TIMEOUT_MS, SEARCH_INTENT_TEMPERATURE);
+      cooldownUntil[idx] = 0;
+      const trimmed = (reply || "").trim().replace(/^["«]+|["»]+$/g, "");
+      if (!trimmed || /^NONE$/i.test(trimmed)) return null;
+      return trimmed;
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `Классификация поискового интента: ошибка [${targetLabel(target)}]:`,
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+      if (err.status && !isFallbackWorthy(err.status)) break;
+      cooldownUntil[idx] = Date.now() + MODEL_COOLDOWN_MS;
+    }
+  }
+  throw lastErr ?? new Error("Все провайдеры и модели недоступны");
 }
 
 // Отдельный точечный вызов vision-модели — в обход askLLM/TARGETS-фолбэка:
