@@ -5666,6 +5666,56 @@ async function askAstroLLM(taskType, dataBlock, theme = null, years = null, time
   throw lastErr ?? new Error("Все провайдеры и модели недоступны");
 }
 
+// "/banana <промпт>" — сгенерировать картинку с нуля через Nano Banana
+// (gemini-2.5-flash-image, см. generateImageGemini выше). Если команда
+// отправлена РЕПЛАЕМ на фото (в том числе фото, которое ранее прислал сам
+// бот) — это фото уходит в запрос как reference-картинка, и модель вместо
+// генерации с нуля РЕДАКТИРУЕТ/комбинирует существующее изображение по
+// тексту промпта — это и есть основная фишка Nano Banana (conversational
+// image editing), а не просто text-to-image.
+bot.command("banana", async (ctx) => {
+  const prompt = (ctx.match || "").trim();
+  if (!prompt) {
+    await ctx.reply(
+      "напиши, что нарисовать: /banana рыжий кот в скафандре на Марсе\n" +
+        "или реплаем на фото: /banana сделай фон закатным"
+    );
+    return;
+  }
+
+  const repliedPhoto = ctx.message.reply_to_message?.photo;
+  const referenceImages = [];
+  try {
+    if (repliedPhoto?.length) {
+      // Telegram шлёт массив размеров одного и того же фото — берём
+      // последний (самый крупный).
+      const fileId = repliedPhoto[repliedPhoto.length - 1].file_id;
+      const { base64, mime } = await fetchTelegramFileBase64(ctx, fileId);
+      referenceImages.push({ base64, mime });
+    }
+  } catch (err) {
+    console.error("Не удалось скачать референс-фото для /banana:", err.message || err);
+    await ctx.reply("не смог скачать фото, на которое ты реплайнул — попробую сгенерировать без него?");
+    return;
+  }
+
+  await sendTypingAction(ctx, "upload_photo");
+  try {
+    const { buffer, mime } = await generateImageGemini(prompt, referenceImages);
+    const ext = mime.includes("png") ? "png" : "jpg";
+    await ctx.replyWithPhoto(new InputFile(buffer, `banana.${ext}`), {
+      reply_parameters: { message_id: ctx.message.message_id },
+      message_thread_id: ctx.message.message_thread_id,
+    });
+  } catch (err) {
+    console.error("Ошибка генерации картинки (Nano Banana):", err.message || err);
+    await ctx.reply(`не получилось нарисовать: ${(err.message || "").slice(0, 200) || "неизвестная ошибка"}`, {
+      reply_parameters: { message_id: ctx.message.message_id },
+      message_thread_id: ctx.message.message_thread_id,
+    });
+  }
+});
+
 // "/natal" — без аргументов показывает то, что уже сохранено (или
 // инструкцию, если ничего нет); "/natal reset" стирает сохранённые данные;
 // "/natal ДД.ММ.ГГГГ[ ЧЧ:ММ] Город" сохраняет/перезаписывает дату рождения.
@@ -7188,6 +7238,80 @@ async function captionPhoto(ctx, fileId) {
   ];
   const { reply } = await callTarget(visionTarget, messages);
   return extractPhotoReaction(reply);
+}
+
+// ==== Генерация/редактирование картинок — Nano Banana (Gemini 2.5 Flash Image) ====
+// Сознательно ТОЛЬКО gemini-2.5-flash-image, а не более новые
+// gemini-3.1-flash-image/gemini-3-pro-image — именно у этой модели щедрый
+// бесплатный тир (~500 картинок/день без привязки карты), новые сильно
+// урезаны или вообще платные. Это отдельный REST-эндпоинт Gemini
+// (generateContent с responseModalities), а НЕ тот же OpenAI-совместимый
+// chat/completions, через который ходит callTarget/PROVIDER_CONFIGS.gemini —
+// та ветка текстовая и картинок на выходе не отдаёт в принципе, поэтому тут
+// свой fetch, по аналогии с searchWebTavily. referenceImages (опционально) —
+// массив { base64, mime } — если сообщение было реплаем на фото/картинку от
+// бота, добавляем их как inline_data ПЕРЕД текстом промпта, тогда модель
+// редактирует/комбинирует существующее изображение, а не рисует с нуля
+// (та самая "conversational image editing", ради которой Nano Banana и
+// прославилась).
+const GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image";
+const GEMINI_IMAGE_TIMEOUT_MS = Number(process.env.GEMINI_IMAGE_TIMEOUT_MS) || 60000;
+
+async function generateImageGemini(prompt, referenceImages = []) {
+  if (!GEMINI_API_KEYS.length) throw new Error("GEMINI_API_KEY(S) не задан");
+
+  const parts = [
+    ...referenceImages.map((img) => ({ inline_data: { mime_type: img.mime, data: img.base64 } })),
+    { text: prompt },
+  ];
+
+  let lastErr;
+  for (let i = 0; i < GEMINI_API_KEYS.length; i++) {
+    const apiKey = GEMINI_API_KEYS[i];
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), GEMINI_IMAGE_TIMEOUT_MS);
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+          signal: controller.signal,
+          body: JSON.stringify({
+            contents: [{ role: "user", parts }],
+            generationConfig: { responseModalities: ["Image"] },
+          }),
+        }
+      ).finally(() => clearTimeout(timeoutId));
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`status ${res.status}: ${text.slice(0, 300)}`);
+      }
+
+      const json = await res.json();
+      const responseParts = json?.candidates?.[0]?.content?.parts || [];
+      const imagePart = responseParts.find((p) => p.inline_data || p.inlineData);
+      const inlineData = imagePart?.inline_data || imagePart?.inlineData;
+      if (!inlineData?.data) {
+        // Модель может отказаться рисовать (safety-фильтр и т.п.) и
+        // вернуть только текст с объяснением — прокидываем его в ошибку,
+        // чтобы вызывающий код мог показать причину пользователю, а не
+        // просто "не получилось".
+        const textPart = responseParts.find((p) => p.text)?.text;
+        throw new Error(textPart || "модель не вернула картинку");
+      }
+      return { buffer: Buffer.from(inlineData.data, "base64"), mime: inlineData.mime_type || "image/png" };
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `generateImageGemini: ошибка у аккаунта ${i + 1}/${GEMINI_API_KEYS.length}:`,
+        err.message || err
+      );
+      // пробуем следующий ключ из GEMINI_API_KEYS
+    }
+  }
+  throw lastErr ?? new Error("все аккаунты Gemini недоступны");
 }
 
 // ==== Поиск в интернете (Groq Compound) ====
@@ -10276,6 +10400,7 @@ async function registerCommands() {
     { command: "krokodil_reset", description: "сбросить зависший раунд крокодила" },
     { command: "natal", description: "сохранить дату рождения / посмотреть натальную карту" },
     { command: "tarot", description: "расклад Таро (день / три карты / вопрос / кельтский крест)" },
+    { command: "banana", description: "нарисовать картинку (или отредактировать фото реплаем)" },
   ]);
   console.log("Команды зарегистрированы в Telegram");
 }
