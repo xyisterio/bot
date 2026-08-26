@@ -7083,6 +7083,64 @@ function hasSearchIntent(text) {
   return SEARCH_GENERIC_VERB_REGEX.test(text) && SEARCH_LOCATION_REGEX.test(text);
 }
 
+// ==== Определение необходимости веб-поиска через LLM (вместо чистого regex) ====
+// hasSearchIntent выше остаётся как быстрый и дешёвый первый фильтр (см.
+// использование ниже как фолбэка), но у чистого regex по тексту ТЕКУЩЕГО
+// сообщения три системных проблемы, которые всплыли на практике:
+// 1) слово-триггер ("загугли"/"поищи") никак не вырезается и утекает в сам
+//    поисковый запрос — Tavily/Compound ищут по фразе "Загугли курс
+//    доллара", а не по теме;
+// 2) короткие follow-up'ы без темы ("Ну загугли") бесполезны — тема была в
+//    предыдущих репликах, а regex видит только текущее сообщение;
+// 3) естественные формулировки без прямого глагола-повеления ("а если в
+//    интернете посмотреть?") вообще не ловятся.
+// Эта функция решает все три: даём лёгкой модели последние HISTORY_LIMIT
+// сообщений диалога (тот же формат, что и в основной истории для askLLM) и
+// просим её самой решить, нужен ли поиск, и если да — сформулировать
+// самодостаточный запрос (без "загугли", с уточнениями типа "Украина"/
+// "НБУ", если это следует из переписки). Дешёвая быстрая модель, отдельным
+// точечным вызовом, в обход основного TARGETS-фолбэка — как и с vision/
+// search выше, это узкоспециальная задача, а не общий чат.
+const SEARCH_INTENT_TIMEOUT_MS = Number(process.env.SEARCH_INTENT_TIMEOUT_MS) || 8000;
+const GROQ_SEARCH_INTENT_MODEL = process.env.GROQ_SEARCH_INTENT_MODEL || GROQ_MODELS[0];
+
+const SEARCH_INTENT_SYSTEM_PROMPT =
+  "Ты определяешь, нужен ли для ответа на ПОСЛЕДНЕЕ сообщение пользователя " +
+  "актуальный веб-поиск (новости, курсы валют, погода, свежие факты, " +
+  "события, даты — всё, что модель не может надёжно знать сама или что " +
+  "могло устареть). Учитывай контекст всей переписки выше — если тема " +
+  "поиска упоминалась раньше (например пользователь до этого спрашивал " +
+  "про курс доллара, а потом просто написал \"загугли\" без темы), " +
+  "восстанови тему из истории.\n\n" +
+  "Если поиск нужен — ответь ТОЛЬКО самим поисковым запросом на русском " +
+  "языке, без слов вроде \"загугли\"/\"поищи\"/\"глянь\", без кавычек и " +
+  "пояснений — запрос должен быть понятен сам по себе, вне контекста " +
+  "переписки (добавь уточнения по стране/валюте/дате, если это следует из " +
+  "переписки, например \"курс доллара к гривне НБУ сегодня\", а не просто " +
+  "\"курс доллара\").\n\n" +
+  "Если поиск НЕ нужен (бытовой разговор, мнение, шутка, вопрос про то, " +
+  "что и так уже есть в истории переписки) — ответь ровно одним словом: " +
+  "NONE\n\n" +
+  "Ничего кроме поискового запроса или NONE в ответе быть не должно.";
+
+async function classifySearchIntent(chatId, rawText) {
+  const intentTarget = {
+    provider: "groq",
+    model: GROQ_SEARCH_INTENT_MODEL,
+    baseUrl: PROVIDER_CONFIGS.groq.baseUrl,
+    apiKey: GROQ_API_KEYS[0],
+  };
+  const messages = [
+    { role: "system", content: SEARCH_INTENT_SYSTEM_PROMPT },
+    ...getHistory(chatId),
+    { role: "user", content: rawText },
+  ];
+  const { reply } = await callTarget(intentTarget, messages, SEARCH_INTENT_TIMEOUT_MS);
+  const trimmed = (reply || "").trim().replace(/^["«]+|["»]+$/g, "");
+  if (!trimmed || /^NONE$/i.test(trimmed)) return null;
+  return trimmed;
+}
+
 // Отдельный точечный вызов vision-модели — в обход askLLM/TARGETS-фолбэка:
 // тут только одна конкретная модель (GROQ_VISION_MODEL), без перебора
 // провайдеров, потому что это узкоспециальная задача, а не общий чат.
@@ -7124,7 +7182,10 @@ const WEB_SEARCH_SYSTEM_PROMPT =
   "информацию через поиск в интернете и изложи её кратким фактическим " +
   "конспектом на русском: конкретика (даты, цифры, названия), без " +
   "вступлений и без собственных оценок. Если источники противоречат " +
-  "друг другу — отметь это прямо в тексте.";
+  "друг другу — отметь это прямо в тексте. В конце ОБЯЗАТЕЛЬНО добавь " +
+  "строку \"Источники: \" и через запятую прямые URL страниц, которые " +
+  "реально использовал (не выдумывай ссылки, если поиск их не дал — " +
+  "тогда просто не добавляй эту строку).";
 
 async function searchWebGroq(query) {
   const searchTarget = {
@@ -7182,15 +7243,20 @@ async function searchWebTavily(query) {
       }
 
       const json = await res.json();
-      if (json.answer && json.answer.trim()) return json.answer.trim();
+      const results = Array.isArray(json.results) ? json.results : [];
+      const sourceUrls = results.map((r) => r.url).filter(Boolean);
+      const sourcesLine = sourceUrls.length ? `\nИсточники: ${sourceUrls.slice(0, 3).join(", ")}` : "";
+
+      if (json.answer && json.answer.trim()) return `${json.answer.trim()}${sourcesLine}`;
 
       // Fallback внутри самого Tavily-пути: ответа нет, но есть результаты —
       // собираем короткий конспект сами, а не сдаёмся раньше времени.
-      const results = Array.isArray(json.results) ? json.results : [];
+      // Каждый пункт сразу со своим URL — иначе если попросят прислать
+      // ссылку на конкретный источник, боту нечего будет прислать.
       if (results.length) {
         return results
           .slice(0, 3)
-          .map((r) => `${r.title || ""}: ${(r.content || "").slice(0, 300)}`)
+          .map((r) => `${r.title || ""} (${r.url || "без ссылки"}): ${(r.content || "").slice(0, 300)}`)
           .join("\n");
       }
       throw new Error("пустой ответ без результатов");
@@ -9537,9 +9603,35 @@ bot.on("message:text", async (ctx) => {
   // истории переписки, а не отдельным сухим блоком фактов от Compound.
   // Дошли сюда — сообщение уже точно адресовано боту (см. isAddressedToBot
   // внутри if (isGroup) выше; в личке — адресовано по умолчанию).
+  //
+  // Решение "нужен ли поиск и по какому запросу" принимает
+  // classifySearchIntent (см. определение выше) — она видит историю
+  // переписки, поэтому понимает follow-up'ы без темы ("Ну загугли") и не
+  // тащит в сам запрос слово-триггер. Если классификатор технически упал
+  // (таймаут/лимит/ошибка провайдера) — фолбэк на старый быстрый regex
+  // (hasSearchIntent), чтобы явные "загугли X" не терялись совсем даже при
+  // проблемах с LLM-классификацией; в этом фолбэк-случае слово-триггер из
+  // самого запроса вырезаем вручную, чтобы не повторить старый баг.
   {
-    const searchQuery = stripBotAddressing(rawText, ctx);
-    if (hasSearchIntent(searchQuery)) {
+    const strippedForSearch = stripBotAddressing(rawText, ctx);
+    let searchQuery = null;
+    try {
+      searchQuery = await classifySearchIntent(chatId, strippedForSearch);
+    } catch (err) {
+      console.error(
+        "Ошибка классификации поискового интента, фолбэк на regex:",
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+      if (hasSearchIntent(strippedForSearch)) {
+        searchQuery =
+          strippedForSearch
+            .replace(SEARCH_STANDALONE_VERB_REGEX, "")
+            .replace(SEARCH_GENERIC_VERB_REGEX, "")
+            .trim() || strippedForSearch;
+      }
+    }
+    if (searchQuery) {
       console.log(`Поиск в интернете: интент сработал, запрос «${searchQuery}»`);
       sendTypingAction(ctx);
       try {
