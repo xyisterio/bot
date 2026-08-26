@@ -7211,13 +7211,20 @@ async function searchWebTavily(query) {
 // исчерпана/таймаут) — откатывается на Groq compound-mini, чтобы поиск не
 // переставал работать целиком из-за одного упавшего провайдера.
 async function searchWeb(query) {
+  console.log(`searchWeb: запрос «${query}»`);
   try {
     const tavilyReply = await searchWebTavily(query);
-    if (tavilyReply) return tavilyReply;
+    if (tavilyReply) {
+      console.log(`searchWeb: ответ от Tavily (${tavilyReply.length} симв.): ${tavilyReply.slice(0, 200)}`);
+      return tavilyReply;
+    }
+    console.log("searchWeb: Tavily не дал результата (ключи не заданы/пусто), пробую Groq");
   } catch (err) {
     console.error("searchWebTavily упал целиком, откатываюсь на Groq:", err.message || err);
   }
-  return await searchWebGroq(query);
+  const groqReply = await searchWebGroq(query);
+  console.log(`searchWeb: ответ от Groq compound (${groqReply.length} симв.): ${groqReply.slice(0, 200)}`);
+  return groqReply;
 }
 
 // ==== Фоновая расшифровка голосовых/аудио для сводки чата ====
@@ -9533,6 +9540,7 @@ bot.on("message:text", async (ctx) => {
   {
     const searchQuery = stripBotAddressing(rawText, ctx);
     if (hasSearchIntent(searchQuery)) {
+      console.log(`Поиск в интернете: интент сработал, запрос «${searchQuery}»`);
       sendTypingAction(ctx);
       try {
         const found = await searchWeb(searchQuery);
