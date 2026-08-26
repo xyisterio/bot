@@ -5957,7 +5957,13 @@ async function runTarotSpread(ctx, spreadType, question) {
         : drawCards(spread.count);
 
     const dataBlock = buildTarotContext(spreadType, drawn, question);
-    const reply = await askTarotLLM(spreadType, dataBlock);
+    const rawReply = await askTarotLLM(spreadType, dataBlock);
+    // SYSTEM_PROMPT — тот же общий промпт персонажа, что и в обычном чате,
+    // а в нём есть инструкция про теги [sticker: ...] (см. extractSticker
+    // выше). Для таро своя механика стикеров не нужна, но модель всё равно
+    // иногда добавляет тег по инерции — вырезаем его так же, как в
+    // обычном чате, просто без последующей отправки стикера.
+    const { text: reply } = extractSticker(rawReply);
 
     const displayName = getDisplayName(ctx.chat.id, ctx.from);
     const label = SPREAD_LABEL_RU[spreadType] || "расклад Таро";
