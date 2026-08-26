@@ -82,6 +82,17 @@ const GEMINI_API_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_K
   .map((k) => k.trim())
   .filter(Boolean);
 
+// Tavily — тот же принцип, что у Gemini/Groq выше: несколько ключей с
+// разных аккаунтов через запятую в TAVILY_API_KEYS, каждый со своей
+// отдельной месячной квотой (1000 бесплатных запросов/мес без привязки
+// карты) — несколько аккаунтов суммарно продлевают доступный бюджет поиска.
+// TAVILY_API_KEY (в единственном числе) — для обратной совместимости, если
+// ключ один. См. searchWebTavily ниже.
+const TAVILY_API_KEYS = (process.env.TAVILY_API_KEYS || process.env.TAVILY_API_KEY || "")
+  .split(",")
+  .map((k) => k.trim())
+  .filter(Boolean);
+
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан в переменных окружения");
 if (!GROQ_API_KEYS.length) throw new Error("GROQ_API_KEY(S) не задан в переменных окружения");
 
@@ -7130,47 +7141,40 @@ async function searchWebGroq(query) {
   return reply;
 }
 
-// ==== Веб-поиск через Gemini (Grounding with Google Search) ====
-// Отдельная квота от обычных текстовых запросов (5000 бесплатных
-// grounded-запросов/месяц на Gemini 3.x, не делится с лимитом обычного
-// чата/резолвинга треков на тех же ключах GEMINI_API_KEYS) — поэтому
-// предпочтительнее Groq compound-mini (см. searchWebGroq выше) как
-// основной путь, а не только фолбэк.
-//
-// Идёт МИМО callTarget/TARGETS: та инфраструктура заточена под
-// OpenAI-совместимый /chat/completions формат, а нативный google_search
-// тул надёжно работает только через "родной" Gemini REST-эндпоинт
-// (generateContent) — через OpenAI-совместимую прослойку это поле либо
-// игнорируется, либо ловит "Unknown name google_search" (см. репорты в
-// форуме Google AI Developers).
-//
-// Перебирает все аккаунты (GEMINI_API_KEYS) по очереди при ошибке — один
-// протухший/забаненный ключ (см. PERMISSION_DENIED) не должен рушить
-// поиск целиком, пока жив хотя бы один рабочий.
-const GEMINI_SEARCH_MODEL = process.env.GEMINI_SEARCH_MODEL || GEMINI_MODELS[0] || "gemini-flash-latest";
-const GEMINI_SEARCH_TIMEOUT_MS = Number(process.env.GEMINI_SEARCH_TIMEOUT_MS || SEARCH_TIMEOUT_MS || 15000);
+// ==== Веб-поиск через Tavily ====
+// В отличие от Gemini grounding (см. историю правок выше — квота на free
+// tier там оказалась нулевой без биллинга), у Tavily честный бесплатный
+// тир БЕЗ привязки карты — 1000 запросов/мес на аккаунт. Несколько
+// аккаунтов (TAVILY_API_KEYS через запятую) суммарно продлевают бюджет,
+// как и с Gemini/Groq — при 6 ключах это ~6000 запросов/мес.
+// include_answer:true просит Tavily самой синтезировать краткий ответ по
+// найденным источникам — этого обычно достаточно; если Tavily его не
+// вернула (бывает на совсем свежих/редких темах), собираем конспект сами
+// из сниппетов топ-результатов, чтобы не возвращать пустоту.
+const TAVILY_SEARCH_TIMEOUT_MS = Number(process.env.TAVILY_SEARCH_TIMEOUT_MS || SEARCH_TIMEOUT_MS || 15000);
 
-async function searchWebGemini(query) {
-  if (!GEMINI_API_KEYS.length) return null;
+async function searchWebTavily(query) {
+  if (!TAVILY_API_KEYS.length) return null;
 
-  for (let i = 0; i < GEMINI_API_KEYS.length; i++) {
-    const apiKey = GEMINI_API_KEYS[i];
+  for (let i = 0; i < TAVILY_API_KEYS.length; i++) {
+    const apiKey = TAVILY_API_KEYS[i];
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), GEMINI_SEARCH_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort(), TAVILY_SEARCH_TIMEOUT_MS);
     try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_SEARCH_MODEL}:generateContent?key=${apiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: controller.signal,
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: query }] }],
-            systemInstruction: { parts: [{ text: WEB_SEARCH_SYSTEM_PROMPT }] },
-            tools: [{ google_search: {} }],
-          }),
-        }
-      ).finally(() => clearTimeout(timeoutId));
+      const res = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          query,
+          search_depth: "basic",
+          max_results: 5,
+          include_answer: true,
+        }),
+      }).finally(() => clearTimeout(timeoutId));
 
       if (!res.ok) {
         const text = await res.text().catch(() => "");
@@ -7178,34 +7182,40 @@ async function searchWebGemini(query) {
       }
 
       const json = await res.json();
-      const text = (json.candidates?.[0]?.content?.parts || [])
-        .map((p) => p.text || "")
-        .join("")
-        .trim();
-      if (text) return text;
-      throw new Error("пустой ответ (возможно, сработал только safety-фильтр)");
+      if (json.answer && json.answer.trim()) return json.answer.trim();
+
+      // Fallback внутри самого Tavily-пути: ответа нет, но есть результаты —
+      // собираем короткий конспект сами, а не сдаёмся раньше времени.
+      const results = Array.isArray(json.results) ? json.results : [];
+      if (results.length) {
+        return results
+          .slice(0, 3)
+          .map((r) => `${r.title || ""}: ${(r.content || "").slice(0, 300)}`)
+          .join("\n");
+      }
+      throw new Error("пустой ответ без результатов");
     } catch (err) {
       console.error(
-        `searchWebGemini: ошибка у аккаунта ${i + 1}/${GEMINI_API_KEYS.length}:`,
+        `searchWebTavily: ошибка у аккаунта ${i + 1}/${TAVILY_API_KEYS.length}:`,
         err.message || err
       );
-      // пробуем следующий ключ из GEMINI_API_KEYS
+      // пробуем следующий ключ из TAVILY_API_KEYS
     }
   }
   return null;
 }
 
 // Единая точка входа для веб-поиска (см. вызовы ниже) — сначала пробует
-// Gemini grounding (отдельная квота, см. searchWebGemini выше), и только
-// если ВСЕ аккаунты Gemini не сработали (протухли/забанены/таймаут) —
-// откатывается на Groq compound-mini, чтобы поиск не переставал работать
-// целиком из-за одного упавшего провайдера.
+// Tavily (честная отдельная квота, см. searchWebTavily выше), и только
+// если ВСЕ аккаунты Tavily не сработали (ключи не заданы/квота
+// исчерпана/таймаут) — откатывается на Groq compound-mini, чтобы поиск не
+// переставал работать целиком из-за одного упавшего провайдера.
 async function searchWeb(query) {
   try {
-    const geminiReply = await searchWebGemini(query);
-    if (geminiReply) return geminiReply;
+    const tavilyReply = await searchWebTavily(query);
+    if (tavilyReply) return tavilyReply;
   } catch (err) {
-    console.error("searchWebGemini упал целиком, откатываюсь на Groq:", err.message || err);
+    console.error("searchWebTavily упал целиком, откатываюсь на Groq:", err.message || err);
   }
   return await searchWebGroq(query);
 }
