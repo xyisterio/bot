@@ -5712,8 +5712,10 @@ async function translatePromptForImage(prompt) {
   return prompt;
 }
 
-// "/imggen <промпт>" — сгенерировать картинку с нуля через Pollinations.ai
-// (см. generateImagePollinations ниже). Промпт сначала переводится и
+// "/imggen <промпт>" (а также текстовое "нарисуй ..." в начале сообщения,
+// см. DRAW_PREFIX_REGEX и место вызова в bot.on("message:text")) —
+// сгенерировать картинку с нуля через Pollinations.ai (см.
+// generateImagePollinations ниже). Промпт сначала переводится и
 // адаптируется под текст-в-картинку модель (см. translatePromptForImage
 // выше) — без ключей, без дневной квоты. Раньше здесь была генерация
 // через Gemini (Nano Banana) с поддержкой редактирования референсного
@@ -5722,10 +5724,9 @@ async function translatePromptForImage(prompt) {
 // убрали целиком. Pollinations не поддерживает conversational image
 // editing — только text-to-image, так что реплай на фото больше ничего
 // не даёт.
-bot.command("imggen", async (ctx) => {
-  const prompt = (ctx.match || "").trim();
+async function handleImgGenRequest(ctx, prompt, emptyPromptHint) {
   if (!prompt) {
-    await ctx.reply("напиши, что нарисовать: /imggen рыжий кот в скафандре на Марсе");
+    await ctx.reply(emptyPromptHint);
     return;
   }
 
@@ -5745,7 +5746,22 @@ bot.command("imggen", async (ctx) => {
       message_thread_id: ctx.message.message_thread_id,
     });
   }
+}
+
+bot.command("imggen", async (ctx) => {
+  const prompt = (ctx.match || "").trim();
+  await handleImgGenRequest(ctx, prompt, "напиши, что нарисовать: /imggen рыжий кот в скафандре на Марсе");
 });
+
+// "нарисуй ..." в начале сообщения — тот же /imggen, но без слэша, для
+// более естественного обращения к боту. Матчим ТОЛЬКО префикс (^), а не
+// подстроку где угодно — иначе ловились бы посторонние фразы вроде
+// "а помнишь, как я тебе нарисуй просил" или пересказ чужих слов.
+// Опциональное обращение по имени/запятая перед словом ("Женя, нарисуй",
+// "жень нарисуй") срезается через stripBotAddressing ДО проверки этого
+// regex (см. место вызова в bot.on("message:text")), так что здесь сам
+// regex рассчитан на текст, где обращение уже вырезано.
+const DRAW_PREFIX_REGEX = /^нарисуй\b[,:]?\s*/i;
 
 // "/natal" — без аргументов показывает то, что уже сохранено (или
 // инструкцию, если ничего нет); "/natal reset" стирает сохранённые данные;
@@ -8874,6 +8890,20 @@ bot.on("message:text", async (ctx) => {
 
   // 1. Прямой intent-запрос ("скинь песню X", "найди трек X")
   const strippedText = stripBotAddressing(rawText, ctx);
+
+  // 1a. "нарисуй <промпт>" в начале сообщения — тот же /imggen, но без
+  // слэша (см. DRAW_PREFIX_REGEX/handleImgGenRequest выше). Тот же гейт
+  // isBotAddressed в группах, что и у музыкального интента ниже — иначе
+  // в группе бот реагировал бы на "нарисуй" в чужой переписке, не
+  // адресованной ему вовсе.
+  if (!isGroup || isBotAddressed(ctx, rawText)) {
+    const drawMatch = strippedText.match(DRAW_PREFIX_REGEX);
+    if (drawMatch) {
+      const drawPrompt = strippedText.slice(drawMatch[0].length).trim();
+      await handleImgGenRequest(ctx, drawPrompt, "напиши, что нарисовать, например: нарисуй рыжего кота в скафандре на Марсе");
+      return;
+    }
+  }
 
   // 1b. Неполный/двусмысленный запрос трека ("скинь этот трек", "пришли
   // её", "пришли главный хит o-zone") — пытаемся понять из текущего
