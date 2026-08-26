@@ -7108,7 +7108,14 @@ async function captionPhoto(ctx, fileId) {
 // переписки формулирует Gemini (или следующий по фолбэку), как обычно.
 // Compound тут только "гуглит", не "разговаривает" — поэтому и системный
 // промпт ниже намеренно сухой и фактический, а не в характере бота.
-async function searchWeb(query) {
+const WEB_SEARCH_SYSTEM_PROMPT =
+  "Ты — инструмент веб-поиска. По запросу пользователя найди актуальную " +
+  "информацию через поиск в интернете и изложи её кратким фактическим " +
+  "конспектом на русском: конкретика (даты, цифры, названия), без " +
+  "вступлений и без собственных оценок. Если источники противоречат " +
+  "друг другу — отметь это прямо в тексте.";
+
+async function searchWebGroq(query) {
   const searchTarget = {
     provider: "groq",
     model: GROQ_SEARCH_MODEL,
@@ -7116,19 +7123,91 @@ async function searchWeb(query) {
     apiKey: GROQ_API_KEYS[0],
   };
   const messages = [
-    {
-      role: "system",
-      content:
-        "Ты — инструмент веб-поиска. По запросу пользователя найди актуальную " +
-        "информацию через поиск в интернете и изложи её кратким фактическим " +
-        "конспектом на русском: конкретика (даты, цифры, названия), без " +
-        "вступлений и без собственных оценок. Если источники противоречат " +
-        "друг другу — отметь это прямо в тексте.",
-    },
+    { role: "system", content: WEB_SEARCH_SYSTEM_PROMPT },
     { role: "user", content: query },
   ];
   const { reply } = await callTarget(searchTarget, messages, SEARCH_TIMEOUT_MS);
   return reply;
+}
+
+// ==== Веб-поиск через Gemini (Grounding with Google Search) ====
+// Отдельная квота от обычных текстовых запросов (5000 бесплатных
+// grounded-запросов/месяц на Gemini 3.x, не делится с лимитом обычного
+// чата/резолвинга треков на тех же ключах GEMINI_API_KEYS) — поэтому
+// предпочтительнее Groq compound-mini (см. searchWebGroq выше) как
+// основной путь, а не только фолбэк.
+//
+// Идёт МИМО callTarget/TARGETS: та инфраструктура заточена под
+// OpenAI-совместимый /chat/completions формат, а нативный google_search
+// тул надёжно работает только через "родной" Gemini REST-эндпоинт
+// (generateContent) — через OpenAI-совместимую прослойку это поле либо
+// игнорируется, либо ловит "Unknown name google_search" (см. репорты в
+// форуме Google AI Developers).
+//
+// Перебирает все аккаунты (GEMINI_API_KEYS) по очереди при ошибке — один
+// протухший/забаненный ключ (см. PERMISSION_DENIED) не должен рушить
+// поиск целиком, пока жив хотя бы один рабочий.
+const GEMINI_SEARCH_MODEL = process.env.GEMINI_SEARCH_MODEL || GEMINI_MODELS[0] || "gemini-flash-latest";
+const GEMINI_SEARCH_TIMEOUT_MS = Number(process.env.GEMINI_SEARCH_TIMEOUT_MS || SEARCH_TIMEOUT_MS || 15000);
+
+async function searchWebGemini(query) {
+  if (!GEMINI_API_KEYS.length) return null;
+
+  for (let i = 0; i < GEMINI_API_KEYS.length; i++) {
+    const apiKey = GEMINI_API_KEYS[i];
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), GEMINI_SEARCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_SEARCH_MODEL}:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: query }] }],
+            systemInstruction: { parts: [{ text: WEB_SEARCH_SYSTEM_PROMPT }] },
+            tools: [{ google_search: {} }],
+          }),
+        }
+      ).finally(() => clearTimeout(timeoutId));
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`status ${res.status}: ${text.slice(0, 300)}`);
+      }
+
+      const json = await res.json();
+      const text = (json.candidates?.[0]?.content?.parts || [])
+        .map((p) => p.text || "")
+        .join("")
+        .trim();
+      if (text) return text;
+      throw new Error("пустой ответ (возможно, сработал только safety-фильтр)");
+    } catch (err) {
+      console.error(
+        `searchWebGemini: ошибка у аккаунта ${i + 1}/${GEMINI_API_KEYS.length}:`,
+        err.message || err
+      );
+      // пробуем следующий ключ из GEMINI_API_KEYS
+    }
+  }
+  return null;
+}
+
+// Единая точка входа для веб-поиска (см. вызовы ниже) — сначала пробует
+// Gemini grounding (отдельная квота, см. searchWebGemini выше), и только
+// если ВСЕ аккаунты Gemini не сработали (протухли/забанены/таймаут) —
+// откатывается на Groq compound-mini, чтобы поиск не переставал работать
+// целиком из-за одного упавшего провайдера.
+async function searchWeb(query) {
+  try {
+    const geminiReply = await searchWebGemini(query);
+    if (geminiReply) return geminiReply;
+  } catch (err) {
+    console.error("searchWebGemini упал целиком, откатываюсь на Groq:", err.message || err);
+  }
+  return await searchWebGroq(query);
 }
 
 // ==== Фоновая расшифровка голосовых/аудио для сводки чата ====
