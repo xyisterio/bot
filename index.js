@@ -6993,7 +6993,7 @@ async function synthesizeSpeech(text, emotion = "neutral") {
     // /tts — эндпоинт из своего app.py (см. деплой-инструкцию); референсный
     // голос для клонирования зашит в сам Space (см. EMOTION_REFS), поэтому
     // тут гоняем только текст и ключ настроения, а не аудио-файл.
-    const result = await client.predict("/tts", { text, emotion });
+    const result = await client.predict("/tts", { text }); // TODO: вернуть emotion, когда обновится Space на HF
     const audioUrl = result?.data?.[0]?.url;
     if (!audioUrl) return null;
     const resp = await fetch(audioUrl, { signal: controller.signal });
