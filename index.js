@@ -8421,18 +8421,41 @@ async function getDeezerTrackById(trackId) {
 
 // Обработка ссылки на трек Deezer, кинутой в чат: находим ID, тянем метаданные
 // напрямую по ID (без поиска) и скачиваем тем же путём, что и обычный /song.
+//
+// Оборачиваем весь флоу в withTyping("upload_document") — иначе между
+// запросом пользователя и появлением статусного "🎵 Загружаю..." (которое
+// шлётся только ПОСЛЕ похода за метаданными трека на Deezer) в чате полная
+// тишина без какой-либо индикации, что бот вообще что-то делает. action
+// "upload_document" — это тот же chat action, что Telegram показывает при
+// реальной отправке аудио/документа ("отправляет файл..."), сюда подходит
+// больше чем "typing". withTyping сам обновляет статус каждые 4с, так что
+// заодно перекрывает и возможную паузу при скачивании/аплоаде самого трека.
 async function handleDeezerLinkQuery(ctx, trackId) {
-  try {
-    const track = await getDeezerTrackById(trackId);
-    await handleDeezerTrackObject(ctx, track);
-  } catch (err) {
-    console.error("Ошибка при получении трека Deezer по ссылке:", trackId, err.message || err);
-    const errMsg = await ctx.reply("⚠️ Не удалось найти этот трек на Deezer.");
-    markDeezerFlowMessage(ctx.chat.id, errMsg.message_id);
-  }
+  await withTyping(
+    ctx,
+    async () => {
+      try {
+        const track = await getDeezerTrackById(trackId);
+        await handleDeezerTrackObject(ctx, track);
+      } catch (err) {
+        console.error("Ошибка при получении трека Deezer по ссылке:", trackId, err.message || err);
+        const errMsg = await ctx.reply("⚠️ Не удалось найти этот трек на Deezer.");
+        markDeezerFlowMessage(ctx.chat.id, errMsg.message_id);
+      }
+    },
+    "upload_document"
+  );
 }
 
+// Тот же приём с withTyping("upload_document"), что и в handleDeezerLinkQuery
+// выше — покрывает тишину и на самом поиске (searchDeezerTracks), и на
+// возможной LLM-нормализации запроса, и на последующем скачивании/аплоаде
+// внутри handleDeezerTrackObject.
 async function handleDeezerQuery(ctx, query, originalQuery) {
+  await withTyping(ctx, () => handleDeezerQueryInner(ctx, query, originalQuery), "upload_document");
+}
+
+async function handleDeezerQueryInner(ctx, query, originalQuery) {
   try {
     let tracks = await searchDeezerTracks(query, 5);
 
