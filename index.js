@@ -6,7 +6,8 @@ import crypto from "node:crypto";
 import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
-import { Shazam } from "node-shazam";
+import { spawn } from "node:child_process";
+import { Shazam as ShazamApi, s16LEToSamplesArray } from "shazam-api";
 import { Client as GradioClient, handle_file } from "@gradio/client";
 import { BOT_SKILLS_PROMPT } from "./skills.js";
 import {
@@ -6989,15 +6990,55 @@ function getVideoOnlyMedia(message) {
 const SHAZAM_INTENT_REGEX =
   /шазам|что\s*(?:тут|там|это)?\s*за\s*(?:трек|песня|музыка|мелодия|композиция)|найди\s*(?:мне\s*)?(?:эту\s*|эт[оу]\s*)?(?:песню|трек|музыку)|какая\s*(?:тут|там|это)?\s*(?:играет\s*)?(?:песня|музыка)|распознай\s*(?:трек|песню|музыку)/i;
 
+// node-shazam не подошёл: тянет платформозависимые нативные зависимости
+// (@ffmpeg-installer/ffmpeg, shazamio-core), под FreeBSD (serv00) для них
+// нет прекомпилированных бинарников. Вместо него — связка из двух чистых
+// частей без единого нативного модуля:
+//   1) shazam-api — reverse-engineered JS-клиент, сам считает аудио-
+//      отпечаток и стучится напрямую в настоящие сервера Shazam;
+//      из зависимостей у него только buffer/fft.js/node-fetch, всё JS;
+//   2) системный ffmpeg (уже стоит на serv00, см. `ffmpeg -version`) —
+//      вызывается напрямую как процесс, декодирует видео в сырой PCM,
+//      который и нужен shazam-api на вход.
+// Алгоритм внутри shazam-api жёстко рассчитан на 16000 Hz / mono / s16le
+// (см. algorithm.js: sampleRateHz = 16000) — ffmpeg просим отдать именно
+// такой формат.
+const shazamApiClient = new ShazamApi();
+
+function decodeToPcm16k(inputPath) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn("ffmpeg", [
+      "-i", inputPath,
+      "-vn",
+      "-ac", "1",
+      "-ar", "16000",
+      "-f", "s16le",
+      "-acodec", "pcm_s16le",
+      "pipe:1",
+    ]);
+    const chunks = [];
+    let stderr = "";
+    ffmpeg.stdout.on("data", (chunk) => chunks.push(chunk));
+    ffmpeg.stderr.on("data", (chunk) => { stderr += chunk; });
+    ffmpeg.on("error", reject);
+    ffmpeg.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffmpeg завершился с кодом ${code}: ${stderr.slice(-500)}`));
+        return;
+      }
+      resolve(Buffer.concat(chunks));
+    });
+  });
+}
+
 async function recognizeTrackFromBuffer(buffer) {
   const tmpPath = path.join(os.tmpdir(), `shazam_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
   await fs.writeFile(tmpPath, buffer);
   try {
-    const shazam = new Shazam();
-    // minimal=true — сразу отдаёт {title, artist, album, year} вместо
-    // всего сырого ответа Shazam (нам нужны только title/artist, чтобы
-    // отдать запрос в уже существующий Deezer-пайплайн, см. ниже).
-    const result = await shazam.recognise(tmpPath, "ru-RU", true);
+    const pcm = await decodeToPcm16k(tmpPath);
+    if (!pcm.length) return null;
+    const samples = s16LEToSamplesArray(new Uint8Array(pcm));
+    const result = await shazamApiClient.recognizeSong(samples);
     if (!result || !result.title) return null;
     return { title: result.title, artist: result.artist || "" };
   } finally {
