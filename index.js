@@ -4,6 +4,9 @@ import { Redis } from "@upstash/redis";
 import { Chess } from "chess.js";
 import crypto from "node:crypto";
 import path from "node:path";
+import fs from "node:fs/promises";
+import os from "node:os";
+import { Shazam } from "node-shazam";
 import { Client as GradioClient, handle_file } from "@gradio/client";
 import { BOT_SKILLS_PROMPT } from "./skills.js";
 import {
@@ -516,7 +519,7 @@ const SYSTEM_PROMPT = `
 - Иногда сообщение приходит из группового чата, где к тебе обращаются по имени (Женя/Жень) — само обращение уже вырезано из текста, отвечай сразу по сути, не переспрашивай "ты ко мне?".
 - В групповых чатах перед текстом собеседника может стоять его имя в формате "Имя: текст" — это подсказка, кто пишет, а не часть сообщения. Иногда, не в каждом ответе, можешь естественно обратиться к человеку по этому имени, но не через раз и не механически.
 - Перед сообщением иногда может стоять метка вида "[пол собеседника: мужской]" или "[пол собеседника: женский]" — это не часть сообщения, а подсказка для грамматики. Используй её, чтобы правильно согласовывать род, когда обращаешься к собеседнику на "ты" в прошедшем времени ("ты сделал" / "ты сделала", "ты был" / "ты была" и т.п.). Саму метку никогда не комментируй и не упоминай вслух. Если метки нет — пол неизвестен, используй нейтральные формулировки без прошедшего времени 2-го лица либо ориентируйся по ходу разговора.
-- Перед сообщением иногда может стоять метка вида "[фото от Имя: описание]", "[сообщение от Имя: текст]" или "[переслано от Имя: текст]" — значит собеседник ответил (реплаем) на чужое сообщение и обращается по этому поводу к тебе: на фото (тогда "описание" — то, что реально видно на фото, распознано автоматически заранее), на обычное сообщение другого участника чата, или на пост/статью/мем, пересланные из канала. Если имя в метке отличается от имени в "Имя: текст" сразу после неё — учитывай это: ты комментируешь чужой контент по просьбе того, кто сейчас с тобой говорит, а не свой собственный. Опирайся только на то, что реально написано/видно в метке, не выдумывай подробностей сверх неё — если текст обрезан многоточием, значит там было больше, но тебе показан только кусок. Реагируй живо и по-своему, с реальным мнением/оценкой, а не просто пересказом. Саму метку никогда не комментируй и не упоминай вслух.
+- Перед сообщением иногда может стоять метка вида "[фото от Имя: описание]", "[видео от Имя: описание]", "[сообщение от Имя: текст]" или "[переслано от Имя: текст]" — значит собеседник ответил (реплаем) на чужое сообщение и обращается по этому поводу к тебе: на фото или видео (тогда "описание" — то, что реально видно/происходит в кадре, распознано автоматически заранее — для видео это краткий пересказ сюжета/действия, а не только один кадр), на обычное сообщение другого участника чата, или на пост/статью/мем, пересланные из канала. Если имя в метке отличается от имени в "Имя: текст" сразу после неё — учитывай это: ты комментируешь чужой контент по просьбе того, кто сейчас с тобой говорит, а не свой собственный. Опирайся только на то, что реально написано/видно в метке, не выдумывай подробностей сверх неё — если текст обрезан многоточием, значит там было больше, но тебе показан только кусок. Реагируй живо и по-своему, с реальным мнением/оценкой, а не просто пересказом. Саму метку никогда не комментируй и не упоминай вслух.
 - Перед сообщением иногда может стоять метка вида "[голосовое от Имя (мм:сс), расшифровка: текст]" или "[аудиофайл (Исполнитель — Название) от Имя (мм:сс), текст: текст]" — собеседник ответил (реплаем) на голосовое сообщение, кружочек или музыкальный файл (mp3/flac и т.п.), а не спросил дословный текст (тот случай обрабатывается отдельно, без тебя). Отвечай по существу вопроса, опираясь на расшифровку/распознанный текст — если спросили "о чём тут вкратце"/"перескажи"/"что там по сути" и запись длинная, перескажи своими словами кратко и без воды, а не дословно и не на весь объём исходника. Для аудиофайла это обычно текст песни — если спросили "о чём песня", отвечай по смыслу текста, а не пересказывай его построчно. Если вопрос про что-то конкретное из сказанного — отвечай именно по нему. Если расшифровка обрывается многоточием — значит она была длиннее и обрезана технически, не делай вид, что знаешь продолжение. Саму метку никогда не комментируй и не упоминай вслух.
 - Метка вида "[голосовое от Имя — речь не распознана, тишина или шум]", "[аудиофайл от Имя — текст не распознан...]" или "...расшифровать его не получилось из-за технической ошибки" — значит расшифровать нечего или не вышло технически. Для аудиофайла это часто просто означает, что трек инструментальный (без вокала) — если в метке есть исполнитель и название, можешь опираться хотя бы на них. Так и скажи по-своему (не разобрал речь / не смог расслушать), не выдумывай, что там могло быть сказано.
 - Перед сообщением иногда может стоять метка вида "[в чате недавно было фото от Имя: описание]" — это НЕ реплай: собеседник прямо спросил тебя про какое-то фото в чате словами (например "как тебе фото кота в чате?"), не отвечая на конкретное сообщение с ним, и ты нашёл в логе чата подходящее фото под описание. Отвечай по существу вопроса, опираясь на это описание, как будто ты сам это фото видел в чате. Если по тексту вопроса видно, что найденное фото явно не то, о котором спрашивают (не совпадает с тем, что человек описывает) — не притворяйся, что видел именно то, о котором он спрашивает, а честно скажи, что не помнишь такого. Саму метку никогда не комментируй и не упоминай вслух.
@@ -524,6 +527,7 @@ const SYSTEM_PROMPT = `
 - Перед сообщением иногда может стоять метка вида "[бот ранее прислал карточку — фильм «Название» (год), рейтинг X/10 на TMDB, жанры: ..., описание: ...]" — значит собеседник ответил (реплаем) именно на твою же ранее отправленную карточку фильма/сериала (постер с описанием), например коротким "ну такое", "как тебе?", "не смотрел", "стоит глянуть?". Это ГЛАВНЫЙ контекст для ответа — отвечай по существу именно про этот фильм/сериал (жанр, рейтинг, сюжет по описанию), а не про что-то из более раннего разговора в чате, даже если тема разговора недавно была другой. Если человек написал коротко и неоднозначно ("ну такое", "фу", "огонь") — трактуй это как оценку именно этого фильма/сериала и отреагируй на неё (согласись/поспорь/уточни, почему), а не уходи в отвлечённые рассуждения не по теме. Саму метку никогда не комментируй и не упоминай вслух.
 - Перед сообщением иногда может стоять метка вида "[бот ранее прислал трек «Исполнитель — Название», текст песни: текст]" — значит собеседник ответил (реплаем) на трек, который ты сам ему прислал через Deezer, вопросом или комментарием про саму песню ("о чём эта песня?", "переведи", "нравится?" и т.п. — прямые просьбы прислать/найти другой трек сюда не попадают, это отдельный механизм). Отвечай по существу: если песню знаешь и без текста — можешь опираться на своё знание по названию/исполнителю; если в метке есть распознанный текст песни — отвечай по его смыслу (перескажи своими словами, о чём поётся, не построчно и не дословно, если не просили дословно). Если в метке написано, что текст распознать не вышло или это похоже на инструментал — так и скажи по-своему, не выдумывай, о чём песня, если реально не знаешь её. Саму метку никогда не комментируй и не упоминай вслух.
 - Пиши только на русском.
+- В начале реплик собеседников в истории переписки может стоять метка вида "[29.08 14:32]" — это реальные дата и время, когда сообщение было отправлено (не придумано тобой, а взято из системы). Используй её, только чтобы понимать реальные паузы между сообщениями (например, если между репликами прошло несколько часов — это можно учитывать в тоне ответа, "о, долго не было" и т.п., но не обязательно каждый раз это комментировать). Саму метку никогда не комментируй и не упоминай вслух, в своих ответах её не ставь.
 - Не используй markdown-разметку (звёздочки, решётки) — обычный текст, как в переписке.
 - Отвечай ОДНИМ финальным вариантом реплики. Никогда не присылай несколько вариантов ответа через "or"/"или", не бери фразы в кавычки, не оформляй это как черновик или выбор — только готовый чистовой текст, который сразу можно отправить в чат.
 - Если ситуация подходящая, можешь ПОСЛЕДНЕЙ строкой ответа (и только последней) добавить тег вида [sticker: ключ] — это отправит стикер вместе с текстом. Доступные ключи сейчас:
@@ -1403,9 +1407,18 @@ async function clearHistory(chatId) {
   }
 }
 
+// Каждой пользовательской реплике в истории явно приписываем момент
+// отправки — "[ДД.ММ ЧЧ:ММ] " перед текстом. Раньше модель видела только
+// голый порядок реплик без привязки ко времени и не могла понять, например,
+// что между двумя сообщениями прошло 3 часа, а не 3 секунды. Ответы самого
+// бота меткой не размечаем — они и так идут сразу за помеченной репликой
+// пользователя, дублировать незачем. Метка попадает в постоянное хранилище
+// (Redis) как часть content — это осознанно: она должна быть видна модели
+// и при следующих обращениях, а не только в момент самого пуша.
 function pushHistory(chatId, role, content) {
   const h = getHistory(chatId);
-  h.push({ role, content });
+  const stamped = role === "user" ? `[${formatShortDateTime()}] ${content}` : content;
+  h.push({ role, content: stamped });
   while (h.length > HISTORY_LIMIT) h.shift();
   saveHistory(chatId);
 }
@@ -1516,6 +1529,26 @@ function rememberPhotoCaption(chatId, messageId, name, caption) {
 
 function getPhotoCaption(chatId, messageId) {
   return photoCaptionsByMessage.get(`${chatId}:${messageId}`) || null;
+}
+
+// Тот же приём, что и с фото выше, но для описаний видео (см. captionVideo/
+// VIDEO_DESCRIPTION_PROMPT) — если несколько человек по очереди отвечают на
+// одно и то же видео вопросами к боту, не гонять Gemini заново на каждый
+// реплай.
+const VIDEO_CAPTION_CACHE_LIMIT = 200;
+const videoCaptionsByMessage = new Map(); // `${chatId}:${messageId}` -> { name, caption }
+
+function rememberVideoCaption(chatId, messageId, name, caption) {
+  const key = `${chatId}:${messageId}`;
+  videoCaptionsByMessage.set(key, { name, caption });
+  if (videoCaptionsByMessage.size > VIDEO_CAPTION_CACHE_LIMIT) {
+    const oldestKey = videoCaptionsByMessage.keys().next().value;
+    videoCaptionsByMessage.delete(oldestKey);
+  }
+}
+
+function getVideoCaption(chatId, messageId) {
+  return videoCaptionsByMessage.get(`${chatId}:${messageId}`) || null;
 }
 
 // ==== Кэш собственных текстовых ответов бота по message_id ====
@@ -3427,6 +3460,48 @@ function shouldIncludeSkillsPrompt(userText) {
   return SKILLS_PROMPT_TRIGGER_REGEX.test(userText);
 }
 
+// ==== Текущие дата и время для промпта ====
+// Модели (Gemini/Groq) периодически путают текущий год с годом среза своих
+// обучающих данных (типичный симптом — на вопрос "какой сейчас год"
+// отвечают позапрошлым). Явно передаём реальные дату/время ЖИВЫМ текстом
+// при КАЖДОМ обращении к LLM (а не один раз при старте процесса в
+// константу) — иначе после недель аптайма бота на Render/serv00 дата в
+// промпте сама начала бы врать. Часовой пояс — Украина (Женя "живёт" там
+// по легенде, см. SYSTEM_PROMPT выше).
+const BOT_TIMEZONE = "Europe/Kyiv";
+
+function formatFullDateTime(date = new Date()) {
+  return new Intl.DateTimeFormat("ru-RU", {
+    timeZone: BOT_TIMEZONE,
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+// Короткий формат для меток внутри истории диалога (см. pushHistory) —
+// "29.08 14:32", без года и дня недели, чтобы не раздувать промпт на
+// каждое сообщение истории.
+function formatShortDateTime(date = new Date()) {
+  return new Intl.DateTimeFormat("ru-RU", {
+    timeZone: BOT_TIMEZONE,
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+// Подмешивается в системный промпт каждого обращения к LLM, где важно,
+// чтобы модель отвечала "как Женя" (обычный чат, гороскопы, Таро) —
+// см. места вызова ниже.
+function buildDateTimeBlock() {
+  return `\n\nСправка: сейчас реальные дата и время — ${formatFullDateTime()} (${BOT_TIMEZONE}). Если твои внутренние представления о текущем годе или дате устарели (модель могла быть обучена раньше и по умолчанию "думать", что сейчас другой год) — доверяй этой строке, а не своим ощущениям.`;
+}
+
 // ==== Запрос к LLM с фолбэком по провайдерам и моделям ====
 async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
   const history = getHistory(chatId);
@@ -3439,7 +3514,7 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
   const skillsBlock = shouldIncludeSkillsPrompt(userText) ? "\n\n" + BOT_SKILLS_PROMPT : "";
 
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT + buildMemoryPromptBlock(chatId) + skillsBlock },
+    { role: "system", content: SYSTEM_PROMPT + buildMemoryPromptBlock(chatId) + skillsBlock + buildDateTimeBlock() },
     ...history,
     { role: "user", content: userText },
   ];
@@ -3458,7 +3533,7 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
   // Gemini и другие провайдеры это не видят вообще, получают messages
   // с полным SYSTEM_PROMPT и всей HISTORY_LIMIT как обычно.
   const groqMessages = [
-    { role: "system", content: GROQ_SYSTEM_PROMPT },
+    { role: "system", content: GROQ_SYSTEM_PROMPT + buildDateTimeBlock() },
     ...history.slice(-6),
     { role: "user", content: userText },
   ];
@@ -5637,7 +5712,7 @@ async function askAstroLLM(taskType, dataBlock, theme = null, years = null, time
   const baseInstruction = typeof rawInstruction === "function" ? rawInstruction(years) : rawInstruction;
   const themeFocus = theme && THEME_FOCUS_INSTRUCTIONS[theme] ? THEME_FOCUS_INSTRUCTIONS[theme] : "";
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: SYSTEM_PROMPT + buildDateTimeBlock() },
     {
       role: "user",
       content: `${baseInstruction}${themeFocus}\n\n${dataBlock}`,
@@ -5983,7 +6058,7 @@ const TAROT_TEMPERATURE = 0.5;
 async function askTarotLLM(spreadType, dataBlock, timeoutMs = REQUEST_TIMEOUT_MS) {
   const instruction = TAROT_TASK_INSTRUCTIONS[spreadType];
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: SYSTEM_PROMPT + buildDateTimeBlock() },
     { role: "user", content: `${instruction}\n\n${dataBlock}` },
   ];
 
@@ -6864,6 +6939,187 @@ function isAudioDocument(document) {
 // упадёт с малопонятной ошибкой. Проверяем file_size заранее (когда Telegram
 // его прислал) и отвечаем понятным текстом вместо попытки скачать.
 const MAX_TRANSCRIBE_FILE_SIZE = 20 * 1024 * 1024;
+
+// Видеофайл, присланный "как документ" (редко, но бывает — большие видео,
+// которые клиент не стал заворачивать в родной video-плеер). mime_type
+// иногда пустой/общий — подстраховываемся расширением, как и с аудио выше.
+const VIDEO_DOCUMENT_EXT_REGEX = /\.(mp4|mov|mkv|webm|avi|3gp|m4v)$/i;
+function isVideoDocument(document) {
+  if (!document) return false;
+  if (document.mime_type && document.mime_type.startsWith("video/")) return true;
+  return VIDEO_DOCUMENT_EXT_REGEX.test(document.file_name || "");
+}
+
+// Любое "видеоподобное" медиа, на которое годится реплай с "шазам" —
+// обычное видео, кружочек (video_note) и видео, присланное документом.
+// Работает независимо от того, кто прислал видео — сам собеседник, другой
+// бот или форвард из канала: см. вызов ниже, там НЕТ проверки
+// from.is_bot/isForwardedMessage, в отличие от фонового логирования чата —
+// эта команда сознательно должна работать с чужим/пересланным/ботовским
+// видео тоже, раз человек явно попросил распознать трек именно из него.
+function getShazamMedia(message) {
+  if (!message) return null;
+  if (message.video) return { fileObj: message.video, mime: message.video.mime_type || "video/mp4" };
+  if (message.video_note) return { fileObj: message.video_note, mime: "video/mp4" };
+  if (isVideoDocument(message.document)) return { fileObj: message.document, mime: message.document.mime_type || "video/mp4" };
+  return null;
+}
+
+// Только "полноценное" видео (не кружочек) — на кружочки уже есть отдельный,
+// хорошо настроенный путь через распознавание речи (Whisper, см. блок
+// voice/video_note/audio ниже), дублировать его визуальным анализом Gemini
+// незачем. Обычное видео и видео-документ такого пути не имеют вообще —
+// для них единственный способ понять содержимое было бы вручную распознать
+// текст на видео, а с Gemini можно сразу пересказать сюжет/действие.
+function getVideoOnlyMedia(message) {
+  if (!message) return null;
+  if (message.video) return { fileObj: message.video, mime: message.video.mime_type || "video/mp4" };
+  if (isVideoDocument(message.document)) return { fileObj: message.document, mime: message.document.mime_type || "video/mp4" };
+  return null;
+}
+
+// ==== Shazam: распознавание трека из видео по явному запросу-реплаю ====
+// Специально СТРОГО по запросу (см. вызов ниже, до срабатывания нужен и
+// подходящий тип медиа, и совпадение с этим регэкспом) — никогда не
+// пытаемся распознать музыку из видео "фоном"/на автомате, даже если видео
+// прислали явно с музыкой. node-shazam.recognise() умеет разбирать
+// звукодорожку прямо из видеофайла сама (внутри — WASM-порт shazamio-core),
+// отдельно вызывать ffmpeg не нужно (в отличие от deprecated fromVideoFile
+// у той же библиотеки — она в разы медленнее и тянет отдельный процесс).
+const SHAZAM_INTENT_REGEX =
+  /шазам|что\s*(?:тут|там|это)?\s*за\s*(?:трек|песня|музыка|мелодия|композиция)|найди\s*(?:мне\s*)?(?:эту\s*|эт[оу]\s*)?(?:песню|трек|музыку)|какая\s*(?:тут|там|это)?\s*(?:играет\s*)?(?:песня|музыка)|распознай\s*(?:трек|песню|музыку)/i;
+
+async function recognizeTrackFromBuffer(buffer) {
+  const tmpPath = path.join(os.tmpdir(), `shazam_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
+  await fs.writeFile(tmpPath, buffer);
+  try {
+    const shazam = new Shazam();
+    // minimal=true — сразу отдаёт {title, artist, album, year} вместо
+    // всего сырого ответа Shazam (нам нужны только title/artist, чтобы
+    // отдать запрос в уже существующий Deezer-пайплайн, см. ниже).
+    const result = await shazam.recognise(tmpPath, "ru-RU", true);
+    if (!result || !result.title) return null;
+    return { title: result.title, artist: result.artist || "" };
+  } finally {
+    fs.unlink(tmpPath).catch(() => {});
+  }
+}
+
+// Реплай на видео с командой "шазам"/"что за трек" и т.п. — скачиваем
+// файл, прогоняем через Shazam, и при удаче отдаём найденный трек через
+// обычный Deezer-пайплайн (handleDeezerQuery) — для пользователя результат
+// выглядит так же, как если бы он сам попросил трек по имени. Если Shazam
+// ничего не нашёл (не музыкальное видео, тихая дорожка и т.п.) — по
+// решению владельца бота просто короткое "не нашёл трек", без попыток
+// красиво обыграть неудачу через LLM.
+async function handleShazamFromReply(ctx, repliedTo, media) {
+  const chatId = ctx.chat.id;
+  const replyOpts = {
+    reply_parameters: { message_id: repliedTo.message_id },
+    message_thread_id: ctx.message.message_thread_id,
+  };
+
+  if (media.fileObj.file_size && media.fileObj.file_size > MAX_TRANSCRIBE_FILE_SIZE) {
+    await ctx.reply("файл слишком большой (больше 20 МБ), Telegram не даёт его скачать ботам", replyOpts);
+    return;
+  }
+
+  await withTyping(
+    ctx,
+    async () => {
+      try {
+        const { buffer } = await downloadTelegramFile(ctx, media.fileObj.file_id);
+        const track = await recognizeTrackFromBuffer(buffer);
+        if (!track) {
+          await ctx.reply("не нашёл трек", replyOpts);
+          return;
+        }
+        const query = [track.artist, track.title].filter(Boolean).join(" - ");
+        await handleDeezerQuery(ctx, query, query);
+      } catch (err) {
+        console.error(`Shazam: ошибка распознавания трека из видео в чате ${chatId}:`, err.status ?? "-", err.body ?? err.message);
+        await ctx.reply("не нашёл трек", replyOpts);
+      }
+    },
+    "upload_document"
+  );
+}
+
+// ==== Анализ содержимого видео через Gemini (по явному вопросу-реплаю) ====
+// Отдельно от Shazam выше: тут не про музыку, а про "что вообще происходит
+// в видео" — сюжет, действия, кто/что в кадре. Groq video вообще не
+// понимает (только отдельные картинки, см. captionPhoto/GROQ_VISION_MODEL
+// выше) — единственный рабочий вариант в текущем стеке это Gemini, и
+// именно НАТИВНЫЙ его API (generateContent + inline_data), а не
+// OpenAI-совместимый эндпоинт (тот же, что во всех остальных вызовах
+// TARGETS/callTarget) — тот у Gemini документированно понимает только
+// image_url и input_audio, видео через него не проходит вообще.
+// Строго по запросу — реплай на видео с обычным вопросом ("что там?",
+// "о чём это", "переведи, что говорят" и т.п.), НИКОГДА не на автомате.
+const VIDEO_DESCRIPTION_PROMPT =
+  "Опиши по-русски, что происходит в этом видео: сюжет, кто/что в кадре, ключевые действия по порядку — 2-4 предложения. " +
+  "Если это отрывок фильма/сериала/ролика/мема — опиши именно происходящее на экране, а не только общую тему. Если в видео " +
+  "есть речь — кратко перескажи, о чём говорят, но не расшифровывай дословно слово в слово. Пиши только суть, без markdown " +
+  "и без вступлений вроде «в видео показано».";
+
+const GEMINI_VIDEO_MODEL = process.env.GEMINI_VIDEO_MODEL || "gemini-flash-latest";
+const GEMINI_VIDEO_TIMEOUT_MS = Number(process.env.GEMINI_VIDEO_TIMEOUT_MS) || 45000;
+
+async function callGeminiNativeVideo(base64Video, mimeType, promptText, timeoutMs = GEMINI_VIDEO_TIMEOUT_MS) {
+  let lastErr;
+  // Перебираем все настроенные ключи Gemini по очереди (как и везде в
+  // боте — GEMINI_API_KEYS может содержать несколько аккаунтов), чтобы
+  // исчерпанная дневная квота одного не валила фичу целиком.
+  for (const apiKey of GEMINI_API_KEYS) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VIDEO_MODEL}:generateContent?key=${apiKey}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: promptText }, { inline_data: { mime_type: mimeType, data: base64Video } }],
+            },
+          ],
+          generationConfig: { maxOutputTokens: 800 },
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        const err = new Error(`Gemini (видео) вернул ${res.status}`);
+        err.status = res.status;
+        err.body = errText;
+        throw err;
+      }
+      const data = await res.json();
+      const parts = data.candidates?.[0]?.content?.parts || [];
+      const text = parts.map((p) => p.text || "").join("").trim();
+      if (!text) throw new Error("Пустой ответ от Gemini на видео-запрос");
+      return text;
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `Анализ видео Gemini: ошибка [ключ ***${apiKey.slice(-4)}]:`,
+        err.status ?? "-",
+        err.body ?? err.message
+      );
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+  throw lastErr ?? new Error("Нет доступных ключей Gemini для анализа видео");
+}
+
+async function captionVideo(ctx, fileId, mimeType) {
+  const { buffer } = await downloadTelegramFile(ctx, fileId);
+  const base64 = buffer.toString("base64");
+  return callGeminiNativeVideo(base64, mimeType || "video/mp4", VIDEO_DESCRIPTION_PROMPT);
+}
 
 // ==== Голосовые/кружочки — расшифровка через Groq Whisper ====
 // Отдельный эндпоинт (audio/transcriptions, multipart/form-data) — не тот,
@@ -9254,7 +9510,40 @@ bot.on("message:text", async (ctx) => {
     if (repliedTo && !isReplyToBot(ctx)) {
       const repliedName = getDisplayName(chatId, repliedTo.from);
 
-      if (repliedTo.photo) {
+      const shazamMedia = getShazamMedia(repliedTo);
+      const videoOnlyMedia = getVideoOnlyMedia(repliedTo);
+
+      if (shazamMedia && SHAZAM_INTENT_REGEX.test(strippedQuestion)) {
+        // Явная команда на распознавание трека — отвечаем ПРЯМО НА САМО
+        // видео (см. handleShazamFromReply) и не идём в общий askLLM-путь,
+        // как и с "текст"/"расшифруй" у голосовых ниже.
+        await handleShazamFromReply(ctx, repliedTo, shazamMedia);
+        return;
+      } else if (videoOnlyMedia) {
+        // Реплай на видео с обычным вопросом (не про трек) — узнаём, что
+        // происходит в видео, через Gemini (см. captionVideo выше), и
+        // подмешиваем это в промпт как repliedTag, как и с фото — дальше
+        // отвечает уже обычный askLLM в стиле Жени.
+        let info = getVideoCaption(chatId, repliedTo.message_id);
+        if (!info) {
+          try {
+            const caption = await captionVideo(ctx, videoOnlyMedia.fileObj.file_id, videoOnlyMedia.mime);
+            info = { name: repliedName, caption };
+            rememberVideoCaption(chatId, repliedTo.message_id, repliedName, caption);
+          } catch (err) {
+            console.error(
+              `Не удалось проанализировать видео из реплая в чате ${chatId}:`,
+              err.status ?? "-",
+              err.body ?? err.message
+            );
+          }
+        }
+        if (info) {
+          repliedTag = `[видео от ${info.name}: ${info.caption}] `;
+        } else {
+          repliedTag = `[собеседник ответил на видео от ${repliedName}, но проанализировать его не получилось из-за технической ошибки] `;
+        }
+      } else if (repliedTo.photo) {
         let info = getPhotoCaption(chatId, repliedTo.message_id);
         if (!info) {
           try {
