@@ -10205,20 +10205,30 @@ bot.on("message:text", async (ctx) => {
   {
     const strippedForSearch = stripBotAddressing(rawText, ctx);
     let searchQuery = null;
-    try {
-      searchQuery = await classifySearchIntent(chatId, strippedForSearch);
-    } catch (err) {
-      console.error(
-        "Ошибка классификации поискового интента, фолбэк на regex:",
-        err.status ?? "-",
-        err.body ?? err.message
-      );
-      if (hasSearchIntent(strippedForSearch)) {
-        searchQuery =
-          strippedForSearch
-            .replace(SEARCH_STANDALONE_VERB_REGEX, "")
-            .replace(SEARCH_GENERIC_VERB_REGEX, "")
-            .trim() || strippedForSearch;
+    // Пустой текст (человек написал ТОЛЬКО имя/тег бота, без единого слова —
+    // stripBotAddressing в этом случае возвращает "") гуглить нечего, и
+    // отправка пустого user-сообщения в classifySearchIntent — это ровно
+    // тот случай, который валит Gemini с "Requests ending with a model
+    // turn are not supported": OpenAI-совместимый эндпоинт, похоже, просто
+    // отбрасывает пустое сообщение при конвертации, и последним реальным
+    // ходом в переписке оказывается предыдущая реплика ассистента из
+    // истории. Не отправляем классификатору пустоту вообще.
+    if (strippedForSearch) {
+      try {
+        searchQuery = await classifySearchIntent(chatId, strippedForSearch);
+      } catch (err) {
+        console.error(
+          "Ошибка классификации поискового интента, фолбэк на regex:",
+          err.status ?? "-",
+          err.body ?? err.message
+        );
+        if (hasSearchIntent(strippedForSearch)) {
+          searchQuery =
+            strippedForSearch
+              .replace(SEARCH_STANDALONE_VERB_REGEX, "")
+              .replace(SEARCH_GENERIC_VERB_REGEX, "")
+              .trim() || strippedForSearch;
+        }
       }
     }
     if (searchQuery) {
