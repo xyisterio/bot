@@ -7104,7 +7104,14 @@ const VIDEO_DESCRIPTION_PROMPT =
   "и без вступлений вроде «в видео показано».";
 
 const GEMINI_VIDEO_MODEL = process.env.GEMINI_VIDEO_MODEL || "gemini-flash-latest";
-const GEMINI_VIDEO_TIMEOUT_MS = Number(process.env.GEMINI_VIDEO_TIMEOUT_MS) || 45000;
+// 45с часто не хватает: видео кодируется целиком в base64 и шлётся одним
+// inline_data-запросом, а не стримом — и аплоад, и обработка на стороне
+// Gemini для не самых коротких видео легко вылезают за 45с (особенно с
+// не самым быстрым исходящим каналом на serv00). Подняли дефолт до 100с;
+// при переборе нескольких ключей это суммарно может занять до
+// GEMINI_VIDEO_TIMEOUT_MS * количество_ключей — это осознанный компромисс
+// ради шанса получить ответ хоть от какого-то ключа, а не быстрый отказ.
+const GEMINI_VIDEO_TIMEOUT_MS = Number(process.env.GEMINI_VIDEO_TIMEOUT_MS) || 100000;
 
 async function callGeminiNativeVideo(base64Video, mimeType, promptText, timeoutMs = GEMINI_VIDEO_TIMEOUT_MS) {
   let lastErr;
@@ -7115,10 +7122,16 @@ async function callGeminiNativeVideo(base64Video, mimeType, promptText, timeoutM
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VIDEO_MODEL}:generateContent?key=${apiKey}`;
+      // Ключ передаём заголовком x-goog-api-key (официальный способ Google),
+      // а не query-параметром ?key=... — некоторые исходящие
+      // прокси/файрволы хостингов настроены цепляться именно за паттерн
+      // "ключ прямо в URL" как за потенциальную утечку и либо режут такие
+      // запросы, либо ощутимо тормозят их, из-за чего запрос зависает до
+      // собственного таймаута, а не падает с понятной ошибкой сразу.
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VIDEO_MODEL}:generateContent`;
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
         body: JSON.stringify({
           contents: [
             {
@@ -7156,7 +7169,24 @@ async function callGeminiNativeVideo(base64Video, mimeType, promptText, timeoutM
   throw lastErr ?? new Error("Нет доступных ключей Gemini для анализа видео");
 }
 
-async function captionVideo(ctx, fileId, mimeType) {
+// Google жёстко ограничивает ВЕСЬ HTTP-запрос к generateContent 20 МБ
+// суммарно (не сам файл — весь body). base64 раздувает бинарные данные
+// примерно на треть (4/3), плюс небольшой JSON-оверхед — поэтому сырое
+// видео уже от ~14 МБ рискует после кодирования не пролезть в лимит, и
+// Google отклоняет такой запрос ЦЕЛИКОМ, причём одинаково на любом ключе
+// (что и выглядит как "видео вообще не анализируется", а не как разовый
+// сбой конкретного аккаунта). Проверяем сырой размер заранее, чтобы не
+// тратить впустую попытки на всех ключах на заведомо обречённый запрос.
+const MAX_GEMINI_INLINE_VIDEO_SIZE = 14 * 1024 * 1024;
+
+async function captionVideo(ctx, fileId, mimeType, fileSize) {
+  if (fileSize && fileSize > MAX_GEMINI_INLINE_VIDEO_SIZE) {
+    const err = new Error(
+      `Видео слишком большое для анализа (после base64 не проходит в лимит Gemini 20 МБ на запрос): ${(fileSize / 1024 / 1024).toFixed(1)} МБ`
+    );
+    err.tooLarge = true;
+    throw err;
+  }
   const { buffer } = await downloadTelegramFile(ctx, fileId);
   const base64 = buffer.toString("base64");
   return callGeminiNativeVideo(base64, mimeType || "video/mp4", VIDEO_DESCRIPTION_PROMPT);
@@ -9566,12 +9596,19 @@ bot.on("message:text", async (ctx) => {
         // подмешиваем это в промпт как repliedTag, как и с фото — дальше
         // отвечает уже обычный askLLM в стиле Жени.
         let info = getVideoCaption(chatId, repliedTo.message_id);
+        let tooLarge = false;
         if (!info) {
           try {
-            const caption = await captionVideo(ctx, videoOnlyMedia.fileObj.file_id, videoOnlyMedia.mime);
+            const caption = await captionVideo(
+              ctx,
+              videoOnlyMedia.fileObj.file_id,
+              videoOnlyMedia.mime,
+              videoOnlyMedia.fileObj.file_size
+            );
             info = { name: repliedName, caption };
             rememberVideoCaption(chatId, repliedTo.message_id, repliedName, caption);
           } catch (err) {
+            tooLarge = Boolean(err.tooLarge);
             console.error(
               `Не удалось проанализировать видео из реплая в чате ${chatId}:`,
               err.status ?? "-",
@@ -9581,6 +9618,8 @@ bot.on("message:text", async (ctx) => {
         }
         if (info) {
           repliedTag = `[видео от ${info.name}: ${info.caption}] `;
+        } else if (tooLarge) {
+          repliedTag = `[собеседник ответил на видео от ${repliedName}, но оно слишком большое для анализа] `;
         } else {
           repliedTag = `[собеседник ответил на видео от ${repliedName}, но проанализировать его не получилось из-за технической ошибки] `;
         }
