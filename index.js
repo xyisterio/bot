@@ -10830,7 +10830,7 @@ bot.catch((err) => {
 // ==== HTTP-заглушка, чтобы Render/HF Spaces считали сервис "живым" ====
 const app = express();
 app.get("/", (req, res) => res.send("bot is alive"));
-app.listen(PORT, () => console.log(`HTTP ping-сервер запущен на порту ${PORT}`));
+app.listen(PORT, '127.0.0.1', () => console.log(`HTTP ping-сервер запущен на порту ${PORT}`));
 
 // ==== Регистрация команд в Telegram (чтобы появлялись в автоподсказке "/") ====
 async function registerCommands() {
