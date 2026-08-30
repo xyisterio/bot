@@ -7104,6 +7104,14 @@ const VIDEO_DESCRIPTION_PROMPT =
   "и без вступлений вроде «в видео показано».";
 
 const GEMINI_VIDEO_MODEL = process.env.GEMINI_VIDEO_MODEL || "gemini-flash-latest";
+// Резервная модель на случай, если ВСЕ ключи словили отказ на основной
+// модели (типично — 503 "the model is overloaded", а не проблема
+// конкретного ключа). -latest ловит весь непривязанный трафик Google
+// первым, поэтому в момент пиковой нагрузки он же первым и валится с 503
+// на всех ключах подряд. gemini-3.5-flash — сознательно НЕ -latest:
+// отдельный пул мощностей и, по наблюдениям, самая щедрая дневная квота
+// среди доступных сейчас 3.x-моделей — меньше шанс словить тот же затор.
+const GEMINI_VIDEO_FALLBACK_MODEL = process.env.GEMINI_VIDEO_FALLBACK_MODEL || "gemini-3.5-flash";
 // 45с часто не хватает: видео кодируется целиком в base64 и шлётся одним
 // inline_data-запросом, а не стримом — и аплоад, и обработка на стороне
 // Gemini для не самых коротких видео легко вылезают за 45с (особенно с
@@ -7115,55 +7123,61 @@ const GEMINI_VIDEO_TIMEOUT_MS = Number(process.env.GEMINI_VIDEO_TIMEOUT_MS) || 1
 
 async function callGeminiNativeVideo(base64Video, mimeType, promptText, timeoutMs = GEMINI_VIDEO_TIMEOUT_MS) {
   let lastErr;
-  // Перебираем все настроенные ключи Gemini по очереди (как и везде в
-  // боте — GEMINI_API_KEYS может содержать несколько аккаунтов), чтобы
-  // исчерпанная дневная квота одного не валила фичу целиком.
-  for (const apiKey of GEMINI_API_KEYS) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      // Ключ передаём заголовком x-goog-api-key (официальный способ Google),
-      // а не query-параметром ?key=... — некоторые исходящие
-      // прокси/файрволы хостингов настроены цепляться именно за паттерн
-      // "ключ прямо в URL" как за потенциальную утечку и либо режут такие
-      // запросы, либо ощутимо тормозят их, из-за чего запрос зависает до
-      // собственного таймаута, а не падает с понятной ошибкой сразу.
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VIDEO_MODEL}:generateContent`;
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: promptText }, { inline_data: { mime_type: mimeType, data: base64Video } }],
-            },
-          ],
-          generationConfig: { maxOutputTokens: 800 },
-        }),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const errText = await res.text();
-        const err = new Error(`Gemini (видео) вернул ${res.status}`);
-        err.status = res.status;
-        err.body = errText;
-        throw err;
+  // Сначала весь набор ключей гоняем по основной модели (-latest), и
+  // только если АБСОЛЮТНО все ключи на ней провалились — тот же набор
+  // ключей второй раз, но уже на резервной модели. Если основная модель
+  // отвалилась не из-за общей перегрузки, а из-за проблемы с самими
+  // ключами (невалидный ключ, исчерпанная квота и т.п.), резерв тоже не
+  // поможет — но это осознанный компромисс: цена лишнего прохода — время
+  // (до 2x ключей × таймаут на полный провал), а не деньги/лимиты.
+  for (const model of [GEMINI_VIDEO_MODEL, GEMINI_VIDEO_FALLBACK_MODEL]) {
+    for (const apiKey of GEMINI_API_KEYS) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        // Ключ передаём заголовком x-goog-api-key (официальный способ Google),
+        // а не query-параметром ?key=... — некоторые исходящие
+        // прокси/файрволы хостингов настроены цепляться именно за паттерн
+        // "ключ прямо в URL" как за потенциальную утечку и либо режут такие
+        // запросы, либо ощутимо тормозят их, из-за чего запрос зависает до
+        // собственного таймаута, а не падает с понятной ошибкой сразу.
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: promptText }, { inline_data: { mime_type: mimeType, data: base64Video } }],
+              },
+            ],
+            generationConfig: { maxOutputTokens: 800 },
+          }),
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          const err = new Error(`Gemini (видео, ${model}) вернул ${res.status}`);
+          err.status = res.status;
+          err.body = errText;
+          throw err;
+        }
+        const data = await res.json();
+        const parts = data.candidates?.[0]?.content?.parts || [];
+        const text = parts.map((p) => p.text || "").join("").trim();
+        if (!text) throw new Error("Пустой ответ от Gemini на видео-запрос");
+        return text;
+      } catch (err) {
+        lastErr = err;
+        console.error(
+          `Анализ видео Gemini: ошибка [модель ${model}, ключ ***${apiKey.slice(-4)}]:`,
+          err.status ?? "-",
+          err.body ?? err.message
+        );
+      } finally {
+        clearTimeout(timeoutId);
       }
-      const data = await res.json();
-      const parts = data.candidates?.[0]?.content?.parts || [];
-      const text = parts.map((p) => p.text || "").join("").trim();
-      if (!text) throw new Error("Пустой ответ от Gemini на видео-запрос");
-      return text;
-    } catch (err) {
-      lastErr = err;
-      console.error(
-        `Анализ видео Gemini: ошибка [ключ ***${apiKey.slice(-4)}]:`,
-        err.status ?? "-",
-        err.body ?? err.message
-      );
-    } finally {
-      clearTimeout(timeoutId);
     }
   }
   throw lastErr ?? new Error("Нет доступных ключей Gemini для анализа видео");
