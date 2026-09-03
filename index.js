@@ -520,7 +520,7 @@ const SYSTEM_PROMPT = `
 - Иногда сообщение приходит из группового чата, где к тебе обращаются по имени (Женя/Жень) — само обращение уже вырезано из текста, отвечай сразу по сути, не переспрашивай "ты ко мне?".
 - В групповых чатах перед текстом собеседника может стоять его имя в формате "Имя: текст" — это подсказка, кто пишет, а не часть сообщения. Иногда, не в каждом ответе, можешь естественно обратиться к человеку по этому имени, но не через раз и не механически.
 - Перед сообщением иногда может стоять метка вида "[пол собеседника: мужской]" или "[пол собеседника: женский]" — это не часть сообщения, а подсказка для грамматики. Используй её, чтобы правильно согласовывать род, когда обращаешься к собеседнику на "ты" в прошедшем времени ("ты сделал" / "ты сделала", "ты был" / "ты была" и т.п.). Саму метку никогда не комментируй и не упоминай вслух. Если метки нет — пол неизвестен, используй нейтральные формулировки без прошедшего времени 2-го лица либо ориентируйся по ходу разговора.
-- Перед сообщением иногда может стоять метка вида "[фото от Имя: описание]", "[видео от Имя: описание]", "[сообщение от Имя: текст]" или "[переслано от Имя: текст]" — значит собеседник ответил (реплаем) на чужое сообщение и обращается по этому поводу к тебе: на фото или видео (тогда "описание" — то, что реально видно/происходит в кадре, распознано автоматически заранее — для видео это краткий пересказ сюжета/действия, а не только один кадр), на обычное сообщение другого участника чата, или на пост/статью/мем, пересланные из канала. Если имя в метке отличается от имени в "Имя: текст" сразу после неё — учитывай это: ты комментируешь чужой контент по просьбе того, кто сейчас с тобой говорит, а не свой собственный. Опирайся только на то, что реально написано/видно в метке, не выдумывай подробностей сверх неё — если текст обрезан многоточием, значит там было больше, но тебе показан только кусок. Реагируй живо и по-своему, с реальным мнением/оценкой, а не просто пересказом. Саму метку никогда не комментируй и не упоминай вслух.
+- Перед сообщением иногда может стоять метка вида "[фото от Имя: описание]", "[видео от Имя: описание]", "[сообщение от Имя: текст]" или "[переслано от Имя: текст]" — значит собеседник ответил (реплаем) на чужое сообщение и обращается по этому поводу к тебе: на фото или видео (тогда "описание" — то, что реально видно/происходит в кадре, распознано автоматически заранее), на обычное сообщение другого участника чата, или на пост/статью/мем, пересланные из канала. Если имя в метке отличается от имени в "Имя: текст" сразу после неё — учитывай это: ты комментируешь чужой контент по просьбе того, кто сейчас с тобой говорит, а не свой собственный. Опирайся только на то, что реально написано/видно в метке, не выдумывай подробностей сверх неё — если текст обрезан многоточием, значит там было больше, но тебе показан только кусок. Для фото — реагируй живо и по-своему, с реальным мнением/оценкой, а не просто пересказом в одну строку. Для видео — в описании обычно уже расписан сюжет/действия по порядку (это не один кадр, а разбор всего ролика), так что отвечай содержательно: если спросили в общем ("что тут?", "о чём видео") — перескажи по сути происходящее (несколько предложений, а не одна короткая реакция), можешь добавить и своё отношение, но не своди ответ только к реакции без пересказа; если спросили про что-то конкретное — отвечай именно по нему, опираясь на описание. Саму метку никогда не комментируй и не упоминай вслух.
 - Перед сообщением иногда может стоять метка вида "[голосовое от Имя (мм:сс), расшифровка: текст]" или "[аудиофайл (Исполнитель — Название) от Имя (мм:сс), текст: текст]" — собеседник ответил (реплаем) на голосовое сообщение, кружочек или музыкальный файл (mp3/flac и т.п.), а не спросил дословный текст (тот случай обрабатывается отдельно, без тебя). Отвечай по существу вопроса, опираясь на расшифровку/распознанный текст — если спросили "о чём тут вкратце"/"перескажи"/"что там по сути" и запись длинная, перескажи своими словами кратко и без воды, а не дословно и не на весь объём исходника. Для аудиофайла это обычно текст песни — если спросили "о чём песня", отвечай по смыслу текста, а не пересказывай его построчно. Если вопрос про что-то конкретное из сказанного — отвечай именно по нему. Если расшифровка обрывается многоточием — значит она была длиннее и обрезана технически, не делай вид, что знаешь продолжение. Саму метку никогда не комментируй и не упоминай вслух.
 - Метка вида "[голосовое от Имя — речь не распознана, тишина или шум]", "[аудиофайл от Имя — текст не распознан...]" или "...расшифровать его не получилось из-за технической ошибки" — значит расшифровать нечего или не вышло технически. Для аудиофайла это часто просто означает, что трек инструментальный (без вокала) — если в метке есть исполнитель и название, можешь опираться хотя бы на них. Так и скажи по-своему (не разобрал речь / не смог расслушать), не выдумывай, что там могло быть сказано.
 - Перед сообщением иногда может стоять метка вида "[в чате недавно было фото от Имя: описание]" — это НЕ реплай: собеседник прямо спросил тебя про какое-то фото в чате словами (например "как тебе фото кота в чате?"), не отвечая на конкретное сообщение с ним, и ты нашёл в логе чата подходящее фото под описание. Отвечай по существу вопроса, опираясь на это описание, как будто ты сам это фото видел в чате. Если по тексту вопроса видно, что найденное фото явно не то, о котором спрашивают (не совпадает с тем, что человек описывает) — не притворяйся, что видел именно то, о котором он спрашивает, а честно скажи, что не помнишь такого. Саму метку никогда не комментируй и не упоминай вслух.
@@ -579,6 +579,38 @@ const GROQ_SYSTEM_PROMPT = `
 - Один финальный вариант реплики — никогда не присылай несколько вариантов через "or"/"или" и не бери фразы в кавычки как черновик.
 - Перед сообщением иногда стоит техническая метка в квадратных скобках (пол собеседника, реплай на фото/голосовое/трек/карточку фильма, обращение к настоящему Жене и т.п.) — используй её как подсказку контекста для ответа, но никогда не комментируй и не упоминай саму метку вслух.
 `.trim();
+
+// ==== Короткая "злая" личность — для тех, кого хозяин пометил врагом ====
+// Подменяет собой SYSTEM_PROMPT целиком (см. askLLM/systemPromptOverride и
+// использование в enemyMode ниже) — никакого обычного характера Жени,
+// памяти чата, скиллов и т.п. тут не подмешивается, специально по-простому.
+// Задача — не помогать вообще ничем и не отвечать по существу ни на один
+// вопрос; за настоящий отказ на "полезные" команды (поиск/трек/фильм/
+// таро/погода/игры) отвечает отдельная, более быстрая и дешёвая ветка до
+// вызова LLM вообще — см. isEnemyBlockedIntent/ENEMY_REFUSAL_PHRASES ниже,
+// этот промпт нужен только для обычного текстового чата с врагом.
+const ENEMY_SYSTEM_PROMPT = `
+Ты сейчас не Женя в обычном виде, а его короткая злая версия — специально для конкретного человека, который сейчас пишет тебе. Он в игноре по-хорошему быть не может, но по-доброму ты с ним тоже общаться не хочешь.
+
+Правила:
+- Ты ему НЕ помогаешь. Ни на один вопрос по существу не отвечаешь — ни фактический, ни личный, ни просьбу что-то объяснить или сделать.
+- Отвечай коротко — одна короткая фраза, максимум две.
+- Можно грубить, посылать нахуй, хамить, огрызаться, отвечать сарказмом или полным безразличием.
+- Никакой вежливости, извинений, объяснений "почему я не помогаю" — просто отшей и всё.
+- Пиши только на русском, без markdown-разметки, без эмодзи.
+`.trim();
+
+// Отказы на "полезные" команды от врага (поиск в интернете, трек, фильм,
+// таро, погода, игры) — эти интенты вообще не доходят до LLM (см.
+// isEnemyBlockedIntent), просто отдаём случайную грубую отмашку.
+const ENEMY_REFUSAL_PHRASES = [
+  "бери и ищи сам",
+  "отъебись",
+  "мне лень, разбирайся сам",
+  "сам найди, не маленький",
+  "иди на хуй со своими просьбами",
+  "перебьёшься",
+];
 
 // ==== Имя бота — на какие обращения реагировать в группах ====
 // Добавляй сюда любые формы имени/обращения, через запятую.
@@ -815,6 +847,52 @@ function unignoreUser(chatId, userId) {
   return true;
 }
 
+// ==== Список "врагов" (по chatId -> Set<userId>) ====
+// Тот же принцип, что и игнор-лист выше, но другое поведение: врага бот
+// НЕ игнорирует молча — он ему отвечает, но со сменой личности на короткую
+// злую (см. ENEMY_SYSTEM_PROMPT) и с отказом на любые "полезные" команды
+// (поиск в интернете, трек, фильм, таро, погода, игры — см.
+// isEnemyBlockedIntent/ENEMY_REFUSAL_PHRASES). Задаётся ТОЛЬКО хозяином
+// бота (см. isOwner), так же как и игнор. Живёт в памяти как кэш, зеркалится
+// в Redis (ключ enemies:{chatId}) — см. loadPersistedState() при старте.
+const chatEnemies = new Map(); // chatId -> Set<userId>
+
+function getEnemySet(chatId) {
+  if (!chatEnemies.has(chatId)) chatEnemies.set(chatId, new Set());
+  return chatEnemies.get(chatId);
+}
+
+async function saveEnemies(chatId) {
+  if (!redis) return;
+  try {
+    const set = getEnemySet(chatId);
+    if (set.size === 0) await redis.del(`enemies:${chatId}`);
+    else await redis.set(`enemies:${chatId}`, [...set]);
+  } catch (err) {
+    console.error(`Redis: не удалось сохранить список врагов чата ${chatId}:`, err);
+  }
+}
+
+function isUserEnemy(chatId, userId) {
+  return getEnemySet(chatId).has(userId);
+}
+
+function markEnemy(chatId, userId) {
+  const set = getEnemySet(chatId);
+  if (set.has(userId)) return false; // уже враг
+  set.add(userId);
+  saveEnemies(chatId);
+  return true;
+}
+
+function unmarkEnemy(chatId, userId) {
+  const set = getEnemySet(chatId);
+  if (!set.has(userId)) return false;
+  set.delete(userId);
+  saveEnemies(chatId);
+  return true;
+}
+
 // Пытаемся понять, о ком речь ("игнорируй @lays" / "игнорируй Васю" /
 // "игнорируй 123456789" / реплаем на человека без явного указания) —
 // возвращает userId или null, если распознать не вышло. Порядок
@@ -884,6 +962,52 @@ async function tryHandleOwnerIgnoreDirective(chatId, text, ctx, replyOpts) {
     }
     const added = ignoreUser(chatId, targetId);
     await ctx.reply(added ? "готово, больше ему не отвечаю в этом чате" : "он и так уже в игноре", replyOpts);
+    return true;
+  }
+
+  return false;
+}
+
+// ==== Директива хозяина "запомни X враг" / "запомни X друг" ====
+// В отличие от игнора (где сначала идёт глагол — "игнорируй X"), тут
+// порядок обратный: сначала цель, потом метка ("запомни @vasya враг",
+// "запомни @vasya друг" для отмены) — так просил хозяин. Цель — строго
+// одно "слово" (без пробелов): @ник, numeric id, или ничего (тогда берём
+// автора реплая) — см. resolveIgnoreTargetId. Специально НЕ разрешаем
+// цель из нескольких слов, чтобы не ловить случайные фразы вида "запомни,
+// Вася мой лучший друг", которые заканчиваются на "друг", но врагом/другом
+// в смысле этой команды не являются. Доступно только хозяину (см. isOwner) —
+// вызывающий код обязан проверить это ДО вызова, как и у ignore-директивы
+// выше. Возвращает true, если команду распознали и обработали.
+async function tryHandleOwnerEnemyDirective(chatId, text, ctx, replyOpts) {
+  const enemyMatch = text.match(/^(\S+)?\s*враг\.?$/i);
+  if (enemyMatch) {
+    const targetId = resolveIgnoreTargetId(chatId, enemyMatch[1], ctx);
+    if (!targetId) {
+      await ctx.reply("не понял, кого во враги — реплаем на его сообщение или укажи @ник", replyOpts);
+      return true;
+    }
+    if (targetId === ctx.from.id) {
+      await ctx.reply("сам себе врагом не станешь", replyOpts);
+      return true;
+    }
+    const added = markEnemy(chatId, targetId);
+    await ctx.reply(
+      added ? "готово, теперь он у меня во врагах — поблажек не будет" : "он и так уже враг",
+      replyOpts
+    );
+    return true;
+  }
+
+  const friendMatch = text.match(/^(\S+)?\s*друг\.?$/i);
+  if (friendMatch) {
+    const targetId = resolveIgnoreTargetId(chatId, friendMatch[1], ctx);
+    if (!targetId) {
+      await ctx.reply("не понял, кого разврагивать — реплаем на его сообщение или укажи @ник", replyOpts);
+      return true;
+    }
+    const removed = unmarkEnemy(chatId, targetId);
+    await ctx.reply(removed ? "ладно, помирились — снял с него метку врага" : "он и так не враг", replyOpts);
     return true;
   }
 
@@ -3504,7 +3628,11 @@ function buildDateTimeBlock() {
 }
 
 // ==== Запрос к LLM с фолбэком по провайдерам и моделям ====
-async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
+// systemPromptOverride — используется ТОЛЬКО для врага (см. enemyMode/
+// ENEMY_SYSTEM_PROMPT в bot.on("message:text")): полностью подменяет собой
+// SYSTEM_PROMPT/GROQ_SYSTEM_PROMPT, без памяти чата и скиллов — короткая
+// злая личность работает сама по себе, обычный характер Жени тут не нужен.
+async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS, systemPromptOverride = null) {
   const history = getHistory(chatId);
 
   // BOT_SKILLS_PROMPT — только когда похоже, что реально спрашивают про
@@ -3515,7 +3643,12 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
   const skillsBlock = shouldIncludeSkillsPrompt(userText) ? "\n\n" + BOT_SKILLS_PROMPT : "";
 
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT + buildMemoryPromptBlock(chatId) + skillsBlock + buildDateTimeBlock() },
+    {
+      role: "system",
+      content: systemPromptOverride
+        ? systemPromptOverride + buildDateTimeBlock()
+        : SYSTEM_PROMPT + buildMemoryPromptBlock(chatId) + skillsBlock + buildDateTimeBlock(),
+    },
     ...history,
     { role: "user", content: userText },
   ];
@@ -3534,7 +3667,10 @@ async function askLLM(chatId, userText, timeoutMs = REQUEST_TIMEOUT_MS) {
   // Gemini и другие провайдеры это не видят вообще, получают messages
   // с полным SYSTEM_PROMPT и всей HISTORY_LIMIT как обычно.
   const groqMessages = [
-    { role: "system", content: GROQ_SYSTEM_PROMPT + buildDateTimeBlock() },
+    {
+      role: "system",
+      content: (systemPromptOverride || GROQ_SYSTEM_PROMPT) + buildDateTimeBlock(),
+    },
     ...history.slice(-6),
     { role: "user", content: userText },
   ];
@@ -3933,6 +4069,29 @@ function rememberKnownChat(ctx) {
   saveKnownChats();
 }
 
+// ==== Ретрансляция сообщений между группами ("/relay") ====
+// sourceChatId -> targetChatId. Настраивается только владельцем (см.
+// isOwner) через bot.command("relay") ниже, кнопками по тому же реестру
+// knownChats, что у /memory и /leavegroups. Зеркалится в Redis одним
+// ключом "relay_map" (тем же паттерном, что known_chats). Сама пересылка
+// — см. bot.use() сразу после фильтра разрешённых групп: используем
+// нативный ctx.api.forwardMessage, а не ручную пересборку сообщения —
+// так Telegram сам переносит ВСЁ как есть (автора, голосовые, медиа,
+// альбомы, стикеры, опросы и т.д.) без необходимости разбирать каждый
+// тип сообщения руками. Из недостатков: если у автора в настройках
+// приватности выключено "показывать при пересылке" — Telegram сам
+// подставит "Скрытый пользователь", бот тут ничего не решает.
+const relayMap = new Map();
+
+async function saveRelayMap() {
+  if (!redis) return;
+  try {
+    await redis.set("relay_map", Object.fromEntries(relayMap));
+  } catch (err) {
+    console.error("Redis: не удалось сохранить карту ретрансляции:", err);
+  }
+}
+
 // ==== Восстановление состояния из Redis при старте ====
 // Читает всё, что успели сохранить save*-хелперы выше, обратно в
 // оперативные Map'ы, чтобы после рестарта бот "помнил" контекст диалогов,
@@ -3955,11 +4114,13 @@ async function loadPersistedState() {
       memberNameKeys,
       memoryKeys,
       ignoredKeys,
+      enemyKeys,
       savedKnownChats,
       savedIdx,
       savedPinnedIdx,
       savedWatchDisabledChats,
       savedVoiceEnabledChats,
+      savedRelayMap,
     ] = await Promise.all([
       redis.keys("history:*"),
       redis.keys("chatlog:*"),
@@ -3974,11 +4135,13 @@ async function loadPersistedState() {
       redis.keys("members:*"),
       redis.keys("memory:*"),
       redis.keys("ignored:*"),
+      redis.keys("enemies:*"),
       redis.get("known_chats"),
       redis.get("activeTargetIndex"),
       redis.get("pinnedTargetIndex"),
       redis.get("watchDisabledChats"),
       redis.get("voiceEnabledChats"),
+      redis.get("relay_map"),
     ]);
 
     await Promise.all(
@@ -4119,6 +4282,14 @@ async function loadPersistedState() {
       })
     );
 
+    await Promise.all(
+      enemyKeys.map(async (key) => {
+        const chatId = Number(key.slice("enemies:".length));
+        const data = await redis.get(key);
+        if (Array.isArray(data)) chatEnemies.set(chatId, new Set(data.map(Number)));
+      })
+    );
+
     if (savedKnownChats && typeof savedKnownChats === "object") {
       for (const [chatIdRaw, title] of Object.entries(savedKnownChats)) {
         knownChats.set(Number(chatIdRaw), title);
@@ -4150,6 +4321,16 @@ async function loadPersistedState() {
       }
     }
 
+    if (savedRelayMap && typeof savedRelayMap === "object") {
+      for (const [sourceRaw, targetRaw] of Object.entries(savedRelayMap)) {
+        const sourceChatId = Number(sourceRaw);
+        const targetChatId = Number(targetRaw);
+        if (Number.isInteger(sourceChatId) && Number.isInteger(targetChatId)) {
+          relayMap.set(sourceChatId, targetChatId);
+        }
+      }
+    }
+
     console.log(
       `Восстановлено из Redis: истории — ${historyKeys.length}, логи чатов — ${chatLogKeys.length}, алиасы — ${aliasKeys.length}, ` +
         `юзернеймы — ${usernameKeys.length}, пол — ${genderKeys.length}, шахматные партии — ${chessKeys.length}, ` +
@@ -4159,7 +4340,8 @@ async function loadPersistedState() {
         (typeof savedIdx === "number" ? `, активная модель — индекс ${activeTargetIndex}` : "") +
         (pinnedTargetIndex !== null ? `, закреплена вручную — индекс ${pinnedTargetIndex}` : "") +
         `, чатов с выключенной слежкой (watch) — ${watchDisabledChats.size}` +
-        `, чатов с включённым голосом — ${voiceEnabledChats.size}`
+        `, чатов с включённым голосом — ${voiceEnabledChats.size}` +
+        `, активных ретрансляций — ${relayMap.size}`
     );
   } catch (err) {
     console.error("Не удалось восстановить состояние из Redis, стартую с чистой памятью:", err);
@@ -4450,6 +4632,24 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
+// Сам хук ретрансляции (см. relayMap выше) — стоит после фильтра
+// разрешённых групп, поэтому пересылка возможна только между чатами,
+// куда бота пустили явно. Пропускает сообщения от самого бота (чтобы не
+// зациклиться на собственных репостах) и молча продолжает цепочку дальше
+// — ретрансляция не мешает обычной обработке того же сообщения (ответы
+// LLM, команды и т.п.).
+bot.use(async (ctx, next) => {
+  if (ctx.message && !ctx.from?.is_bot && relayMap.size > 0) {
+    const targetChatId = relayMap.get(ctx.chat.id);
+    if (targetChatId) {
+      ctx.api
+        .forwardMessage(targetChatId, ctx.chat.id, ctx.message.message_id)
+        .catch((err) => console.error(`Не удалось ретранслировать сообщение из ${ctx.chat.id} в ${targetChatId}:`, err));
+    }
+  }
+  await next();
+});
+
 bot.command("start", async (ctx) => {
   const chatId = ctx.chat.id;
   await clearHistory(chatId); // сброс истории при /start
@@ -4631,6 +4831,27 @@ bot.command("ignored", async (ctx) => {
     return `- ${userId}${label ? ` (${label})` : ""}`;
   });
   await ctx.reply(`сейчас в игноре:\n${lines.join("\n")}`);
+});
+
+// /enemies — посмотреть, кто сейчас во врагах в этом чате (см.
+// markEnemy/unmarkEnemy, задаётся через "запомни X враг" / "запомни X друг").
+// Только владелец — как и сама возможность назначать/снимать метку врага.
+bot.command("enemies", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const chatId = ctx.chat.id;
+  const set = getEnemySet(chatId);
+  if (set.size === 0) {
+    await ctx.reply("сейчас во врагах никого нет в этом чате");
+    return;
+  }
+  const lines = [...set].map((userId) => {
+    const name =
+      getAliasMap(chatId).get(userId)?.name || getMemberNameMap(chatId).get(userId) || null;
+    const username = getKnownUsername(chatId, userId);
+    const label = [name, username ? `@${username}` : null].filter(Boolean).join(", ");
+    return `- ${userId}${label ? ` (${label})` : ""}`;
+  });
+  await ctx.reply(`сейчас во врагах:\n${lines.join("\n")}`);
 });
 
 // /gender — посмотреть или задать пол вручную (перекрывает эвристику навсегда).
@@ -4856,6 +5077,301 @@ bot.on("callback_query:data", async (ctx, next) => {
   }
 
   return next();
+});
+
+// ==== /leavegroups — список групп, в которых состоит бот, с возможностью
+// "уйти" из любой кнопкой ====
+// Скрыта из списка команд (не добавлена в setMyCommands) и доступна только
+// владельцу (см. isOwner). Источник списка — тот же реестр knownChats, что
+// у /memory (chatId -> title), но отфильтрованный только группами/супергруппами
+// — у них Telegram всегда даёт отрицательный chatId, у личных чатов chatId
+// положительный, поэтому фильтр по знаку. Внутри реестра могут быть чаты,
+// которые бота уже выкинули вручную (без вызова этой команды) — тогда
+// leaveChat ниже просто вернёт ошибку "not a member", ловим и всё равно
+// убираем чат из реестра.
+const LEAVE_GROUP_GIF_FILE_ID =
+  process.env.LEAVE_GROUP_GIF_FILE_ID ||
+  "CgACAgIAAxkBAAFTYS1qmWPc0ZCZRDaUT_m10MPshXmcRwACD6EAAkxbQEmbwLkOz5TGOD0E";
+
+function buildLeaveGroupsKeyboard() {
+  const rows = [...knownChats.entries()]
+    .filter(([chatId]) => chatId < 0) // только группы/супергруппы, не личка
+    .sort((a, b) => a[1].localeCompare(b[1], "ru"))
+    .map(([chatId, title]) => [{ text: title.slice(0, 64), callback_data: `leavegrp:${chatId}` }]);
+  return { inline_keyboard: rows };
+}
+
+bot.command("leavegroups", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const keyboard = buildLeaveGroupsKeyboard();
+  if (keyboard.inline_keyboard.length === 0) {
+    await ctx.reply("сейчас не состою ни в одной группе (из тех, что знаю)");
+    return;
+  }
+  await ctx.reply("группы, в которых я состою — выбери, откуда уйти:", { reply_markup: keyboard });
+});
+
+// Обработка кнопок /leavegroups — отдельный callback_query-обработчик
+// (grammY прогоняет их цепочкой через next(), см. пояснение у /memory
+// выше), закрыт владельцем так же, как и сама команда.
+bot.on("callback_query:data", async (ctx, next) => {
+  const data = ctx.callbackQuery.data;
+  if (!data.startsWith("leavegrp")) return next();
+
+  if (!isOwner(ctx)) {
+    await ctx.answerCallbackQuery({ text: "это только для хозяина", show_alert: true });
+    return;
+  }
+
+  // Первый клик — просим подтверждение, чтобы не вылететь из группы случайным тапом.
+  if (data.startsWith("leavegrp:")) {
+    const chatId = Number(data.slice("leavegrp:".length));
+    const title = knownChats.get(chatId) || String(chatId);
+    await ctx.editMessageText(`точно выйти из «${title}»?`, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ да, выйти", callback_data: `leavegrpok:${chatId}` },
+            { text: "❌ отмена", callback_data: "leavegrpback" },
+          ],
+        ],
+      },
+    });
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data === "leavegrpback") {
+    await ctx.editMessageText("группы, в которых я состою — выбери, откуда уйти:", {
+      reply_markup: buildLeaveGroupsKeyboard(),
+    });
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data.startsWith("leavegrpok:")) {
+    const chatId = Number(data.slice("leavegrpok:".length));
+    const title = knownChats.get(chatId) || String(chatId);
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.api.sendAnimation(chatId, LEAVE_GROUP_GIF_FILE_ID);
+    } catch (err) {
+      console.error(`Не удалось отправить прощальную гифку в чат ${chatId}:`, err);
+    }
+    try {
+      await ctx.api.leaveChat(chatId);
+    } catch (err) {
+      console.error(`Не удалось выйти из чата ${chatId}:`, err);
+    }
+    knownChats.delete(chatId);
+    await saveKnownChats();
+    const keyboard = buildLeaveGroupsKeyboard();
+    if (keyboard.inline_keyboard.length === 0) {
+      await ctx.editMessageText(`вышел из «${title}»`);
+    } else {
+      await ctx.editMessageText(`вышел из «${title}»\n\nостальные группы:`, { reply_markup: keyboard });
+    }
+    return;
+  }
+
+  return next();
+});
+
+// ==== /relay — настройка ретрансляции сообщений между группами ====
+// Скрыта из списка команд, только владелец (см. isOwner). Пересылка сама
+// по себе — см. bot.use() у relayMap выше; здесь только управление
+// картой sourceChatId -> targetChatId кнопками, по тому же реестру
+// knownChats, что у /memory и /leavegroups (те же группы, отфильтрованные
+// по отрицательному chatId).
+function relayGroupLabel(chatId) {
+  const title = knownChats.get(chatId) || String(chatId);
+  const targetId = relayMap.get(chatId);
+  if (targetId) {
+    const targetTitle = knownChats.get(targetId) || String(targetId);
+    return `${title} → ${targetTitle}`;
+  }
+  return title;
+}
+
+function buildRelaySourceKeyboard() {
+  const rows = [...knownChats.entries()]
+    .filter(([chatId]) => chatId < 0)
+    .sort((a, b) => a[1].localeCompare(b[1], "ru"))
+    .map(([chatId]) => [{ text: relayGroupLabel(chatId).slice(0, 64), callback_data: `relaysrc:${chatId}` }]);
+  return { inline_keyboard: rows };
+}
+
+// При выборе цели не даём выбрать саму группу-источник и группу, для
+// которой источник уже сам является целью — так хотя бы прямые циклы
+// A→B→A отсекаются на уровне UI. Цепочки длиннее (A→B→C→A) остаются на
+// совести того, кто их настраивает.
+function buildRelayTargetKeyboard(sourceChatId) {
+  const rows = [...knownChats.entries()]
+    .filter(([chatId]) => chatId < 0 && chatId !== sourceChatId && relayMap.get(chatId) !== sourceChatId)
+    .sort((a, b) => a[1].localeCompare(b[1], "ru"))
+    .map(([chatId, title]) => [{ text: title.slice(0, 64), callback_data: `relaytgt:${sourceChatId}:${chatId}` }]);
+  rows.push([{ text: "← назад", callback_data: "relayback" }]);
+  return { inline_keyboard: rows };
+}
+
+bot.command("relay", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const keyboard = buildRelaySourceKeyboard();
+  if (keyboard.inline_keyboard.length === 0) {
+    await ctx.reply("пока не знаю ни одной группы — бот должен хотя бы раз получить в ней сообщение");
+    return;
+  }
+  await ctx.reply(
+    "ретрансляция сообщений — выбери группу-источник (стрелка показывает текущую цель, если настроена):",
+    { reply_markup: keyboard }
+  );
+});
+
+bot.on("callback_query:data", async (ctx, next) => {
+  const data = ctx.callbackQuery.data;
+  if (!data.startsWith("relay")) return next();
+
+  if (!isOwner(ctx)) {
+    await ctx.answerCallbackQuery({ text: "это только для хозяина", show_alert: true });
+    return;
+  }
+
+  if (data === "relayback") {
+    await ctx.editMessageText("ретрансляция сообщений — выбери группу-источник:", {
+      reply_markup: buildRelaySourceKeyboard(),
+    });
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  // Выбрали источник — если для него уже настроена цель, даём отключить
+  // или сменить; если нет, сразу зовём выбор цели.
+  if (data.startsWith("relaysrc:")) {
+    const sourceChatId = Number(data.slice("relaysrc:".length));
+    const sourceTitle = knownChats.get(sourceChatId) || String(sourceChatId);
+    const currentTargetId = relayMap.get(sourceChatId);
+    if (currentTargetId) {
+      const targetTitle = knownChats.get(currentTargetId) || String(currentTargetId);
+      await ctx.editMessageText(`«${sourceTitle}» сейчас ретранслируется в «${targetTitle}». Что сделать?`, {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🔁 сменить цель", callback_data: `relaychange:${sourceChatId}` }],
+            [{ text: "🛑 отключить", callback_data: `relayoff:${sourceChatId}` }],
+            [{ text: "← назад", callback_data: "relayback" }],
+          ],
+        },
+      });
+    } else {
+      await ctx.editMessageText(`источник — «${sourceTitle}». Куда ретранслировать?`, {
+        reply_markup: buildRelayTargetKeyboard(sourceChatId),
+      });
+    }
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data.startsWith("relaychange:")) {
+    const sourceChatId = Number(data.slice("relaychange:".length));
+    const sourceTitle = knownChats.get(sourceChatId) || String(sourceChatId);
+    await ctx.editMessageText(`источник — «${sourceTitle}». Куда ретранслировать?`, {
+      reply_markup: buildRelayTargetKeyboard(sourceChatId),
+    });
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (data.startsWith("relayoff:")) {
+    const sourceChatId = Number(data.slice("relayoff:".length));
+    const sourceTitle = knownChats.get(sourceChatId) || String(sourceChatId);
+    relayMap.delete(sourceChatId);
+    await saveRelayMap();
+    await ctx.editMessageText(`ретрансляцию из «${sourceTitle}» отключил.\n\nвыбери группу-источник:`, {
+      reply_markup: buildRelaySourceKeyboard(),
+    });
+    await ctx.answerCallbackQuery({ text: "отключил" });
+    return;
+  }
+
+  if (data.startsWith("relaytgt:")) {
+    const [, sourceRaw, targetRaw] = data.split(":");
+    const sourceChatId = Number(sourceRaw);
+    const targetChatId = Number(targetRaw);
+    relayMap.set(sourceChatId, targetChatId);
+    await saveRelayMap();
+    const sourceTitle = knownChats.get(sourceChatId) || String(sourceChatId);
+    const targetTitle = knownChats.get(targetChatId) || String(targetChatId);
+    await ctx.editMessageText(
+      `готово: «${sourceTitle}» → «${targetTitle}».\n\nвыбери группу-источник:`,
+      { reply_markup: buildRelaySourceKeyboard() }
+    );
+    await ctx.answerCallbackQuery({ text: "настроил" });
+    return;
+  }
+
+  return next();
+});
+
+// ==== /send — отправка сообщения от имени бота в выбранный чат ====
+// Владелец делает reply на любое сообщение (текст/фото/видео/войс/файл —
+// что угодно) командой /send, бот показывает список известных чатов
+// (тот же knownChats, что у /memory и /relay) и по выбору копирует
+// сообщение туда через ctx.api.copyMessage — в отличие от forwardMessage
+// это ПОЛНАЯ копия без пометки "переслано от", то есть выглядит как
+// сообщение, отправленное самим ботом. pendingSend хранит message_id
+// исходного сообщения и chat_id, откуда его копировать, по ownerId —
+// живёт только в памяти, персистить в Redis смысла нет (одноразовое
+// действие, не переживающее рестарт — и не должно).
+const pendingSend = new Map();
+
+function buildSendChatKeyboard() {
+  const rows = [...knownChats.entries()]
+    .sort((a, b) => a[1].localeCompare(b[1], "ru"))
+    .map(([chatId, title]) => [{ text: title.slice(0, 64), callback_data: `sendto:${chatId}` }]);
+  return { inline_keyboard: rows };
+}
+
+bot.command("send", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const src = ctx.message.reply_to_message;
+  if (!src) {
+    await ctx.reply("сделай реплай на сообщение (текст/фото/видео/войс/файл — что угодно), которое хочешь отправить, и повтори /send");
+    return;
+  }
+  const keyboard = buildSendChatKeyboard();
+  if (keyboard.inline_keyboard.length === 0) {
+    await ctx.reply("пока не знаю ни одного чата — бот должен хотя бы раз получить в нём сообщение");
+    return;
+  }
+  pendingSend.set(ctx.from.id, { fromChatId: ctx.chat.id, messageId: src.message_id });
+  await ctx.reply("куда отправить?", { reply_markup: keyboard });
+});
+
+bot.on("callback_query:data", async (ctx, next) => {
+  const data = ctx.callbackQuery.data;
+  if (!data.startsWith("sendto:")) return next();
+
+  if (!isOwner(ctx)) {
+    await ctx.answerCallbackQuery({ text: "это только для хозяина", show_alert: true });
+    return;
+  }
+
+  const pending = pendingSend.get(ctx.from.id);
+  if (!pending) {
+    await ctx.answerCallbackQuery({ text: "сессия устарела, вызови /send заново", show_alert: true });
+    return;
+  }
+
+  const targetChatId = Number(data.slice("sendto:".length));
+  try {
+    await ctx.api.copyMessage(targetChatId, pending.fromChatId, pending.messageId);
+    pendingSend.delete(ctx.from.id);
+    const targetTitle = knownChats.get(targetChatId) || String(targetChatId);
+    await ctx.editMessageText(`отправлено в «${targetTitle}»`);
+    await ctx.answerCallbackQuery({ text: "готово" });
+  } catch (err) {
+    console.error("Не удалось скопировать сообщение через /send:", err);
+    await ctx.answerCallbackQuery({ text: "не вышло отправить, см. логи", show_alert: true });
+  }
 });
 
 bot.command("gender", async (ctx) => {
@@ -6966,15 +7482,20 @@ function getShazamMedia(message) {
   return null;
 }
 
-// Только "полноценное" видео (не кружочек) — на кружочки уже есть отдельный,
-// хорошо настроенный путь через распознавание речи (Whisper, см. блок
-// voice/video_note/audio ниже), дублировать его визуальным анализом Gemini
-// незачем. Обычное видео и видео-документ такого пути не имеют вообще —
-// для них единственный способ понять содержимое было бы вручную распознать
-// текст на видео, а с Gemini можно сразу пересказать сюжет/действие.
+// Любое "видеоподобное" медиа для визуального анализа через Gemini —
+// обычное видео, видео-документ и кружочек (video_note). Кружочек раньше
+// сюда не входил (гонялся только через Whisper — только звук, без картинки),
+// но это тоже полноценное видео с кадром, а не просто голосовое, так что
+// смысла в нём меньше, чем в обычном видео, но он есть — Gemini разбирает и
+// видеоряд, и речь в нём. Отдельный путь через Whisper (см. блок
+// voice/video_note/audio ниже) для кружочка не убираем — он остаётся для
+// случаев, когда явно просят дословный текст (см. wantsLiteralVideoNoteText
+// в вызове ниже), потому что Gemini сознательно не транскрибирует слово в
+// слово (см. VIDEO_DESCRIPTION_PROMPT).
 function getVideoOnlyMedia(message) {
   if (!message) return null;
   if (message.video) return { fileObj: message.video, mime: message.video.mime_type || "video/mp4" };
+  if (message.video_note) return { fileObj: message.video_note, mime: "video/mp4" };
   if (isVideoDocument(message.document)) return { fileObj: message.document, mime: message.document.mime_type || "video/mp4" };
   return null;
 }
@@ -7098,20 +7619,24 @@ async function handleShazamFromReply(ctx, repliedTo, media) {
 // Строго по запросу — реплай на видео с обычным вопросом ("что там?",
 // "о чём это", "переведи, что говорят" и т.п.), НИКОГДА не на автомате.
 const VIDEO_DESCRIPTION_PROMPT =
-  "Опиши по-русски, что происходит в этом видео: сюжет, кто/что в кадре, ключевые действия по порядку — 2-4 предложения. " +
-  "Если это отрывок фильма/сериала/ролика/мема — опиши именно происходящее на экране, а не только общую тему. Если в видео " +
-  "есть речь — кратко перескажи, о чём говорят, но не расшифровывай дословно слово в слово. Пиши только суть, без markdown " +
-  "и без вступлений вроде «в видео показано».";
+  "Подробно опиши по-русски, что происходит в этом видео: сюжет, кто/что в кадре, обстановка, ключевые действия по порядку " +
+  "от начала до конца, важные детали и изменения в кадре. Не ограничивай себя по объёму — если в видео много всего " +
+  "происходит, опиши всё это полно, а не только в общих чертах. Если это отрывок фильма/сериала/ролика/мема — опиши именно " +
+  "происходящее на экране, а не только общую тему. Если в видео есть речь — перескажи, о чём говорят, достаточно подробно, " +
+  "чтобы был понятен смысл сказанного (но не обязательно дословно слово в слово). Пиши только суть, без markdown и без " +
+  "вступлений вроде «в видео показано».";
 
-const GEMINI_VIDEO_MODEL = process.env.GEMINI_VIDEO_MODEL || "gemini-flash-latest";
+// Сознательно НЕ gemini-flash-latest: -latest ловит весь непривязанный
+// трафик Google первым, поэтому в момент пиковой нагрузки именно он первым
+// валится с 503 "the model is overloaded" на всех ключах подряд. Берём
+// зафиксированные версии линейки 3.5 — у них отдельные от -latest пулы
+// мощностей и щедрые дневные квоты.
+const GEMINI_VIDEO_MODEL = process.env.GEMINI_VIDEO_MODEL || "gemini-3.5-flash";
 // Резервная модель на случай, если ВСЕ ключи словили отказ на основной
-// модели (типично — 503 "the model is overloaded", а не проблема
-// конкретного ключа). -latest ловит весь непривязанный трафик Google
-// первым, поэтому в момент пиковой нагрузки он же первым и валится с 503
-// на всех ключах подряд. gemini-3.5-flash — сознательно НЕ -latest:
-// отдельный пул мощностей и, по наблюдениям, самая щедрая дневная квота
-// среди доступных сейчас 3.x-моделей — меньше шанс словить тот же затор.
-const GEMINI_VIDEO_FALLBACK_MODEL = process.env.GEMINI_VIDEO_FALLBACK_MODEL || "gemini-3.5-flash";
+// (типично — тот же 503 от перегрузки, а не проблема конкретного ключа).
+// flash-lite — отдельный от обычного flash пул мощностей и своя квота,
+// так что шанс словить тот же затор ниже.
+const GEMINI_VIDEO_FALLBACK_MODEL = process.env.GEMINI_VIDEO_FALLBACK_MODEL || "gemini-3.5-flash-lite";
 // 45с часто не хватает: видео кодируется целиком в base64 и шлётся одним
 // inline_data-запросом, а не стримом — и аплоад, и обработка на стороне
 // Gemini для не самых коротких видео легко вылезают за 45с (особенно с
@@ -7152,7 +7677,7 @@ async function callGeminiNativeVideo(base64Video, mimeType, promptText, timeoutM
                 parts: [{ text: promptText }, { inline_data: { mime_type: mimeType, data: base64Video } }],
               },
             ],
-            generationConfig: { maxOutputTokens: 800 },
+            generationConfig: { maxOutputTokens: 3000 },
           }),
           signal: controller.signal,
         });
@@ -7487,6 +8012,15 @@ function getVoiceTranscript(chatId, messageId) {
 // "транскрипция" и т.п. в одном заходе).
 const VOICE_TRANSCRIBE_INTENT_REGEX =
   /^(расшифр|транскри|распознай)|^(текст|дословно|слово\s+в\s+слово)(?![а-яёА-ЯЁ])|^что\s+(он|она|там)?\s*(сказал|говорил)/i;
+
+// Реплай на видео с просьбой именно ПОЛНОГО, ничем не урезанного разбора от
+// Gemini ("детально", "подробно", "во всех деталях" и т.п.) — по этой команде
+// отдаём сырой текст от captionVideo напрямую, в обход персоны Жени (см.
+// использование ниже). Без этой команды видео по умолчанию идёт обычным
+// путём через repliedTag + Женя — иначе КАЖДЫЙ реплай на видео, даже
+// простое "что тут?", выдавал бы огромную простыню текста без всякого
+// фильтра, что хуже, чем изначальная проблема со слишком коротким ответом.
+const VIDEO_DETAIL_INTENT_REGEX = /детальн|подробн|полност[ьи]|во\s+всех\s+деталях/i;
 
 // Сколько символов расшифровки максимум подмешиваем в промпт модели для
 // обычных вопросов по голосовому (не для литерального "текст" — там отдаём
@@ -9255,6 +9789,51 @@ bot.on("message:text", async (ctx) => {
   // которые парсит не LLM, а chess.js.
   const rawText = ctx.message.text;
 
+  // ==== Враг (см. markEnemy/isUserEnemy, ставится "запомни X враг") ====
+  // Специально ПЕРЕД вообще всеми intent-парсерами ниже (Deezer/поиск/
+  // фильм/таро/погода/игры) — все они уходят через return раньше, чем
+  // код дошёл бы до более позднего гейта (так и было раньше — враг всё
+  // равно получал трек, потому что Deezer-ветка ниже успевала сработать
+  // первой). Хозяина самого сюда не пускаем. enemyMode сам по себе НЕ
+  // завязан на обращение к боту (isBotAddressed) — он нужен ещё и в самом
+  // конце, для выбора личности при обычном чате, а туда код всё равно не
+  // дойдёт в группе без обращения (см. isAddressedToBot дальше). А вот
+  // блокировка конкретных команд ниже — по каждой команде отдельно,
+  // потому что они сами по-разному завязаны на обращение (см. addressed).
+  const enemyMode = !isOwner(ctx) && isUserEnemy(chatId, ctx.from.id);
+  if (enemyMode) {
+    const strippedForEnemyCheck = stripBotAddressing(rawText, ctx);
+    // В группе часть команд ниже (поиск/погода/фильм/таро/игры/нечёткий
+    // трек-запрос) реально требуют обращения к боту — см. isBotAddressed
+    // и isAddressedToBot дальше по коду, они не сработали бы без него.
+    // А вот явный "трек X"/"песню X" (parseDeezerIntent) и прямая ссылка
+    // на Deezer-трек (findDeezerTrackIdInText) — исключение: они уходят в
+    // обработку БЕЗ проверки на обращение (см. deezerQuery/deezerLinkTrackId
+    // ниже — там нет гейта isBotAddressed), именно поэтому враг раньше
+    // получал трек фразой "трек X" без обращения "Женя, ...". Блокируем их
+    // тем же способом — без привязки к addressed.
+    const addressed = !isGroup || isBotAddressed(ctx, rawText);
+    const isDeezerExactBlocked =
+      Boolean(parseDeezerIntent(strippedForEnemyCheck)) || Boolean(await findDeezerTrackIdInText(rawText));
+    const isAddressedOnlyBlocked =
+      addressed &&
+      (hasSearchIntent(rawText) ||
+        Boolean(parseWeatherIntent(strippedForEnemyCheck)) ||
+        isDeezerAmbiguousMusicRequest(strippedForEnemyCheck) ||
+        Boolean(parseMovieIntent(strippedForEnemyCheck)) ||
+        Boolean(parseTarotQueryIntent(strippedForEnemyCheck)) ||
+        CHESS_INTENT_REGEX.test(rawText) ||
+        CHECKERS_INTENT_REGEX.test(rawText) ||
+        KROKODIL_INTENT_REGEX.test(rawText));
+    if (isDeezerExactBlocked || isAddressedOnlyBlocked) {
+      await ctx.reply(pickRandom(ENEMY_REFUSAL_PHRASES), {
+        reply_parameters: { message_id: ctx.message.message_id },
+        message_thread_id: ctx.message.message_thread_id,
+      });
+      return;
+    }
+  }
+
   // ==== Музыка / Deezer / SoundCloud ====
   // 0. Прямая ссылка на трек Deezer в сообщении — качаем без всякого
   // распознавания интента, независимо от того, что написано вокруг ссылки.
@@ -9602,6 +10181,18 @@ bot.on("message:text", async (ctx) => {
 
       const shazamMedia = getShazamMedia(repliedTo);
       const videoOnlyMedia = getVideoOnlyMedia(repliedTo);
+      // Кружочек (video_note) внутри videoOnlyMedia тоже матчится (см.
+      // getVideoOnlyMedia выше) — но если явно просят дословный текст
+      // ("Женя, текст"/"расшифруй"), для кружочка это должен по-прежнему
+      // обрабатывать Whisper-путь ниже (word-for-word), а не Gemini
+      // (который сознательно не транскрибирует дословно). Поэтому здесь
+      // отдельно проверяем именно этот случай и пропускаем Gemini-ветку.
+      const wantsLiteralVideoNoteText =
+        Boolean(repliedTo.video_note) && VOICE_TRANSCRIBE_INTENT_REGEX.test(strippedQuestion);
+      // Явный запрос "детально"/"подробно" — отдать сырой разбор от Gemini
+      // целиком, без персоны Жени (см. ветку ниже). Без этой команды видео
+      // уходит обычным путём через repliedTag, как и раньше.
+      const wantsDetailedVideo = VIDEO_DETAIL_INTENT_REGEX.test(strippedQuestion);
 
       if (shazamMedia && SHAZAM_INTENT_REGEX.test(strippedQuestion)) {
         // Явная команда на распознавание трека — отвечаем ПРЯМО НА САМО
@@ -9609,13 +10200,15 @@ bot.on("message:text", async (ctx) => {
         // как и с "текст"/"расшифруй" у голосовых ниже.
         await handleShazamFromReply(ctx, repliedTo, shazamMedia);
         return;
-      } else if (videoOnlyMedia) {
-        // Реплай на видео с обычным вопросом (не про трек) — узнаём, что
-        // происходит в видео, через Gemini (см. captionVideo выше), и
-        // подмешиваем это в промпт как repliedTag, как и с фото — дальше
-        // отвечает уже обычный askLLM в стиле Жени.
+      } else if (videoOnlyMedia && !wantsLiteralVideoNoteText) {
+        // Реплай на видео (обычное, видео-документ или кружочек) — узнаём,
+        // что происходит в видео, через Gemini (см. captionVideo/
+        // VIDEO_DESCRIPTION_PROMPT выше). Кэш caption общий для обоих
+        // сценариев ниже, чтобы не гонять Gemini дважды, если сначала
+        // спросили просто, а потом "детально" (или наоборот).
         let info = getVideoCaption(chatId, repliedTo.message_id);
         let tooLarge = false;
+        let analyzeError = null;
         if (!info) {
           try {
             const caption = await captionVideo(
@@ -9628,6 +10221,7 @@ bot.on("message:text", async (ctx) => {
             rememberVideoCaption(chatId, repliedTo.message_id, repliedName, caption);
           } catch (err) {
             tooLarge = Boolean(err.tooLarge);
+            analyzeError = err;
             console.error(
               `Не удалось проанализировать видео из реплая в чате ${chatId}:`,
               err.status ?? "-",
@@ -9635,6 +10229,35 @@ bot.on("message:text", async (ctx) => {
             );
           }
         }
+
+        if (wantsDetailedVideo) {
+          // Явно попросили подробный разбор — отдаём текст от Gemini
+          // ЦЕЛИКОМ, напрямую, в обход персоны Жени (тот же паттерн, что
+          // дословный текст голосовых/шазам выше) — иначе даже по прямой
+          // просьбе персона могла бы пересказать своими словами короче.
+          if (info) {
+            await ctx.reply(info.caption, {
+              reply_parameters: { message_id: repliedTo.message_id },
+              message_thread_id: ctx.message.message_thread_id,
+            });
+          } else if (tooLarge) {
+            await ctx.reply(`видео слишком большое для анализа (${analyzeError?.message || "лимит Gemini"})`, {
+              reply_parameters: { message_id: ctx.message.message_id },
+              message_thread_id: ctx.message.message_thread_id,
+            });
+          } else {
+            await ctx.reply(`не смог проанализировать видео, попробуй ещё раз`, {
+              reply_parameters: { message_id: ctx.message.message_id },
+              message_thread_id: ctx.message.message_thread_id,
+            });
+          }
+          return; // сюда не идём в общий askLLM-путь — разбор уже отправлен
+        }
+
+        // Обычный вопрос без "детально" — подмешиваем описание в промпт как
+        // repliedTag, как и с фото, дальше отвечает обычный askLLM в стиле
+        // Жени (см. смягчённую инструкцию про видео-метку в SYSTEM_PROMPT —
+        // не однострочная реакция, а содержательный ответ по сути).
         if (info) {
           repliedTag = `[видео от ${info.name}: ${info.caption}] `;
         } else if (tooLarge) {
@@ -9841,6 +10464,13 @@ bot.on("message:text", async (ctx) => {
         // addMemoryItem, чтобы такая фраза не осела просто текстом,
         // который LLM может выполнить, а может и нет.
         if (isOwner(ctx) && (await tryHandleOwnerIgnoreDirective(chatId, text, ctx, replyOpts))) {
+          return;
+        }
+
+        // "запомни X враг" / "запомни X друг" (см. tryHandleOwnerEnemyDirective) —
+        // тот же принцип: программная директива хозяина, приоритет над
+        // обычным пунктом памяти, проверяем ДО addMemoryItem.
+        if (isOwner(ctx) && (await tryHandleOwnerEnemyDirective(chatId, text, ctx, replyOpts))) {
           return;
         }
 
@@ -10774,7 +11404,8 @@ bot.on("message:text", async (ctx) => {
         const res = await askLLM(
           chatId,
           userText,
-          searchUsedThisMessage ? POST_SEARCH_ASK_TIMEOUT_MS : undefined
+          searchUsedThisMessage ? POST_SEARCH_ASK_TIMEOUT_MS : undefined,
+          enemyMode ? ENEMY_SYSTEM_PROMPT : null
         );
         reply = res.text;
         stickerKey = res.stickerKey;
